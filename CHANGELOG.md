@@ -3,6 +3,15 @@
 This changelog tracks the current release line. Historical phase notes
 and stale roadmap entries have been removed from the public documentation set.
 
+## [Unreleased]
+
+- Reversible (5/3) coefficients whose low bit-planes were not decoded are now
+  reconstructed with r = 1/2 in T.800 Equation E-8 (E.1.2.2), the value
+  already used for irreversible coefficients, instead of r = 0. Lossless
+  encoders such as GDCM/OpenJPEG 2.0 stop a code block's coding passes early
+  when the remaining bits equal that midpoint; those codestreams now decode
+  exactly instead of 1 or 2 levels off.
+
 ## [0.12.0] - 2026-10-06
 
 - Breaking (experimental `j2k-cuda-j2k-engine`):

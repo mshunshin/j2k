@@ -37,6 +37,13 @@ determination.
   `crates/j2k-test-support/fixtures/htj2k/LICENSE.OpenHTJ2K`, and
   `crates/j2k-cuda/tests/fixtures/htj2k/LICENSE.OpenHTJ2K`.
 
+- **pydicom-data** <https://github.com/pydicom/pydicom-data> — The lossless
+  JPEG 2000 fixture in `crates/j2k-native/fixtures/pydicom/` is one frame of
+  `emri_small_jpeg_2k_lossless.dcm`, with expected samples from the same
+  series' uncompressed `emri_small.dcm`; provenance and hashes are in that
+  directory's `README.md`. The retained upstream MIT license is
+  `crates/j2k-native/fixtures/pydicom/LICENSE.pydicom-data`.
+
 - **Compact ICC Profiles** <https://github.com/saucecontrol/Compact-ICC-Profiles>
   — ICC profile assets in `crates/j2k-native/assets/` are used for
   color-management tests. The profiles are available under CC0 1.0 Universal;

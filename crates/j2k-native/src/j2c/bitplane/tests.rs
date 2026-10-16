@@ -194,6 +194,82 @@ fn irreversible_midpoint_reconstruction_tracks_the_last_decoded_pass() {
 }
 
 #[test]
+fn reversible_reconstruction_is_exact_when_complete_and_centred_when_stopped_early() {
+    let coefficient = |magnitude: u64, sign: u8| {
+        let mut coefficient = Coefficient::default();
+        for bit in 0..63 {
+            coefficient.push_bit_at(u32::from(magnitude >> bit & 1 == 1), bit);
+        }
+        coefficient.set_sign(sign);
+        coefficient
+    };
+    // Three bit-planes allow 1 + 3 * 2 = 7 passes.
+    let complete = MidpointReconstructor::new(3, 7, 0);
+    assert_eq!(complete.reconstruct_reversible(coefficient(5, 0)), 5);
+    assert_eq!(complete.reconstruct_reversible(coefficient(5, 1)), -5);
+
+    // Stopped after bit-plane 1's cleanup pass: bit 0 is undecoded, so 0b100
+    // is reconstructed at 0b100 + 2^0.
+    let missing_bit0 = MidpointReconstructor::new(3, 4, 0);
+    assert_eq!(missing_bit0.reconstruct_reversible(coefficient(4, 0)), 5);
+    assert_eq!(missing_bit0.reconstruct_reversible(coefficient(4, 1)), -5);
+    assert_eq!(missing_bit0.reconstruct_reversible(coefficient(0, 0)), 0);
+
+    // Only the first cleanup pass: bits 1 and 0 are undecoded (offset 2^1).
+    let first_plane = MidpointReconstructor::new(3, 1, 0);
+    assert_eq!(first_plane.reconstruct_reversible(coefficient(4, 0)), 6);
+
+    // A final significance pass leaves earlier-significant coefficients
+    // unrefined at that bit-plane: 0b100 still misses bits 1 and 0, while a
+    // coefficient that became significant at bit 1 misses only bit 0.
+    let final_sigprop = MidpointReconstructor::new(3, 2, 0);
+    assert_eq!(final_sigprop.reconstruct_reversible(coefficient(4, 0)), 6);
+    assert_eq!(final_sigprop.reconstruct_reversible(coefficient(2, 0)), 3);
+
+    // ROI-shifted blocks keep the plain coefficient.
+    let roi = MidpointReconstructor::new(3, 4, 2);
+    assert_eq!(roi.reconstruct_reversible(coefficient(4, 0)), 4);
+}
+
+#[test]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the f32 reference holds these magnitudes (below 2^23) and their half-levels exactly"
+)]
+fn reversible_reconstruction_truncates_the_irreversible_midpoint_toward_zero() {
+    // Where a low bit-plane is undecoded the reversible and irreversible
+    // midpoints coincide (an integer offset); a fully decoded reversible
+    // coefficient is exact where the irreversible one sits half a level out.
+    // Magnitudes stay below 2^23 so the f32 reference, half-levels
+    // included, is exact.
+    for decoded_bitplanes in 1_u8..=23 {
+        let top = (1_u64 << decoded_bitplanes) - 1;
+        let mut magnitudes = vec![0, 1, 2, 3, top, top >> 1, top & 0x55_5555];
+        magnitudes.extend((0..decoded_bitplanes).map(|bit| 1_u64 << bit));
+        let max_passes = 1 + 3 * (decoded_bitplanes - 1);
+        for number_of_coding_passes in 1..=max_passes {
+            let block = MidpointReconstructor::new(decoded_bitplanes, number_of_coding_passes, 0);
+            for &magnitude in &magnitudes {
+                for sign in [0_u8, 1] {
+                    let mut coefficient = Coefficient::default();
+                    for bit in 0..63 {
+                        coefficient.push_bit_at(u32::from(magnitude >> bit & 1 == 1), bit);
+                    }
+                    coefficient.set_sign(sign);
+                    let irreversible = block.reconstruct(coefficient);
+                    assert_eq!(
+                        block.reconstruct_reversible(coefficient),
+                        irreversible.trunc() as i64,
+                        "bitplanes {decoded_bitplanes} passes {number_of_coding_passes} \
+                         magnitude {magnitude:#x} sign {sign}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn strict_bypass_decoder_extends_clean_segment_end_with_ones() {
     let mut decoder = BypassDecoder::new(&[0b1010_0101], true);
     let mut context = crate::j2c::arithmetic_decoder::ArithmeticDecoderContext::default();
