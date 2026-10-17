@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/j2k.svg)](https://crates.io/crates/j2k)
 [![docs.rs](https://img.shields.io/docsrs/j2k)](https://docs.rs/j2k)
-[![CI](https://github.com/frames-sg/j2k/actions/workflows/ci.yml/badge.svg)](https://github.com/frames-sg/j2k/actions/workflows/ci.yml)
+[![Full validation](https://github.com/frames-sg/j2k/actions/workflows/full-validation.yml/badge.svg?branch=main&event=push)](https://github.com/frames-sg/j2k/actions/workflows/full-validation.yml?query=branch%3Amain+event%3Apush)
 [![downloads](https://img.shields.io/crates/d/j2k.svg)](https://crates.io/crates/j2k)
 [![license](https://img.shields.io/crates/l/j2k.svg)](#license)
 
@@ -206,8 +206,8 @@ J2K does not depend on any of them.
 
 ## Status
 
-**Release status:** `0.11.3` is published and security-supported. The current
-checkout prepares `0.12.0`; see the [changelog](CHANGELOG.md) for migration notes.
+**Release status:** `0.12.0` is published and security-supported. See the
+[changelog](CHANGELOG.md) for migration notes.
 
 `j2k`, `j2k-core`, `j2k-jpeg`, and `j2k-tilecodec` are the stable crates.
 The GPU, transcode, and ML crates are experimental: patch releases don't
@@ -219,7 +219,7 @@ The minimum supported Rust version is 1.99.0.
 ## Documentation
 
 - [API docs on docs.rs](https://docs.rs/j2k)
-- [Project website](https://frames-sg.github.io/j2k/rust-jpeg2000-codec/)
+- [Project website](https://frames-sg.com/j2k/rust-jpeg2000-codec/)
 - [docs/public-support.md](docs/public-support.md): every supported and
   unsupported feature of the format
 - [docs/architecture.md](docs/architecture.md): how the crates fit together

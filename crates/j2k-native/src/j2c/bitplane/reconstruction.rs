@@ -120,6 +120,44 @@ impl MidpointReconstructor {
         }
     }
 
+    /// Reversible (5/3) reconstruction, T.800 E.1.2.2. A fully decoded
+    /// coefficient is exact (Equation E-7). One whose low bit-planes were not
+    /// all decoded, because the code block's coding passes stop early, is
+    /// reconstructed by Equation E-8 with the decoder-chosen parameter
+    /// r = 1/2, the value the irreversible path uses: with `b >= 1` undecoded
+    /// low bit-planes the offset is `2^(b-1)`, so the value stays an integer.
+    /// Lossless encoders such as GDCM/OpenJPEG 2.0 rely on r = 1/2: they drop
+    /// trailing passes whose bits equal that midpoint. Blocks with an ROI
+    /// shift keep the unshifted-magnitude behaviour.
+    #[expect(
+        clippy::inline_always,
+        reason = "reversible coefficients are reconstructed once per coefficient in the hot output loop"
+    )]
+    #[inline(always)]
+    pub(crate) fn reconstruct_reversible(self, coefficient: Coefficient) -> i64 {
+        let signed = coefficient.get_i64();
+        let magnitude = signed.unsigned_abs();
+        let Some((lowest, final_sigprop)) = self.fast else {
+            return signed;
+        };
+        if magnitude == 0 {
+            return signed;
+        }
+        let bit = lowest + u32::from(final_sigprop && magnitude & (1_u64 << lowest) == 0);
+        if bit == 0 || bit >= 63 {
+            return signed;
+        }
+        // Bits below the lowest decoded bit-plane are zero, so OR places the
+        // midpoint exactly as the irreversible path does, and cannot overflow.
+        let reconstructed = magnitude | (1_u64 << (bit - 1));
+        let reconstructed = i64::try_from(reconstructed).unwrap_or(i64::MAX);
+        if signed < 0 {
+            -reconstructed
+        } else {
+            reconstructed
+        }
+    }
+
     #[expect(
         clippy::cast_precision_loss,
         clippy::inline_always,
