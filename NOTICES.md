@@ -38,11 +38,20 @@ determination.
   `crates/j2k-cuda/tests/fixtures/htj2k/LICENSE.OpenHTJ2K`.
 
 - **pydicom-data** <https://github.com/pydicom/pydicom-data> — The lossless
-  JPEG 2000 fixture in `crates/j2k-native/fixtures/pydicom/` is one frame of
+  JPEG 2000 fixture `emri_small_jpeg_2k_lossless_frame1.j2c` in
+  `crates/j2k-native/fixtures/reversible_early_stop/` is one frame of
   `emri_small_jpeg_2k_lossless.dcm`, with expected samples from the same
   series' uncompressed `emri_small.dcm`; provenance and hashes are in that
   directory's `README.md`. The retained upstream MIT license is
-  `crates/j2k-native/fixtures/pydicom/LICENSE.pydicom-data`.
+  `crates/j2k-native/fixtures/reversible_early_stop/LICENSE.pydicom-data`.
+
+- **OpenJPEG** <https://www.openjpeg.org/> — Reference implementation used as
+  an encoder and oracle for small test assets. The synthetic reversible
+  codestream `openjpeg_53_rate3_gray12_64x64.j2k` in
+  `crates/j2k-native/fixtures/reversible_early_stop/` and its expected samples
+  were produced with OpenJPEG 2.5.4's `opj_compress` and `opj_decompress`; the
+  commands are in that directory's `README.md`. No OpenJPEG source code is
+  incorporated into `j2k`.
 
 - **Compact ICC Profiles** <https://github.com/saucecontrol/Compact-ICC-Profiles>
   — ICC profile assets in `crates/j2k-native/assets/` are used for
