@@ -200,12 +200,18 @@ inline void j2k_mq_set_bits(thread J2kMqEncoder &encoder) {
     }
 }
 
+// T.800 C.2.9 FLUSH. A final 0xFF is discarded: a code-block's bytes must not
+// end in 0xFF (B.10.7), and the decoder supplies it (D.4.1). Matches the CPU
+// ArithmeticEncoder::flush; the sentinel at index 0 is 0x00, never dropped.
 inline void j2k_mq_finish(thread J2kMqEncoder &encoder) {
    j2k_mq_set_bits(encoder);
     encoder.c <<= encoder.ct;
    j2k_mq_byte_out(encoder);
     encoder.c <<= encoder.ct;
    j2k_mq_byte_out(encoder);
+    if (encoder.failed == 0u && encoder.len > 1u && encoder.data[encoder.len - 1u] == uchar(0xFFu)) {
+        encoder.len -= 1u;
+    }
 }
 
 inline void j2k_raw_writer_init(thread J2kRawBitWriter &writer, device uchar *out, uint capacity) {

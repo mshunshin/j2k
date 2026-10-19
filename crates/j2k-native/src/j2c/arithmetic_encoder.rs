@@ -242,12 +242,22 @@ impl ArithmeticEncoder {
     }
 
     /// Flush the encoder state (C.2.9 FLUSH).
+    ///
+    /// A final 0xFF is discarded (C.2.9): a code-block's bytes must not end
+    /// in 0xFF (B.10.7), or it would pair with the next code-block's or packet
+    /// header's first byte into a value in the marker range 0xFF90..=0xFFFF.
+    /// Nothing is lost, since a decoder extends the data with 0xFF bytes
+    /// (D.4.1). Only one can be dropped: the byte after a 0xFF holds 7 bits.
     pub(crate) fn flush(&mut self) {
         self.set_bits();
         self.c <<= self.ct;
         self.byte_out();
         self.c <<= self.ct;
         self.byte_out();
+        // The sentinel at index 0 is 0x00, so it is never discarded.
+        if self.data.last() == Some(&0xFF) {
+            self.data.pop();
+        }
     }
 
     /// Return the encoded data (excluding sentinel), consuming the encoder.

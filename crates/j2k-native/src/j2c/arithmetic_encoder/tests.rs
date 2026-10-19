@@ -187,6 +187,46 @@ fn test_context_state_identical() {
     assert_eq!(enc_ctx.mps(), dec_ctx.mps());
 }
 
+/// C.2.9 / B.10.7: a terminated MQ segment never ends in 0xFF, and dropping
+/// that byte loses nothing, since the decoder supplies 0xFF bytes past the end
+/// (D.4.1).
+#[test]
+#[cfg_attr(
+    test,
+    expect(clippy::similar_names, reason = "paired encoder/decoder state")
+)]
+fn flush_never_ends_a_segment_in_0xff() {
+    let mut state = 0x9E37_79B9u32;
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        state
+    };
+    for trial in 0..2_000 {
+        let length = 1 + next() as usize % 400;
+        // Skewed sources, from nearly all MPS to evenly mixed.
+        let threshold = next() % 0x8000_0000;
+        let symbols: Vec<u32> = (0..length).map(|_| u32::from(next() < threshold)).collect();
+
+        let mut encoder = ArithmeticEncoder::new();
+        let mut enc_ctx = ArithmeticEncoderContext::default();
+        for &symbol in &symbols {
+            encoder.encode(symbol, &mut enc_ctx);
+        }
+        let encoded = encoder.finish();
+        assert_ne!(encoded.last(), Some(&0xFF), "trial {trial} ends in 0xFF");
+
+        let mut decoder = ArithmeticDecoder::new(&encoded);
+        let mut dec_ctx = ArithmeticDecoderContext::default();
+        for (index, &symbol) in symbols.iter().enumerate() {
+            assert_eq!(
+                decoder.decode(&mut dec_ctx),
+                symbol,
+                "trial {trial}, symbol {index}"
+            );
+        }
+    }
+}
+
 #[test]
 fn checked_payload_limit_is_sticky_and_never_underflows_renormalization() {
     let mut encoder =

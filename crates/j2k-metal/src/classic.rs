@@ -378,7 +378,11 @@ mod tests {
         decode_j2k_code_block_scalar(job.as_job(), &mut baseline).expect("baseline decode");
 
         for split_pass in 1..job.number_of_coding_passes {
-            for split_offset in 1..job.data.len() {
+            // The second segment may be empty: a decoder extends every segment
+            // with 0xFF bytes (T.800 D.4.1). The encoder discards an MQ
+            // segment's final 0xFF (B.10.7), so a split that once left that
+            // lone 0xFF in the second segment now leaves it empty.
+            for split_offset in 1..=job.data.len() {
                 let mut candidate = job.clone();
                 let split_offset_u32 =
                     u32::try_from(split_offset).expect("split offset fits in u32");

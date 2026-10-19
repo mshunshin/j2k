@@ -5,6 +5,17 @@ and stale roadmap entries have been removed from the public documentation set.
 
 ## [Unreleased]
 
+- Fix (`j2k-native`, `j2k-metal`): the classic (Part 1) MQ encoder now
+  discards a final 0xFF when it terminates a code-block segment, as T.800
+  C.2.9 FLUSH does, so a code-block's bytes never end in 0xFF (B.10.7).
+  Before, almost every terminated segment ended in 0xFF. That byte paired
+  with the next code-block's or packet header's first byte into a value in
+  the marker range 0xFF90-0xFFFF (D.4), which breaks marker scanning (SOP/EPH
+  resynchronisation, finding the EOC of a Psot-0 tile-part), and it cost one
+  byte per segment. Decoded pixels do not change: decoders supply the
+  discarded 0xFF (D.4.1), and OpenJPEG 2.5.4, FFmpeg and Apple ImageIO
+  decoded the old streams as they decode OpenJPEG's. HTJ2K output was not
+  affected.
 - Reversible (5/3) coefficients whose low bit-planes were not decoded, because
   a classic code block's coding passes stop early, are now reconstructed with
   r = 1/2 in T.800 Equation E-8 (E.1.2.2), the value already used for
