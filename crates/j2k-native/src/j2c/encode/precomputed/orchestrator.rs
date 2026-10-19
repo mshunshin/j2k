@@ -76,6 +76,11 @@ impl Prepared97PacketPlan {
 pub(in crate::j2c::encode) fn validate_legacy_packet_options(
     options: &EncodeOptions,
 ) -> NativeEncodePipelineResult<()> {
+    if options.irreversible_quantization_profile.is_some() {
+        return Err(NativeEncodePipelineError::unsupported(
+            "component quantization profiles are not supported for precomputed coefficient input",
+        ));
+    }
     validate_irreversible_quantization_profile(options)
         .map_err(NativeEncodePipelineError::invalid_input)?;
     if options.guard_bits > MAX_QUANTIZATION_GUARD_BITS {
@@ -238,6 +243,7 @@ pub(in crate::j2c::encode) fn finish_plan(
         component_packets,
         params.width,
         params.height,
+        &params.component_sampling,
         params.num_decomposition_levels,
         &params.precinct_exponents,
         session,

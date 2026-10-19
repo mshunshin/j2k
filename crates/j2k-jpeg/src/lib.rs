@@ -37,8 +37,8 @@ pub use batch_session::JpegBatchSession;
 
 mod capabilities;
 pub use capabilities::{
-    JpegBackendEligibility, JpegCapabilityReport, JpegCapabilityRequest, JpegDecodeOp,
-    JpegDecodeRequest, JpegResolvedDecode, JpegResolvedDecodePath,
+    metal_hybrid_eligibility, JpegBackendEligibility, JpegCapabilityReport, JpegCapabilityRequest,
+    JpegDecodeOp, JpegDecodeRequest, JpegResolvedDecode, JpegResolvedDecodePath,
 };
 
 mod output_buffer;
@@ -83,19 +83,25 @@ pub(crate) mod output;
 
 pub(crate) mod profile;
 
+pub(crate) mod encoded_frame;
 pub(crate) mod encoded_output;
 
 mod baseline_encode_contract;
 mod baseline_entropy;
 mod dct_contract;
+mod optimal_huffman;
 mod standard_huffman;
 
-/// Baseline JPEG encoder API.
+/// Baseline, Huffman-optimized baseline, and 12-bit extended JPEG encoder API.
 mod encoder;
 pub use encoder::{
-    encode_jpeg_baseline, EncodedJpeg, JpegBackend, JpegEncodeError, JpegEncodeOptions,
-    JpegSamples, JpegSubsampling,
+    encode_jpeg_baseline, encode_jpeg_baseline_optimized, encode_jpeg_extended12, EncodedJpeg,
+    JpegBackend, JpegEncodeError, JpegEncodeOptions, JpegSamples, JpegSamples12, JpegSubsampling,
 };
+
+/// Lossless (SOF3) JPEG encoder API.
+mod lossless_encode;
+pub use lossless_encode::{encode_jpeg_lossless, JpegLosslessEncodeOptions, JpegLosslessSamples};
 
 #[doc(hidden)]
 pub mod transcode;

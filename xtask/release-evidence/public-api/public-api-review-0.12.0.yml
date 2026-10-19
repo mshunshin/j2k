@@ -21,14 +21,20 @@ break_ledger:
     removed_items: []
     summary: "Dropping pooled RGB8/RGBA8 CUDA output returns memory to the session pool without synchronizing."
     migration: "Keep each surface alive until every consumer stream has finished using device_ptr. Synchronize or retain the surface until downstream work completes."
+  - id: jpeg-huffman-const
+    kind: "source"
+    packages: ["j2k-codec-math"]
+    removed_items: [{"package": "j2k-codec-math", "item": "pub fn j2k_codec_math::jpeg::derive_canonical_huffman(&[u8; 16], usize) -> core::result::Result<j2k_codec_math::jpeg::CanonicalHuffmanDerivation, j2k_codec_math::jpeg::CanonicalHuffmanError>"}]
+    summary: "The Huffman derivation function is now const; the inventory replaces its non-const spelling with the otherwise identical const signature."
+    migration: "Existing runtime calls remain source compatible. The same function can now also be called in const contexts; no caller migration is required."
 reviews:
   j2k-core:
     removed_fingerprint: "none"
     added_fingerprint: "none"
-    hidden_count: 225
-    hidden_fingerprint: "fnv1a64:3bac105ab257d3a4"
+    hidden_count: 226
+    hidden_fingerprint: "fnv1a64:487523cc4e7f504e"
     rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged."
-    hidden_rationale: "Adds retained_host_bytes and planning with external live bytes; the allocation helpers keep their existing contracts."
+    hidden_rationale: "Adds retained_host_bytes and planning with external live bytes; the allocation helpers keep their existing contracts. Also records the already-merged host_physical_memory_bytes helper used to bound host allocations; it returns None when the platform cannot report physical memory."
   j2k-profile:
     removed_fingerprint: "none"
     added_fingerprint: "none"
@@ -38,17 +44,17 @@ reviews:
     hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
   j2k-types:
     removed_fingerprint: "none"
-    added_fingerprint: "none"
+    added_fingerprint: "fnv1a64:5b8f358d6f255688"
     hidden_count: 103
     hidden_fingerprint: "fnv1a64:71b5df4e9aaebdcb"
-    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged."
+    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged. Adds CPU wavelet selection and output types for tiles, components, resolutions, and orientations. Reversible samples are I64 and irreversible samples are dequantized F32; geometry, precision, sampling, transform, and quantization metadata travel with the bands."
     hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
   j2k-codec-math:
-    removed_fingerprint: "none"
-    added_fingerprint: "fnv1a64:7402e26c4cc53b41"
+    removed_fingerprint: "fnv1a64:594402a62d9308ce"
+    added_fingerprint: "fnv1a64:49ea9cc837e96b09"
     hidden_count: 0
     hidden_fingerprint: "none"
-    rationale: "Adds shared HT scratch bounds and wavelet tiling constants used by the CUDA kernels; existing signatures are preserved."
+    rationale: "Adds shared HT scratch bounds and wavelet tiling constants used by the CUDA kernels; existing signatures are preserved. Adds shared JPEG lossless predictors and difference-category coding. derive_canonical_huffman becomes const without changing its arguments, result, or runtime behavior; callers need no migration."
     hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
   j2k-cuda-build-support:
     removed_fingerprint: "none"
@@ -73,11 +79,11 @@ reviews:
     hidden_rationale: "Three hidden signatures change: both pooled upload methods take &[&[u8]] instead of &[u8], and CudaQueuedHtj2kCleanupGroup::new adds cleanup_capacity and live_host_bytes. Pass &[payload] and the retained group sizes. Six additional methods expose deferred clearing, retained byte counts, batched stores, and deferred final wavelet stages."
   j2k-cuda-jpeg-engine:
     removed_fingerprint: "none"
-    added_fingerprint: "none"
-    hidden_count: 176
-    hidden_fingerprint: "fnv1a64:e88101299bf042a3"
-    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged."
-    hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
+    added_fingerprint: "fnv1a64:103e0c647d4cb39d"
+    hidden_count: 205
+    hidden_fingerprint: "fnv1a64:ad37da6966da1cfd"
+    rationale: "Adds the lossless category count and encode_lossless_with_external_live entry point; existing engine calls keep their signatures."
+    hidden_rationale: "Adds the C-layout lossless parameter block, borrowed input job, and packed-stream or sample-range outcome. The new path validates buffer ranges, alignment, geometry, and retained host allocation before launching CUDA-Oxide kernels."
   j2k-cuda-transcode-engine:
     removed_fingerprint: "none"
     added_fingerprint: "none"
@@ -87,10 +93,10 @@ reviews:
     hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
   j2k-metal-support:
     removed_fingerprint: "none"
-    added_fingerprint: "none"
+    added_fingerprint: "fnv1a64:cb0fe39460064a9f"
     hidden_count: 11
     hidden_fingerprint: "fnv1a64:02139606f1202938"
-    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged."
+    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged. Also records the already-merged checked_shared_heap and checked_heap_shared_buffer allocation helpers. They preserve typed allocation failures and introduce no changes to existing signatures. Adds unsafe with_checked_buffer_slice_mut for bounded CPU writes into shared Metal storage. Its safety contract requires exclusive access with no overlapping GPU commands; the mutable view is limited to the callback."
     hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
   j2k-mpsgraph-support:
     removed_fingerprint: "none"
@@ -101,18 +107,18 @@ reviews:
     hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
   j2k-native:
     removed_fingerprint: "none"
-    added_fingerprint: "none"
-    hidden_count: 562
-    hidden_fingerprint: "fnv1a64:3bd35f4a7d1f83cf"
-    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged."
-    hidden_rationale: "Adds Image::tile_count for allocation-free decode planning; existing native adapters remain compatible."
+    added_fingerprint: "fnv1a64:61c95814ea52b3aa"
+    hidden_count: 570
+    hidden_fingerprint: "fnv1a64:94a3e1a6f76d96ce"
+    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged. Adds selected wavelet extraction and shared wavelet type re-exports. It decodes the requested entropy bands without inverse DWT or color conversion and preserves exact reversible integer coefficients; existing pixel APIs retain their signatures."
+    hidden_rationale: "Adds Image::tile_count for allocation-free decode planning; existing native adapters remain compatible. Also records the already-merged HT coding probe, parallel scratch toggle, and J2kClassicReconstruction hooks. Existing classic adapters retain their defaults; supporting reversible midpoint reconstruction requires opting into the new reconstruction hooks."
   j2k-jpeg:
     removed_fingerprint: "none"
-    added_fingerprint: "none"
-    hidden_count: 574
-    hidden_fingerprint: "fnv1a64:b3e5271cb5d45bac"
-    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged."
-    hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
+    added_fingerprint: "fnv1a64:b13b981667fd252a"
+    hidden_count: 702
+    hidden_fingerprint: "fnv1a64:525423e3896df832"
+    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged. Adds optimized baseline, 12-bit extended, and lossless JPEG encoders with native sample types. Exhaustive JpegEncodeError matches must handle RestartIntervalTooLarge, UnsupportedPixelFormat, UnsupportedPrecision, InvalidPredictor, InvalidPointTransform, and SampleOutOfRange. YCCK colors, lossless sample replication, and color-space inference now match the committed external references. Adds metal_hybrid_eligibility, JpegCapabilityReport::metal_hybrid, and MetalHybrid routing for explicit Metal requests. Exhaustive JpegResolvedDecodePath matches need a MetalHybrid arm; Auto routing keeps its existing choice."
+    hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points. Adds entropy-only DCT and lossless decoding into caller storage, component geometry, lossless GPU planning/Huffman/frame assembly contracts, and a reduced-IDCT benchmark helper. Existing adapter signatures are preserved; the new adapters validate dimensions, precision, ranges, and allocation bounds before execution."
   j2k-tilecodec:
     removed_fingerprint: "fnv1a64:de5a5b18d88e8fb8"
     added_fingerprint: "fnv1a64:4c036c22e22a0254"
@@ -122,10 +128,10 @@ reviews:
     hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
   j2k:
     removed_fingerprint: "none"
-    added_fingerprint: "none"
+    added_fingerprint: "fnv1a64:e212123f4c9acc3a"
     hidden_count: 108
     hidden_fingerprint: "fnv1a64:01e74ad6c3ff416e"
-    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged."
+    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged. Adds J2kDecoder::decode_wavelets and shared wavelet type re-exports. Reduced decode requests beyond the main or tile resolution ladder now return an error rather than silently clamping; owned batches report invalid requests with their input index during preparation. Callers must choose an available reduction level."
     hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
   j2k-transcode:
     removed_fingerprint: "none"
@@ -143,18 +149,18 @@ reviews:
     hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
   j2k-jpeg-metal:
     removed_fingerprint: "none"
-    added_fingerprint: "none"
+    added_fingerprint: "fnv1a64:181f7c41e644147f"
     hidden_count: 83
     hidden_fingerprint: "fnv1a64:79397ffc221464c3"
-    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged."
+    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged. Adds JpegLosslessMetalEncodeTile and encode_jpeg_lossless_from_metal_buffer. Raw buffer construction is unsafe with an explicit producer-completion and immutability contract; validated ResidentMetalImage input is borrowed safely. Explicit Metal decoding and resident batches now support the CPU JPEG classes through CPU entropy plus Metal reconstruction, preserving native sample output."
     hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
   j2k-metal:
     removed_fingerprint: "none"
-    added_fingerprint: "fnv1a64:d51a8c94610fc3df"
-    hidden_count: 319
-    hidden_fingerprint: "fnv1a64:e46e323954530145"
-    rationale: "Adds shared group submission and cooperative CPU/Metal decoding; existing entry points are preserved."
-    hidden_rationale: "Reviewed the generated hidden inventory against v0.11.3; implementation adapters remain part of the release contract. Metal dispatch telemetry adds cpu_tier1_images."
+    added_fingerprint: "fnv1a64:9828496ce9bcbfd1"
+    hidden_count: 318
+    hidden_fingerprint: "fnv1a64:83bd1c8e3bfbe6e5"
+    rationale: "Adds shared group submission and cooperative CPU/Metal decoding; existing entry points are preserved. Also records the already-merged decode_into_metal and decode_into_metal_with_session methods for caller-owned destinations. Existing decoder entry points remain available."
+    hidden_rationale: "Reviewed the generated hidden inventory against v0.11.3; implementation adapters remain part of the release contract. Metal dispatch telemetry adds cpu_tier1_images. The J2kDecoder impl marker moves into the ordinary inventory when its destination methods become public; this is inventory classification, not removal of the decoder or its existing methods."
   j2k-transcode-metal:
     removed_fingerprint: "none"
     added_fingerprint: "none"
@@ -164,10 +170,10 @@ reviews:
     hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
   j2k-jpeg-cuda:
     removed_fingerprint: "none"
-    added_fingerprint: "none"
+    added_fingerprint: "fnv1a64:8dc9917dffab817e"
     hidden_count: 133
     hidden_fingerprint: "fnv1a64:9aa724bde7af1618"
-    rationale: "Compared the ordinary API with v0.11.3; existing signatures are unchanged."
+    rationale: "Adds JpegLosslessCudaEncodeTile and encode_jpeg_lossless_from_cuda_buffer for grayscale or RGB at 2-16 bits. It reuses CPU option validation, binds the session to the input context, and returns CudaUnavailable without the runtime feature; existing decode and baseline encode APIs are preserved."
     hidden_rationale: "Compared the hidden inventory with v0.11.3; retained implementation adapters support this package's public entry points."
   j2k-cuda:
     removed_fingerprint: "none"
