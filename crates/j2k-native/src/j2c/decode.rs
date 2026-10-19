@@ -38,6 +38,7 @@ use core::ops::Range;
 
 mod allocation;
 mod direct_plan;
+mod peak;
 mod reuse;
 mod store;
 mod subband;
@@ -52,6 +53,7 @@ pub(crate) use self::direct_plan::{
     build_referenced_classic_rgba_plan, build_referenced_htj2k_color_plan,
     build_referenced_htj2k_grayscale_plan, build_referenced_htj2k_rgba_plan,
 };
+pub(crate) use self::peak::{record_workspace, WorkspaceBytes, WorkspacePeak};
 use self::store::{apply_sign_shift_after_mct, component_unsigned_level_shift, store};
 use self::subband::{
     code_block_required_by_index, count_classic_code_blocks, count_ht_code_blocks,
@@ -65,9 +67,9 @@ use self::subband::{
 pub(crate) use self::subband::{
     should_decode_classic_sub_band_in_parallel, should_decode_ht_sub_band_in_parallel,
 };
+pub(crate) use self::subband_params::sub_band_decode_parameters;
 use self::subband_params::{
-    classic_decode_job_parameters, ht_code_block_has_decodable_passes, sub_band_decode_parameters,
-    SubBandDecodeParameters,
+    classic_decode_job_parameters, ht_code_block_has_decodable_passes, SubBandDecodeParameters,
 };
 pub use self::workspace::{
     CpuDecodeParallelism, DecoderContext, DecoderWorkspace, DecoderWorkspaceStats,
@@ -344,6 +346,8 @@ pub(crate) struct DecodeDebugCounters {
     pub(crate) selection_scanned_packets: usize,
     /// Empty decomposition capacity discarded before region selection.
     pub(crate) selection_released_storage_bytes: usize,
+    /// The largest decode workspace sampled at stage boundaries, by owner.
+    pub(crate) workspace_peak: WorkspacePeak,
     pub(crate) ht_phase_stats: ht_block_decode::HtBlockDecodeStats,
     #[cfg(all(test, feature = "parallel"))]
     pub(crate) ht_parallel_tasks: usize,
@@ -451,6 +455,13 @@ fn decode_tile<'a>(
         tile_ctx.output_region.is_some(),
         build::BuildWorkspace::DecodePixels {
             skipped_resolution_levels: header.skipped_resolution_levels,
+            // A code-block decoder hook may rely on every component's
+            // coefficients being live together, so it keeps the tile layout.
+            coefficient_layout: if ht_decoder.is_some() {
+                build::CoefficientLayout::Tile
+            } else {
+                build::CoefficientLayout::Component
+            },
         },
         selection.as_ref(),
     )?;
@@ -463,33 +474,87 @@ fn decode_tile<'a>(
         build::allocate_deferred_coefficients(storage, header.skipped_resolution_levels)?;
     }
     tile_ctx.debug_counters.stored_coefficients += storage.coefficients.len();
+    record_workspace(tile_ctx, storage, selection_bytes)?;
     profile_timings.build_us += profile::elapsed_us(stage_start);
     // Next, we parse the layers/segments for each code block.
     let stage_start = profile::profile_now(profile_enabled);
     segment::parse_selected(tile, header, storage, selection.as_ref())?;
+    record_workspace(tile_ctx, storage, selection_bytes)?;
     drop(selection);
     storage.structural_workspace_bytes = storage
         .structural_workspace_bytes
         .checked_sub(selection_bytes)
         .ok_or(ValidationError::ImageTooLarge)?;
     profile_timings.segment_us += profile::elapsed_us(stage_start);
-    // We then decode the bitplanes of each code block, yielding the
-    // (possibly dequantized) coefficients of each code block.
-    let stage_start = profile::profile_now(profile_enabled);
-    decode_component_tile_bit_planes_budgeted(
+    decode_components(
         tile,
+        header,
         tile_ctx,
         storage,
-        header,
         ht_decoder,
         cpu_decode_parallelism,
         profile_enabled,
+        profile_timings,
     )?;
-    profile_timings.codeblock_us += profile::elapsed_us(stage_start);
+    Ok(())
+}
+
+/// Runs Tier-1, the IDWT and store for each component of a parsed tile.
+///
+/// With [`build::CoefficientLayout::Component`], every component decodes into
+/// the same coefficient buffer, so each finishes all three stages before the
+/// next is decoded. Otherwise Tier-1 decodes the whole tile first.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the per-component stages share decode_tile's state, adapter, and profiling explicitly"
+)]
+fn decode_components<'a>(
+    tile: &Tile<'a>,
+    header: &Header<'_>,
+    tile_ctx: &mut TileDecodeContext,
+    storage: &mut DecompositionStorage<'a>,
+    ht_decoder: &mut Option<&mut dyn HtCodeBlockDecoder>,
+    cpu_decode_parallelism: CpuDecodeParallelism,
+    profile_enabled: bool,
+    profile_timings: &mut DecodeProfileTimings,
+) -> Result<()> {
+    let per_component = storage.coefficient_layout == build::CoefficientLayout::Component;
+    if !per_component {
+        decode_tier1_stage(
+            tile,
+            0..tile.component_infos.len(),
+            header,
+            tile_ctx,
+            storage,
+            ht_decoder,
+            cpu_decode_parallelism,
+            profile_enabled,
+            profile_timings,
+        )?;
+    }
 
     // Unlike before, we interleave the apply_idwt and store stages
     // for each component tile so we can reuse allocations better.
     for (idx, component_info) in header.component_infos.iter().enumerate() {
+        if per_component {
+            if idx > 0 {
+                // Code-blocks the decode skips leave their samples untouched,
+                // so clear the previous component's coefficients first.
+                storage.coefficients.fill(0.0);
+                storage.coefficients_i64.fill(0);
+            }
+            decode_tier1_stage(
+                tile,
+                idx..idx + 1,
+                header,
+                tile_ctx,
+                storage,
+                ht_decoder,
+                cpu_decode_parallelism,
+                profile_enabled,
+                profile_timings,
+            )?;
+        }
         // Next, we apply the inverse discrete wavelet transform.
         let stage_start = profile::profile_now(profile_enabled);
         idwt::apply(
@@ -501,6 +566,7 @@ fn decode_tile<'a>(
             ht_decoder,
             cpu_decode_parallelism == CpuDecodeParallelism::Auto,
         )?;
+        record_workspace(tile_ctx, storage, 0)?;
         profile_timings.idwt_us += profile::elapsed_us(stage_start);
         // Finally, we store the raw samples for the tile area in the correct
         // location. Note that in case we have MCT, we are not applying it yet.
@@ -522,14 +588,54 @@ fn decode_tile<'a>(
             ht_decoder,
             cpu_decode_parallelism == CpuDecodeParallelism::Auto,
         )?;
+        record_workspace(tile_ctx, storage, 0)?;
         profile_timings.store_us += profile::elapsed_us(stage_start);
     }
 
     Ok(())
 }
 
+/// Decode the code-blocks of `components` and sample the workspace after.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the Tier-1 stage shares decode_tile's state, adapter, and profiling explicitly"
+)]
+fn decode_tier1_stage<'a>(
+    tile: &Tile<'a>,
+    components: Range<usize>,
+    header: &Header<'_>,
+    tile_ctx: &mut TileDecodeContext,
+    storage: &mut DecompositionStorage<'a>,
+    ht_decoder: &mut Option<&mut dyn HtCodeBlockDecoder>,
+    cpu_decode_parallelism: CpuDecodeParallelism,
+    profile_enabled: bool,
+    profile_timings: &mut DecodeProfileTimings,
+) -> Result<()> {
+    // We decode the bitplanes of each code block, yielding the (possibly
+    // dequantized) coefficients of each code block.
+    let stage_start = profile::profile_now(profile_enabled);
+    decode_component_tile_bit_planes_budgeted(
+        tile,
+        components,
+        tile_ctx,
+        storage,
+        header,
+        ht_decoder,
+        cpu_decode_parallelism,
+        profile_enabled,
+    )?;
+    record_workspace(tile_ctx, storage, 0)?;
+    profile_timings.codeblock_us += profile::elapsed_us(stage_start);
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "this codec boundary keeps geometry, state buffers, and validated options explicit without allocation or indirection"
+)]
 pub(crate) fn decode_component_tile_bit_planes_budgeted<'a>(
     tile: &Tile<'a>,
+    components: Range<usize>,
     tile_ctx: &mut TileDecodeContext,
     storage: &mut DecompositionStorage<'a>,
     header: &Header<'_>,
@@ -537,9 +643,11 @@ pub(crate) fn decode_component_tile_bit_planes_budgeted<'a>(
     cpu_decode_parallelism: CpuDecodeParallelism,
     profile_enabled: bool,
 ) -> Result<()> {
-    let tier1_workspace_bytes = tier1::prepare_tier1_workspace(tile, header, tile_ctx, storage)?;
+    let tier1_workspace_bytes =
+        tier1::prepare_tier1_workspace(tile, components.clone(), header, tile_ctx, storage)?;
     let decode_result = decode_component_tile_bit_planes(
         tile,
+        components,
         tile_ctx,
         storage,
         header,
@@ -555,6 +663,58 @@ fn tile_requires_exact_integer_decode(tile: &Tile<'_>) -> bool {
     tile.component_infos
         .iter()
         .any(ComponentInfo::requires_exact_integer_decode)
+}
+
+pub(crate) fn decode_selected_wavelet_bands<'a>(
+    tile: &Tile<'a>,
+    tile_ctx: &mut TileDecodeContext,
+    storage: &mut DecompositionStorage<'a>,
+    header: &Header<'_>,
+    parallelism: CpuDecodeParallelism,
+    selection: &j2k_types::WaveletSelection,
+) -> Result<()> {
+    let workspace = tier1::prepare_tier1_workspace(
+        tile,
+        0..tile.component_infos.len(),
+        header,
+        tile_ctx,
+        storage,
+    )?;
+    let result = (|| {
+        for (component_index, info) in tile.component_infos.iter().enumerate() {
+            if !super::wavelets::select_component(selection, component_index) {
+                continue;
+            }
+            storage.exact_integer_decode =
+                info.wavelet_transform() == WaveletTransform::Reversible53;
+            for resolution in 0..info.num_resolution_levels() {
+                let composition = &storage.tile_decompositions[component_index];
+                for index in composition.sub_band_iter(resolution, &storage.decompositions) {
+                    if !super::wavelets::select_band(
+                        selection,
+                        resolution,
+                        storage.sub_bands[index].sub_band_type,
+                    ) {
+                        continue;
+                    }
+                    subband::decode_sub_band_bitplanes(
+                        index,
+                        resolution,
+                        info,
+                        tile_ctx,
+                        storage,
+                        header,
+                        &mut None,
+                        parallelism,
+                        false,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    })();
+    tier1::release_tier1_workspace(tile_ctx, storage, &workspace)?;
+    result
 }
 
 fn validate_exact_integer_decode_tile(tile: &Tile<'_>) -> Result<()> {
@@ -600,6 +760,8 @@ fn emit_decode_profile_row(
     profile_timings: &DecodeProfileTimings,
     total_start: Option<profile::ProfileInstant>,
 ) {
+    let peak = tile_ctx.debug_counters.workspace_peak.bytes();
+    let widen = |bytes: usize| bytes as u128;
     profile::emit_profile_row(
         "decode",
         "cpu",
@@ -645,6 +807,12 @@ fn emit_decode_profile_row(
             ("store_us", profile_timings.store_us),
             ("mct_us", profile_timings.mct_us),
             ("total_us", profile::elapsed_us(total_start)),
+            ("peak_workspace_bytes", widen(peak.total())),
+            ("peak_coefficient_bytes", widen(peak.coefficients)),
+            ("peak_channel_bytes", widen(peak.channels)),
+            ("peak_idwt_bytes", widen(peak.idwt)),
+            ("peak_tier1_bytes", widen(peak.tier1)),
+            ("peak_structure_bytes", widen(peak.structure)),
         ],
     );
 }
@@ -727,6 +895,8 @@ pub(crate) struct DecompositionStorage<'a> {
     pub(crate) tile_decompositions: Vec<TileDecompositions>,
     pub(crate) roi_plan: Option<RoiPlan>,
     pub(crate) exact_integer_decode: bool,
+    /// How the built sub-bands' coefficient ranges share `coefficients`.
+    pub(crate) coefficient_layout: build::CoefficientLayout,
     /// Planned non-segment live bytes for the active tile and future decode scratch.
     pub(crate) structural_workspace_bytes: usize,
     /// Set when region decode deferred coefficient storage until the ROI
@@ -751,6 +921,7 @@ impl DecompositionStorage<'_> {
         self.tile_decompositions.clear();
         self.roi_plan = None;
         self.exact_integer_decode = false;
+        self.coefficient_layout = build::CoefficientLayout::Tile;
         self.structural_workspace_bytes = 0;
         self.deferred_idwt_workspace_elements = None;
         self.packet_workspace_error = None;

@@ -5,6 +5,166 @@ and stale roadmap entries have been removed from the public documentation set.
 
 ## [Unreleased]
 
+- Irreversible 9/7 encodes accept per-component quantization profiles:
+  `J2kLossyEncodeOptions::quantization_profile` (`with_quantization_profile`)
+  and `EncodeOptions::irreversible_quantization_profile` take one positive
+  multiplier per band in QCD/QCC order for every component. Rows must match
+  the effective decomposition depth, including the cap from the smallest edge
+  tile. A non-unity profile writes QCC markers; an exact all-ones profile
+  leaves the codestream unchanged. Steps the 5-bit QCD/QCC exponent cannot
+  store are rejected as input errors, and byte, bits-per-pixel and PSNR rate
+  search scale the whole profile only up to its largest representable scale.
+  Reversible, Qfactor, high-bit and precomputed-coefficient encodes reject
+  profiles.
+- The `j2k` Python extension adds CPU research helpers: `encode_rgb` and
+  `decode_rgb` for 8-bit RGB through baseline JPEG 4:4:4, classic JPEG 2000 or
+  HTJ2K (with `quality`, `target_bpp`, `levels` and `profile`), and
+  `forward_rgb97` / `inverse_rgb97` for float 9/7 bands with optional ICT.
+  `j2k-native` exports `inverse_dwt97_reference` and `inverse_ict_reference`.
+- Behavior change: an explicit lossy `max_decomposition_levels` now selects
+  that many levels, capped by geometry, as the lossless option and the field
+  documentation already describe. It previously only capped the default
+  policy, so LRCP and RLCP encodes used one level whatever value was given.
+  Existing lossy encodes that set this option produce different codestreams;
+  encodes that leave it unset are unchanged.
+- Behavior fix: irreversible steps outside the QCD/QCC range from an extreme
+  `irreversible_quantization_scale` or subband scale now saturate at the
+  coarsest or finest stored step instead of panicking or wrapping. Steps of
+  2^32 and coarser, which bit depths above 31 store, are kept exactly and
+  reconstruct without overflowing.
+- Native multi-tile encodes now check a component quantization profile against
+  the edge-tile depth before planning, so `EncodeOptions` callers get the same
+  row count as the `j2k` facade.
+
+- `J2kDecoder::decode_wavelets` extracts selected native wavelet bands on the
+  CPU for classic JPEG 2000 and HTJ2K, without inverse DWT, color conversion,
+  or pixel packing: reversible 5/3 bands as exact `I64`, irreversible 9/7
+  bands as dequantized `F32`. Output keeps tile and component geometry,
+  precision, signedness, sampling, transform, color-transform status, and each
+  band's quantization step. `WaveletSelection` picks tiles, components,
+  resolutions, and orientations; unselected bands skip Tier-1 decoding. New
+  public types, defined in `j2k-types` and re-exported by `j2k` and
+  `j2k-native`: `WaveletSelection`, `WaveletImage`, `WaveletTile`,
+  `WaveletComponent`, `WaveletBand`, `WaveletSamples`, `WaveletBandKind`,
+  `WaveletRect`, and `WaveletTransform`.
+- New unpublished `j2k-python` crate: the `j2k` PyO3 extension, built with
+  maturin as the `j2k` wheel, gives PyTorch and NumPy inspection,
+  native-dtype pixel batches (region, reduced, prepared reuse, input-indexed
+  errors), and wavelet bands through DLPack. Its `cuda` feature decodes
+  directly into PyTorch-owned CUDA storage. Rust builds without its features
+  do not depend on PyO3.
+- Behavior fix: reduced decodes (`Downscale::Half`, `Quarter`, `Eighth`)
+  deeper than a codestream's resolution ladder now fail with
+  `requested reduction exceeds the codestream resolution ladder`; owned
+  batches report it at prepare with the input's index. The request was
+  previously clamped: single-tile images returned the top-left crop of the
+  deepest available reduction, and tiled images failed later with an
+  unrelated code-block error.
+- `j2k-jpeg` decodes the remaining JPEG classes libjpeg-turbo decodes:
+  - sequential 8- and 12-bit frames whose components are split across
+    several scans (multi-scan, one per component or partly interleaved),
+    decoded through the progressive coefficient path;
+  - 8-bit progressive CMYK and YCCK;
+  - 12-bit CMYK/YCCK at any whole-ratio sampling, such as YCCK with Y and K
+    at 2x2;
+  - lossless SOF3 at every precision from 2 to 16 bits, with point
+    transforms, split scans that each carry their own predictor and point
+    transform, any whole-ratio sampling at odd sizes, and row-sink decoding
+    of subsampled frames.
+
+  Lossless output keeps native-range samples: 8-bit formats up to 8-bit
+  precision, 16-bit above. Every lossless case libjpeg-turbo decodes, and
+  DCMTK-written DICOM codestreams (lossless SV1 and other predictors at 8 to
+  16 bits stored, 12-bit extended and progressive, RGB), now match
+  `djpeg`/`dcmdjpeg` byte for byte. Explicit Metal decode covers all of them.
+- Behavior fixes that change decoded output to match libjpeg-turbo:
+  - YCCK decodes YCC to complemented CMY before applying K, as
+    `ycck_cmyk_convert` does. Every Adobe YCCK JPEG, at 8 and 12 bits, on
+    CPU and Metal, previously decoded to wrong colors.
+  - Subsampled lossless components are replicated, as libjpeg-turbo's
+    lossless upsampler does, instead of smoothed.
+  - Color spaces follow `default_decompress_parms`. A JFIF marker means
+    YCbCr even with an Adobe transform-0 marker. Reserved Adobe transforms
+    mean YCbCr (3 components) or YCCK (4). Unmarked components with IDs
+    `R`, `G`, `B` mean RGB. Unmarked three-component lossless frames are
+    RGB, which is how DICOM encoders write RGB; they were previously
+    color-converted as YCbCr.
+- Device planning, which feeds the Metal and CUDA fast paths and explicit
+  Metal decoder construction, now accepts 0xFF fill bytes before markers
+  (T.81 B.1.1.2). DICOM encoders pad fragments with one before EOI, and CPU
+  decode already accepted them.
+- JPEG Metal `Decoder::new` builds its plan directly instead of through a
+  cache local to the call, which hashed the whole input twice for a lookup
+  that always missed: about 2.7 ms per 5 MB input.
+- `j2k-jpeg` encodes the JPEG forms DICOM writes:
+  - `encode_jpeg_lossless`: lossless (SOF3) at 2 to 16 bits from `Gray8`,
+    `Gray16`, `Rgb8`, or `Rgb16` samples, with predictors 1–7 (SV1 is 1),
+    point transforms, and restart intervals in rows, through
+    `JpegLosslessEncodeOptions`. Output matches libjpeg-turbo
+    `cjpeg -lossless` byte for byte on every grayscale and RGB case of the
+    lossless matrix, and DCMTK `dcmdjpeg` decodes it exactly.
+  - `encode_jpeg_extended12`: 12-bit extended sequential (SOF1) from
+    `JpegSamples12` grayscale or RGB (4:4:4, 4:2:2, 4:2:0), with Huffman
+    tables built from the image. `djpeg` and `dcmdjpeg` decode it to the same
+    samples.
+  - `encode_jpeg_baseline_optimized`: baseline encode with optimized Huffman
+    tables (`cjpeg -optimize`). Pixels equal `encode_jpeg_baseline`; tables
+    and entropy-coded data equal `jpegtran -optimize`.
+
+  `JpegEncodeError` gains `RestartIntervalTooLarge`, `UnsupportedPixelFormat`,
+  `UnsupportedPrecision`, `InvalidPredictor`, `InvalidPointTransform`, and
+  `SampleOutOfRange`; exhaustive matches on it need new arms.
+- GPU lossless JPEG encode, byte-identical to `encode_jpeg_lossless`:
+  `j2k_jpeg_metal::encode_jpeg_lossless_from_metal_buffer` (6.2 ms against
+  39.7 ms on the CPU for a 2048×2500 16-bit image on an M4 Pro) and
+  `j2k_jpeg_cuda::encode_jpeg_lossless_from_cuda_buffer`, whose CUDA-Oxide
+  kernels build on Linux cuda-oxide hosts (byte-identical output verified on
+  an RTX 4070 SUPER, `sm_89`). The device classifies and packs;
+  the host builds the table from the device histogram and stuffs bytes.
+  `j2k-codec-math` adds `jpeg::lossless`, the prediction and difference
+  coding all three encoders share.
+- JPEG Metal decode now covers every JPEG the CPU decoder supports. Explicit
+  `BackendRequest::Metal` requests for shapes outside the fast-packet kernels
+  (grayscale; 4:4:0, 4:1:1, 4:1:0, 1x4 and other whole-ratio sampling;
+  4:2:0/4:2:2 images at most 4 px wide; subsampled APP14 RGB; CMYK and YCCK;
+  progressive 8-bit; extended and progressive 12-bit; multi-scan sequential;
+  and lossless SOF3 at every precision with predictors 1–7) use hybrid decode
+  instead of returning `UnsupportedMetalRequest`. The CPU runs only the serial entropy stage,
+  writing dequantized DCT blocks or lossless differences straight into shared
+  Metal storage; Metal runs the IDCT or predictor reconstruction, chroma
+  upsampling, color conversion, and output packing. Full, region, scaled, and
+  region-scaled output, including `Gray16`/`Rgb16`/`Rgba16`, is byte-identical
+  to CPU decode and Metal-resident. Regions of 8-bit sequential images decode
+  only the MCU rows they need. Explicit Metal requests CPU decode rejects
+  still return `UnsupportedMetalRequest`, now with CPU-mirrored reasons.
+  Single-image hybrid decode runs at about CPU speed for DCT JPEG and up to
+  2.2× slower for lossless (see `docs/decode-architecture.md`), so
+  `BackendRequest::Auto` routing is unchanged.
+- JPEG Metal explicit batches, `JpegTileBatch`, viewports, and session decode
+  accept the same JPEG classes. The reusable RGB8 buffer and RGBA8 texture
+  batch outputs (`Codec::decode_rgb8_batch_into_buffer_with_session` and
+  `Codec::decode_rgb8_batch_into_textures_with_session`) no longer reject
+  mixed sampling families, restart-coded full 4:2:2/4:4:4 tiles, or inputs
+  without a fast packet: tiles the batched fast-packet kernels cannot share
+  are hybrid-decoded into their slots. Output dimensions must still match.
+- `j2k-jpeg` adds `metal_hybrid_eligibility`,
+  `JpegCapabilityReport::metal_hybrid`, and
+  `JpegResolvedDecodePath::MetalHybrid`; `resolve_path(BackendRequest::Metal)`
+  returns `MetalHybrid` for JPEG classes outside the fast-packet kernels.
+  Code that matches `JpegResolvedDecodePath` exhaustively needs the new arm.
+  `JpegCapabilityReport::metal_resident_rgb8_batch_output` now accepts every
+  RGB8-decodable input. Hidden `adapter` APIs expose device DCT and lossless
+  layouts, entropy-only decode into caller-owned storage, and
+  per-component scaling geometry.
+- Test support adds `lossless_matrix_cases`: 81 libjpeg-turbo and
+  reference-encoder lossless JPEGs with `djpeg` references, generated by
+  `corpus/conformance/lossless_matrix.py`. It also adds
+  `dicom_matrix_cases`: DCMTK-written DICOM codestreams with DCMTK decodes,
+  generated by `corpus/conformance/dicom_matrix.py`. The scaled matrix gains
+  multi-scan sequential and CMYK/YCCK cases (322 cases).
+- Default CPU JPEG-to-HTJ2K batches process whole tiles in bounded parallel
+  waves, preserving input order, per-tile errors, and aggregate memory admission.
+  Parallel stage reports sum per-tile time rather than elapsed batch latency.
 - Reversible (5/3) coefficients whose low bit-planes were not decoded, because
   a classic code block's coding passes stop early, are now reconstructed with
   r = 1/2 in T.800 Equation E-8 (E.1.2.2), the value already used for

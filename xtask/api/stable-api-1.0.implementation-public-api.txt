@@ -373,6 +373,7 @@ pub type j2k_core::ReadySubmission<T, E>::Output = T
 #[repr(C)] pub struct j2k_jpeg::adapter::JpegHuffmanTable
 impl core::convert::AsRef<[u8]> for j2k_jpeg::adapter::SharedJpegInput
 impl core::convert::From<j2k_jpeg::JpegEncodeError> for j2k_jpeg::adapter::JpegBaselineGpuEncodeError
+impl core::convert::From<j2k_jpeg::JpegEncodeError> for j2k_jpeg::adapter::JpegLosslessGpuEncodeError
 impl core::convert::From<j2k_jpeg::adapter::JpegFast420PacketV1> for j2k_jpeg::adapter::JpegFastPacket
 impl core::convert::From<j2k_jpeg::adapter::JpegFast422PacketV1> for j2k_jpeg::adapter::JpegFastPacket
 impl core::convert::From<j2k_jpeg::adapter::JpegFast444PacketV1> for j2k_jpeg::adapter::JpegFastPacket
@@ -390,8 +391,14 @@ impl j2k_core::traits::ImageCodec for j2k_jpeg::JpegCodec
 impl j2k_core::traits::TileBatchDecode for j2k_jpeg::JpegCodec
 impl j2k_jpeg::adapter::FastPacketError
 impl j2k_jpeg::adapter::JpegCachedPlan
+impl j2k_jpeg::adapter::JpegDeviceDctComponentLayout
+impl j2k_jpeg::adapter::JpegDeviceDctLayout
+impl j2k_jpeg::adapter::JpegDeviceLosslessLayout
 impl j2k_jpeg::adapter::JpegFastPacket
 impl j2k_jpeg::adapter::JpegHuffmanTable
+impl j2k_jpeg::adapter::JpegLosslessEncodePlan
+impl j2k_jpeg::adapter::JpegLosslessGpuEncodeParams
+impl j2k_jpeg::adapter::JpegLosslessHuffmanTable
 impl j2k_jpeg::adapter::JpegPlanCache
 impl j2k_jpeg::adapter::SharedJpegFastPacket
 impl j2k_jpeg::adapter::SharedJpegInput
@@ -421,17 +428,27 @@ pub const fn j2k_jpeg::adapter::JpegFastPacket::family(&self) -> j2k_jpeg::adapt
 pub const fn j2k_jpeg::adapter::JpegFastPacket::fast420(&self) -> core::option::Option<&j2k_jpeg::adapter::JpegFast420PacketV1>
 pub const fn j2k_jpeg::adapter::JpegFastPacket::fast422(&self) -> core::option::Option<&j2k_jpeg::adapter::JpegFast422PacketV1>
 pub const fn j2k_jpeg::adapter::JpegFastPacket::fast444(&self) -> core::option::Option<&j2k_jpeg::adapter::JpegFast444PacketV1>
+pub const fn j2k_jpeg::adapter::JpegLosslessEncodePlan::max_sample(&self) -> u32
+pub const fn j2k_jpeg::adapter::JpegLosslessEncodePlan::restart_interval_mcus(&self) -> core::option::Option<u16>
+pub const fn j2k_jpeg::adapter::JpegLosslessEncodePlan::restart_intervals(&self) -> usize
+pub const fn j2k_jpeg::adapter::JpegLosslessEncodePlan::samples(&self) -> usize
+pub const fn j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::chunks(&self) -> u32
 pub const fn j2k_jpeg::adapter::JpegPlanCache::diagnostics(&self) -> j2k_jpeg::adapter::JpegPlanCacheDiagnostics
 pub const fn j2k_jpeg::transcode::DctExtractOptions::dequantized_only() -> Self
 pub const j2k_jpeg::adapter::DEFAULT_JPEG_PLAN_CACHE_ENTRIES: usize
 pub const j2k_jpeg::adapter::DEFAULT_JPEG_PLAN_CACHE_HOST_BYTES: usize
 pub const j2k_jpeg::adapter::JPEG_BASELINE_ZIGZAG: [u8; 64]
+pub const j2k_jpeg::adapter::JPEG_DEVICE_LOSSLESS_MAX_COMPONENTS: usize
+pub const j2k_jpeg::adapter::JPEG_DEVICE_MAX_COMPONENTS: usize
+pub const j2k_jpeg::adapter::JPEG_LOSSLESS_GPU_CHUNK_PIXELS: u32
 pub enum j2k_jpeg::adapter::FastPacketError
 pub enum j2k_jpeg::adapter::JpegBaselineGpuEncodeError
 pub enum j2k_jpeg::adapter::JpegCachedPlanBuildError
+pub enum j2k_jpeg::adapter::JpegDeviceUpsample
 pub enum j2k_jpeg::adapter::JpegFastPacket
 pub enum j2k_jpeg::adapter::JpegFastPacketFamily
 pub enum j2k_jpeg::adapter::JpegFastPacketState
+pub enum j2k_jpeg::adapter::JpegLosslessGpuEncodeError
 pub enum j2k_jpeg::adapter::JpegPlanCacheError
 pub enum j2k_jpeg::adapter::JpegPlanCacheInsert
 pub enum j2k_jpeg::adapter::TableKind
@@ -473,10 +490,21 @@ pub fn j2k_jpeg::adapter::JpegCachedPlan::build(j2k_jpeg::adapter::SharedJpegInp
 pub fn j2k_jpeg::adapter::JpegCachedPlan::build_from_view_with_decoder(j2k_jpeg::JpegView<'_>, usize) -> core::result::Result<(Self, j2k_jpeg::Decoder<'_>), j2k_jpeg::adapter::JpegCachedPlanBuildError>
 pub fn j2k_jpeg::adapter::JpegCachedPlan::build_with_decoder(&[u8], usize) -> core::result::Result<(Self, j2k_jpeg::Decoder<'_>), j2k_jpeg::adapter::JpegCachedPlanBuildError>
 pub fn j2k_jpeg::adapter::JpegCachedPlan::try_new(j2k_jpeg::adapter::SharedJpegInput, j2k_jpeg::DeviceBatchSummary, j2k_jpeg::ColorSpace, j2k_jpeg::adapter::JpegFastPacketState) -> core::result::Result<Self, j2k_jpeg::adapter::JpegPlanCacheError>
+pub fn j2k_jpeg::adapter::JpegDeviceDctComponentLayout::block_count(self) -> core::result::Result<usize, j2k_jpeg::JpegError>
+pub fn j2k_jpeg::adapter::JpegDeviceDctLayout::block_bases(&self) -> core::result::Result<[usize; 4], j2k_jpeg::JpegError>
+pub fn j2k_jpeg::adapter::JpegDeviceDctLayout::components(&self) -> &[j2k_jpeg::adapter::JpegDeviceDctComponentLayout]
+pub fn j2k_jpeg::adapter::JpegDeviceDctLayout::origin(&self, usize) -> (u32, u32)
+pub fn j2k_jpeg::adapter::JpegDeviceDctLayout::total_blocks(&self) -> core::result::Result<usize, j2k_jpeg::JpegError>
+pub fn j2k_jpeg::adapter::JpegDeviceLosslessLayout::components(&self) -> &[j2k_jpeg::adapter::JpegDeviceLosslessComponent]
+pub fn j2k_jpeg::adapter::JpegDeviceLosslessLayout::sample_bases(&self) -> [usize; 3]
+pub fn j2k_jpeg::adapter::JpegDeviceLosslessLayout::total_samples(&self) -> usize
+pub fn j2k_jpeg::adapter::JpegDeviceLosslessLayout::uniform_predictor(&self) -> core::option::Option<u8>
 pub fn j2k_jpeg::adapter::JpegFastPacket::from(j2k_jpeg::adapter::JpegFast420PacketV1) -> Self
 pub fn j2k_jpeg::adapter::JpegFastPacket::from(j2k_jpeg::adapter::JpegFast422PacketV1) -> Self
 pub fn j2k_jpeg::adapter::JpegFastPacket::from(j2k_jpeg::adapter::JpegFast444PacketV1) -> Self
 pub fn j2k_jpeg::adapter::JpegHuffmanTable::derive_canonical(&self) -> core::result::Result<j2k_jpeg::adapter::JpegCanonicalHuffmanTable, j2k_jpeg::JpegError>
+pub fn j2k_jpeg::adapter::JpegLosslessGpuEncodeError::from(j2k_jpeg::JpegEncodeError) -> Self
+pub fn j2k_jpeg::adapter::JpegLosslessHuffmanTable::codes(&self) -> j2k_jpeg::adapter::JpegBaselineHuffmanTable
 pub fn j2k_jpeg::adapter::JpegPlanCache::default() -> Self
 pub fn j2k_jpeg::adapter::JpegPlanCache::get(&mut self, &[u8]) -> core::option::Option<j2k_jpeg::adapter::JpegCachedPlan>
 pub fn j2k_jpeg::adapter::JpegPlanCache::insert(&mut self, j2k_jpeg::adapter::JpegCachedPlan) -> core::result::Result<j2k_jpeg::adapter::JpegPlanCacheInsert, j2k_jpeg::adapter::JpegPlanCacheError>
@@ -512,6 +540,7 @@ pub fn j2k_jpeg::adapter::SharedJpegInput::try_copy_from_slice_with_external_liv
 pub fn j2k_jpeg::adapter::SharedJpegInput::try_from_arc(alloc::sync::Arc<[u8]>) -> core::result::Result<Self, j2k_jpeg::adapter::JpegPlanCacheError>
 pub fn j2k_jpeg::adapter::SharedJpegInput::try_from_arc_with_external_live(alloc::sync::Arc<[u8]>, usize) -> core::result::Result<Self, j2k_jpeg::adapter::JpegPlanCacheError>
 pub fn j2k_jpeg::adapter::assemble_jpeg_baseline_frame(&[u8], u32, u32, &j2k_jpeg::adapter::JpegBaselineEncodeTables, j2k_jpeg::JpegEncodeOptions, j2k_jpeg::JpegBackend) -> core::result::Result<j2k_jpeg::EncodedJpeg, j2k_jpeg::JpegEncodeError>
+pub fn j2k_jpeg::adapter::assemble_jpeg_lossless_frame(&j2k_jpeg::adapter::JpegLosslessEncodePlan, &j2k_jpeg::adapter::JpegLosslessHuffmanTable, &[u8], j2k_jpeg::JpegBackend) -> core::result::Result<j2k_jpeg::EncodedJpeg, j2k_jpeg::JpegEncodeError>
 pub fn j2k_jpeg::adapter::baseline_encode_tables(j2k_jpeg::JpegEncodeOptions) -> core::result::Result<j2k_jpeg::adapter::JpegBaselineEncodeTables, j2k_jpeg::JpegEncodeError>
 pub fn j2k_jpeg::adapter::build_device_plan<'a>(&'a j2k_jpeg::Decoder<'a>, u32) -> core::result::Result<j2k_jpeg::adapter::DeviceDecodePlan<'a>, j2k_jpeg::JpegError>
 pub fn j2k_jpeg::adapter::build_fast420_packet(&[u8]) -> core::result::Result<j2k_jpeg::adapter::JpegFast420PacketV1, j2k_jpeg::adapter::FastPacketError>
@@ -519,12 +548,24 @@ pub fn j2k_jpeg::adapter::build_fast422_packet(&[u8]) -> core::result::Result<j2
 pub fn j2k_jpeg::adapter::build_fast444_packet(&[u8]) -> core::result::Result<j2k_jpeg::adapter::JpegFast444PacketV1, j2k_jpeg::adapter::FastPacketError>
 pub fn j2k_jpeg::adapter::build_gray_packet(&[u8]) -> core::result::Result<j2k_jpeg::adapter::JpegGrayPacketV1, j2k_jpeg::adapter::FastPacketError>
 pub fn j2k_jpeg::adapter::classify_color_fast_packet_family(&j2k_jpeg::Decoder<'_>) -> core::option::Option<j2k_jpeg::adapter::JpegFastPacketFamily>
+pub fn j2k_jpeg::adapter::decode_device_dct_blocks_into(&j2k_jpeg::Decoder<'_>, &mut [[i16; 64]]) -> core::result::Result<alloc::vec::Vec<j2k_jpeg::Warning>, j2k_jpeg::JpegError>
+pub fn j2k_jpeg::adapter::decode_device_dct_window_into(&j2k_jpeg::Decoder<'_>, j2k_jpeg::adapter::JpegDeviceMcuWindow, &mut [[i16; 64]]) -> core::result::Result<(), j2k_jpeg::JpegError>
+pub fn j2k_jpeg::adapter::decode_device_lossless_differences_into(&j2k_jpeg::Decoder<'_>, j2k_core::pixel::PixelFormat, &mut [u16]) -> core::result::Result<alloc::vec::Vec<j2k_jpeg::Warning>, j2k_jpeg::JpegError>
 pub fn j2k_jpeg::adapter::decoder_bytes<'a>(&'a j2k_jpeg::Decoder<'a>) -> &'a [u8]
 pub fn j2k_jpeg::adapter::decoder_retained_allocation_bytes(&j2k_jpeg::Decoder<'_>) -> core::result::Result<usize, j2k_jpeg::JpegError>
+pub fn j2k_jpeg::adapter::device_component_geometry(&j2k_jpeg::Info, j2k_core::scale::Downscale) -> core::result::Result<alloc::vec::Vec<j2k_jpeg::adapter::JpegDeviceComponentGeometry>, j2k_jpeg::JpegError>
+pub fn j2k_jpeg::adapter::device_dct_layout(&j2k_jpeg::Decoder<'_>) -> core::result::Result<j2k_jpeg::adapter::JpegDeviceDctLayout, j2k_jpeg::JpegError>
+pub fn j2k_jpeg::adapter::device_dct_mcu_window(&j2k_jpeg::Decoder<'_>, &[[u32; 4]]) -> core::option::Option<j2k_jpeg::adapter::JpegDeviceMcuWindow>
+pub fn j2k_jpeg::adapter::device_dct_window_layout(&j2k_jpeg::Decoder<'_>, j2k_jpeg::adapter::JpegDeviceMcuWindow) -> core::result::Result<j2k_jpeg::adapter::JpegDeviceDctLayout, j2k_jpeg::JpegError>
+pub fn j2k_jpeg::adapter::device_lossless_layout(&j2k_jpeg::Decoder<'_>, j2k_core::pixel::PixelFormat) -> core::result::Result<j2k_jpeg::adapter::JpegDeviceLosslessLayout, j2k_jpeg::JpegError>
 pub fn j2k_jpeg::adapter::encode_jpeg_baseline_gpu_batch<T, A>(&[T], j2k_jpeg::JpegEncodeOptions, &mut A) -> core::result::Result<alloc::vec::Vec<j2k_jpeg::EncodedJpeg>, <A as j2k_jpeg::adapter::JpegBaselineGpuEncodeHostAdapter>::Error> where T: core::marker::Copy, A: j2k_jpeg::adapter::JpegBaselineGpuEncodeHostAdapter<T>
 pub fn j2k_jpeg::adapter::encode_jpeg_baseline_gpu_batch_with_external_live<T, A>(&[T], j2k_jpeg::JpegEncodeOptions, &mut A, usize) -> core::result::Result<alloc::vec::Vec<j2k_jpeg::EncodedJpeg>, <A as j2k_jpeg::adapter::JpegBaselineGpuEncodeHostAdapter>::Error> where T: core::marker::Copy, A: j2k_jpeg::adapter::JpegBaselineGpuEncodeHostAdapter<T>
 pub fn j2k_jpeg::adapter::encode_jpeg_baseline_gpu_tile<T, A>(T, j2k_jpeg::JpegEncodeOptions, &mut A) -> core::result::Result<j2k_jpeg::EncodedJpeg, <A as j2k_jpeg::adapter::JpegBaselineGpuEncodeHostAdapter>::Error> where T: core::marker::Copy, A: j2k_jpeg::adapter::JpegBaselineGpuEncodeHostAdapter<T>
 pub fn j2k_jpeg::adapter::encode_jpeg_baseline_gpu_tile_with_external_live<T, A>(T, j2k_jpeg::JpegEncodeOptions, &mut A, usize) -> core::result::Result<j2k_jpeg::EncodedJpeg, <A as j2k_jpeg::adapter::JpegBaselineGpuEncodeHostAdapter>::Error> where T: core::marker::Copy, A: j2k_jpeg::adapter::JpegBaselineGpuEncodeHostAdapter<T>
+pub fn j2k_jpeg::adapter::finish_jpeg_lossless_gpu_entropy(&[u8], &[u32]) -> core::result::Result<alloc::vec::Vec<u8>, j2k_jpeg::JpegEncodeError>
+pub fn j2k_jpeg::adapter::jpeg_lossless_huffman_table(&[u64; 17]) -> core::result::Result<j2k_jpeg::adapter::JpegLosslessHuffmanTable, j2k_jpeg::JpegEncodeError>
+pub fn j2k_jpeg::adapter::plan_jpeg_lossless_encode(j2k_core::pixel::PixelFormat, (u32, u32), j2k_jpeg::JpegLosslessEncodeOptions) -> core::result::Result<j2k_jpeg::adapter::JpegLosslessEncodePlan, j2k_jpeg::JpegEncodeError>
+pub fn j2k_jpeg::adapter::plan_jpeg_lossless_gpu_encode(j2k_jpeg::adapter::JpegLosslessGpuEncodeTile, j2k_jpeg::JpegLosslessEncodeOptions, j2k_jpeg::JpegBackend) -> core::result::Result<j2k_jpeg::adapter::JpegLosslessGpuEncodePlan, j2k_jpeg::adapter::JpegLosslessGpuEncodeError>
 pub fn j2k_jpeg::adapter::preflight_jpeg_baseline_gpu_encode_tile(j2k_jpeg::adapter::JpegBaselineGpuEncodeTile, j2k_jpeg::JpegEncodeOptions, j2k_jpeg::JpegBackend) -> core::result::Result<(), j2k_jpeg::adapter::JpegBaselineGpuEncodeError>
 pub fn j2k_jpeg::adapter::summarize_device_batch(&j2k_jpeg::Decoder<'_>, u32) -> j2k_jpeg::DeviceBatchSummary
 pub fn j2k_jpeg::bench_support::Bench420DispatchStats::neon_tail_chunks(&self) -> usize
@@ -570,6 +611,7 @@ pub fn j2k_jpeg::bench_support::BenchUpsampleH2V2Scratch::run(&mut self)
 pub fn j2k_jpeg::bench_support::bench_idct_dc_only_block_with(i16, &mut [u8; 64])
 pub fn j2k_jpeg::bench_support::bench_idct_neon_block(&[i16; 64], &mut [u8; 64])
 pub fn j2k_jpeg::bench_support::bench_idct_neon_bottom_half_zero_block(&[i16; 64], &mut [u8; 64])
+pub fn j2k_jpeg::bench_support::bench_idct_neon_top_left_2x2_block(&[i16; 64], &mut [u8; 64])
 pub fn j2k_jpeg::bench_support::bench_idct_reduced_2x2_block_with(&[i16; 64], &mut [u8; 4])
 pub fn j2k_jpeg::bench_support::bench_idct_reference_block() -> [u8; 64]
 pub fn j2k_jpeg::bench_support::bench_idct_reference_block_with(&[i16; 64], &mut [u8; 64])
@@ -718,6 +760,35 @@ pub j2k_jpeg::adapter::JpegCanonicalHuffmanTable::huffsize_len: usize
 pub j2k_jpeg::adapter::JpegCanonicalHuffmanTable::max_code: [i32; 17]
 pub j2k_jpeg::adapter::JpegCanonicalHuffmanTable::min_code: [i32; 17]
 pub j2k_jpeg::adapter::JpegCanonicalHuffmanTable::val_offset: [i32; 17]
+pub j2k_jpeg::adapter::JpegDeviceComponentGeometry::h_ratio: u32
+pub j2k_jpeg::adapter::JpegDeviceComponentGeometry::height: u32
+pub j2k_jpeg::adapter::JpegDeviceComponentGeometry::idct_size: u32
+pub j2k_jpeg::adapter::JpegDeviceComponentGeometry::upsample: j2k_jpeg::adapter::JpegDeviceUpsample
+pub j2k_jpeg::adapter::JpegDeviceComponentGeometry::v_ratio: u32
+pub j2k_jpeg::adapter::JpegDeviceComponentGeometry::width: u32
+pub j2k_jpeg::adapter::JpegDeviceDctComponentLayout::block_cols: u32
+pub j2k_jpeg::adapter::JpegDeviceDctComponentLayout::block_rows: u32
+pub j2k_jpeg::adapter::JpegDeviceDctLayout::precision: u8
+pub j2k_jpeg::adapter::JpegDeviceLosslessComponent::h_expand: u8
+pub j2k_jpeg::adapter::JpegDeviceLosslessComponent::height: u32
+pub j2k_jpeg::adapter::JpegDeviceLosslessComponent::initial_predictor: u16
+pub j2k_jpeg::adapter::JpegDeviceLosslessComponent::point_transform: u8
+pub j2k_jpeg::adapter::JpegDeviceLosslessComponent::predictor: u8
+pub j2k_jpeg::adapter::JpegDeviceLosslessComponent::restart_rows: u32
+pub j2k_jpeg::adapter::JpegDeviceLosslessComponent::sample_limit: u16
+pub j2k_jpeg::adapter::JpegDeviceLosslessComponent::v_expand: u8
+pub j2k_jpeg::adapter::JpegDeviceLosslessComponent::width: u32
+pub j2k_jpeg::adapter::JpegDeviceLosslessLayout::color_space: j2k_jpeg::ColorSpace
+pub j2k_jpeg::adapter::JpegDeviceLosslessLayout::precision: u8
+pub j2k_jpeg::adapter::JpegDeviceMcuWindow::col: u32
+pub j2k_jpeg::adapter::JpegDeviceMcuWindow::cols: u32
+pub j2k_jpeg::adapter::JpegDeviceMcuWindow::row: u32
+pub j2k_jpeg::adapter::JpegDeviceMcuWindow::rows: u32
+pub j2k_jpeg::adapter::JpegDeviceUpsample::FancyH1V2
+pub j2k_jpeg::adapter::JpegDeviceUpsample::FancyH2V1
+pub j2k_jpeg::adapter::JpegDeviceUpsample::FancyH2V2
+pub j2k_jpeg::adapter::JpegDeviceUpsample::None
+pub j2k_jpeg::adapter::JpegDeviceUpsample::Replicate
 pub j2k_jpeg::adapter::JpegEntropyCheckpointV1::bit_acc: u64
 pub j2k_jpeg::adapter::JpegEntropyCheckpointV1::bit_count: u32
 pub j2k_jpeg::adapter::JpegEntropyCheckpointV1::cb_prev_dc: i32
@@ -794,6 +865,52 @@ pub j2k_jpeg::adapter::JpegGrayPacketV1::y_quant: [u16; 64]
 pub j2k_jpeg::adapter::JpegHuffmanTable::bits: [u8; 16]
 pub j2k_jpeg::adapter::JpegHuffmanTable::values: [u8; 256]
 pub j2k_jpeg::adapter::JpegHuffmanTable::values_len: u16
+pub j2k_jpeg::adapter::JpegLosslessEncodePlan::components: u8
+pub j2k_jpeg::adapter::JpegLosslessEncodePlan::height: u32
+pub j2k_jpeg::adapter::JpegLosslessEncodePlan::initial_predictor: u16
+pub j2k_jpeg::adapter::JpegLosslessEncodePlan::point_transform: u8
+pub j2k_jpeg::adapter::JpegLosslessEncodePlan::precision: u8
+pub j2k_jpeg::adapter::JpegLosslessEncodePlan::predictor: u8
+pub j2k_jpeg::adapter::JpegLosslessEncodePlan::restart_rows: u32
+pub j2k_jpeg::adapter::JpegLosslessEncodePlan::width: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::Encode(j2k_jpeg::JpegEncodeError)
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::InputRangeExceedsBuffer
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::InputRangeExceedsBuffer::buffer_len: usize
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::InputRangeExceedsBuffer::required_end: usize
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::PitchTooShort
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::PitchTooShort::pitch_bytes: usize
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::PitchTooShort::row_bytes: usize
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::TooLarge
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::TooLarge::reason: &'static str
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::UnalignedSamples
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::UnalignedSamples::alignment: usize
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::UnsupportedBackend
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::UnsupportedBackend::expected: j2k_jpeg::JpegBackend
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeError::UnsupportedBackend::requested: j2k_jpeg::JpegBackend
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::chunk_pixels: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::chunks_per_row: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::components: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::height: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::initial_predictor: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::input_offset_bytes: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::interval_rows: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::intervals: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::max_sample: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::packed_words: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::pitch_bytes: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::point_transform: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::predictor: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::sample_bytes: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::sample_count: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeParams::width: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodePlan::params: j2k_jpeg::adapter::JpegLosslessGpuEncodeParams
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodePlan::plan: j2k_jpeg::adapter::JpegLosslessEncodePlan
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeTile::buffer_len: usize
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeTile::byte_offset: usize
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeTile::format: j2k_core::pixel::PixelFormat
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeTile::height: u32
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeTile::pitch_bytes: usize
+pub j2k_jpeg::adapter::JpegLosslessGpuEncodeTile::width: u32
 pub j2k_jpeg::adapter::JpegPlanCacheDiagnostics::disabled_rejections: u64
 pub j2k_jpeg::adapter::JpegPlanCacheDiagnostics::entries: usize
 pub j2k_jpeg::adapter::JpegPlanCacheDiagnostics::entry_limit: usize
@@ -908,6 +1025,17 @@ pub struct j2k_jpeg::adapter::JpegBaselineHuffmanTable
 pub struct j2k_jpeg::adapter::JpegBaselineSampling
 pub struct j2k_jpeg::adapter::JpegCachedPlan
 pub struct j2k_jpeg::adapter::JpegCanonicalHuffmanTable
+pub struct j2k_jpeg::adapter::JpegDeviceComponentGeometry
+pub struct j2k_jpeg::adapter::JpegDeviceDctComponentLayout
+pub struct j2k_jpeg::adapter::JpegDeviceDctLayout
+pub struct j2k_jpeg::adapter::JpegDeviceLosslessComponent
+pub struct j2k_jpeg::adapter::JpegDeviceLosslessLayout
+pub struct j2k_jpeg::adapter::JpegDeviceMcuWindow
+pub struct j2k_jpeg::adapter::JpegLosslessEncodePlan
+pub struct j2k_jpeg::adapter::JpegLosslessGpuEncodeParams
+pub struct j2k_jpeg::adapter::JpegLosslessGpuEncodePlan
+pub struct j2k_jpeg::adapter::JpegLosslessGpuEncodeTile
+pub struct j2k_jpeg::adapter::JpegLosslessHuffmanTable
 pub struct j2k_jpeg::adapter::JpegPlanCache
 pub struct j2k_jpeg::adapter::JpegPlanCacheDiagnostics
 pub struct j2k_jpeg::adapter::SharedJpegFastPacket(_)
@@ -2484,6 +2612,9 @@ pub fn j2k_native::idwt_band_index(u32, u32, bool) -> u32
 pub fn j2k_native::idwt_required_input_window_for_rects(j2k_native::J2kRequiredBandRegion, j2k_types::decode_plan::J2kRect, j2k_types::decode_plan::J2kRect, bool, bool) -> j2k_native::J2kRequiredBandRegion
 pub fn j2k_native::idwt_required_input_windows(&j2k_types::decode_plan::J2kDirectIdwtStep, j2k_native::J2kRequiredBandRegion) -> j2k_native::J2kIdwtRequiredInputWindows
 pub fn j2k_native::inspect_jp2_container(&[u8]) -> j2k_native::Result<j2k_native::Jp2Container<'_>>
+pub fn j2k_native::inverse_dwt97_reference(&j2k_types::transform::dwt97::J2kForwardDwt97Output) -> j2k_native::Result<alloc::vec::Vec<f32>>
+pub fn j2k_native::inverse_ict_reference(alloc::vec::Vec<alloc::vec::Vec<f32>>) -> j2k_native::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>>
+pub fn j2k_native::irreversible_quantization_profile_scale_ceiling(u8, &j2k_native::EncodeOptions) -> core::option::Option<f32>
 pub fn j2k_native::irreversible_quantization_step_for_subband(u8, u8, f32, j2k_types::transform::quantization::IrreversibleQuantizationSubbandScales, j2k_types::tier1::classic::J2kSubBandType) -> j2k_types::transform::quantization::IrreversibleQuantizationStep
 pub fn j2k_native::pack_j2k_code_block_scalar_from_tier1_tokens(&[u8], &[j2k_native::J2kTier1TokenSegment], u8, u8) -> j2k_native::EncodeResult<j2k_types::tier1::classic::EncodedJ2kCodeBlock>
 pub fn j2k_native::packet_math::HtSegmentLengthError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -2878,6 +3009,7 @@ pub const fn j2k_types::encode_geometry::encode_dwt_level_dimensions_for_input(u
 pub const fn j2k_types::encode_geometry::lossless_decomposition_levels(u32, u32, j2k_types::J2kPacketizationProgressionOrder, core::option::Option<u8>) -> u8
 pub const fn j2k_types::encode_geometry::maximum_decomposition_levels(u32, u32) -> u8
 pub const fn j2k_types::encode_geometry::reversible_subband_total_bitplanes(u8, u8, j2k_types::J2kSubBandType) -> u8
+pub const fn j2k_types::encode_geometry::tiled_decomposition_levels(u32, u32, u32, u32, u8) -> u8
 pub const j2k_types::MAX_JPEG2000_PART1_COMPONENTS: u16
 pub const j2k_types::MAX_JPEG2000_PART1_SAMPLE_BIT_DEPTH: u8
 pub enum j2k_types::encode_geometry::CodeBlockGeometryError
@@ -4072,6 +4204,7 @@ pub unsafe fn j2k_cuda_j2k_engine::J2kCudaEngine<'_>::j2k_store_rgbi16_native_ba
 #[repr(C)] pub struct j2k_cuda_jpeg_engine::CudaJpegEntropyOverflowState
 #[repr(C)] pub struct j2k_cuda_jpeg_engine::CudaJpegEntropySyncState
 #[repr(C)] pub struct j2k_cuda_jpeg_engine::CudaJpegHuffmanTable
+#[repr(C)] pub struct j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams
 impl core::default::Default for j2k_cuda_jpeg_engine::CudaJpegBaselineEncodeHuffmanTable
 impl core::default::Default for j2k_cuda_jpeg_engine::CudaJpegChunkedEntropyConfig
 impl j2k_core::accelerator::GpuAbi for j2k_cuda_jpeg_engine::CudaJpegBaselineEncodeHuffmanTable
@@ -4080,13 +4213,13 @@ impl j2k_core::accelerator::GpuAbi for j2k_cuda_jpeg_engine::CudaJpegEntropyChec
 impl j2k_core::accelerator::GpuAbi for j2k_cuda_jpeg_engine::CudaJpegEntropyOverflowState
 impl j2k_core::accelerator::GpuAbi for j2k_cuda_jpeg_engine::CudaJpegEntropySyncState
 impl j2k_core::accelerator::GpuAbi for j2k_cuda_jpeg_engine::CudaJpegHuffmanTable
+impl j2k_core::accelerator::GpuAbi for j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams
 impl j2k_cuda_jpeg_engine::CudaJpegBaselineEncodeFormat
 impl j2k_cuda_jpeg_engine::CudaJpegChunkedEntropyConfig
 impl j2k_cuda_jpeg_engine::CudaJpegChunkedEntropyReport
 impl j2k_cuda_jpeg_engine::CudaJpegDecodeStageTimings
 impl j2k_cuda_jpeg_engine::CudaJpegHuffmanTable
 impl j2k_cuda_jpeg_engine::CudaJpegProfiledOutput
-impl j2k_cuda_jpeg_engine::JpegCudaEngine<'_>
 impl j2k_cuda_runtime::execution::CudaKernelParam for j2k_cuda_jpeg_engine::CudaJpegBaselineEncodeParams
 pub const fn j2k_cuda_jpeg_engine::CudaJpegDecodeStageTimings::component_workspace_bytes(self) -> usize
 pub const fn j2k_cuda_jpeg_engine::CudaJpegDecodeStageTimings::conversion_us(self) -> u128
@@ -4099,7 +4232,9 @@ pub const j2k_cuda_jpeg_engine::CudaJpegEntropyCheckpoint::NAME: &'static str
 pub const j2k_cuda_jpeg_engine::CudaJpegEntropyOverflowState::NAME: &'static str
 pub const j2k_cuda_jpeg_engine::CudaJpegEntropySyncState::NAME: &'static str
 pub const j2k_cuda_jpeg_engine::CudaJpegHuffmanTable::NAME: &'static str
+pub const j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::NAME: &'static str
 pub enum j2k_cuda_jpeg_engine::CudaJpegBaselineEncodeFormat
+pub enum j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeOutcome
 pub enum j2k_cuda_jpeg_engine::CudaJpegRgb8Sampling
 pub fn j2k_cuda_jpeg_engine::CudaJpegBaselineEncodeFormat::abi(self) -> u32
 pub fn j2k_cuda_jpeg_engine::CudaJpegBaselineEncodeHuffmanTable::default() -> Self
@@ -4125,6 +4260,7 @@ pub fn j2k_cuda_jpeg_engine::JpegCudaEngine<'_>::encode_jpeg_baseline_entropy(&s
 pub fn j2k_cuda_jpeg_engine::JpegCudaEngine<'_>::encode_jpeg_baseline_entropy_batch(&self, &j2k_cuda_jpeg_engine::CudaJpegBaselineEntropyEncodeBatchJob<'_>) -> core::result::Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, j2k_cuda_runtime::error::CudaError>
 pub fn j2k_cuda_jpeg_engine::JpegCudaEngine<'_>::encode_jpeg_baseline_entropy_batch_with_external_live(&self, &j2k_cuda_jpeg_engine::CudaJpegBaselineEntropyEncodeBatchJob<'_>, usize) -> core::result::Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, j2k_cuda_runtime::error::CudaError>
 pub fn j2k_cuda_jpeg_engine::JpegCudaEngine<'_>::encode_jpeg_baseline_entropy_with_external_live(&self, &j2k_cuda_jpeg_engine::CudaJpegBaselineEntropyEncodeJob<'_>, usize) -> core::result::Result<alloc::vec::Vec<u8>, j2k_cuda_runtime::error::CudaError>
+pub fn j2k_cuda_jpeg_engine::JpegCudaEngine<'_>::encode_lossless_with_external_live<E: core::convert::From<j2k_cuda_runtime::error::CudaError>>(self, &j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeJob<'_>, usize, impl core::ops::function::FnOnce(&[u32; 17]) -> core::result::Result<[u32; 17], E>) -> core::result::Result<j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeOutcome, E>
 pub fn j2k_cuda_jpeg_engine::JpegCudaEngine<'_>::profile_decode_jpeg_rgb8_owned_with_external_live(&self, &j2k_cuda_jpeg_engine::CudaJpegRgb8DecodePlan<'_>, usize) -> core::result::Result<j2k_cuda_jpeg_engine::CudaJpegProfiledOutput, j2k_cuda_runtime::error::CudaError>
 pub fn j2k_cuda_jpeg_engine::JpegCudaEngine<'_>::validate_jpeg_output_buffer_context(&self, &j2k_cuda_runtime::memory::CudaDeviceBuffer) -> core::result::Result<(), j2k_cuda_runtime::error::CudaError>
 pub fn j2k_cuda_jpeg_engine::JpegCudaEngine<'context>::decode_rgb8_owned_into_with_external_live(self, &j2k_cuda_jpeg_engine::CudaJpegRgb8DecodePlan<'_>, &j2k_cuda_runtime::memory::CudaDeviceBuffer, usize, usize) -> core::result::Result<j2k_cuda_runtime::execution::queued::CudaExecutionStats, j2k_cuda_runtime::error::CudaError>
@@ -4216,6 +4352,30 @@ pub j2k_cuda_jpeg_engine::CudaJpegEntropySyncState::reserved: u32
 pub j2k_cuda_jpeg_engine::CudaJpegEntropySyncState::start_bit: u32
 pub j2k_cuda_jpeg_engine::CudaJpegEntropySyncState::symbol_count: u32
 pub j2k_cuda_jpeg_engine::CudaJpegEntropySyncState::zigzag_index: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeJob::input: &'a j2k_cuda_runtime::memory::CudaDeviceBuffer
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeJob::params: j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeOutcome::Packed
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeOutcome::Packed::interval_lengths: alloc::vec::Vec<u32>
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeOutcome::Packed::stream: alloc::vec::Vec<u8>
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeOutcome::SampleOutOfRange
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeOutcome::SampleOutOfRange::index: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeOutcome::SampleOutOfRange::value: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::chunk_pixels: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::chunks_per_row: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::components: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::height: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::initial_predictor: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::input_offset_bytes: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::interval_rows: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::intervals: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::max_sample: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::packed_words: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::pitch_bytes: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::point_transform: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::predictor: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::sample_bytes: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::sample_count: u32
+pub j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeParams::width: u32
 pub j2k_cuda_jpeg_engine::CudaJpegRgb8DecodePlan::cb_ac_table: j2k_cuda_jpeg_engine::CudaJpegHuffmanTable
 pub j2k_cuda_jpeg_engine::CudaJpegRgb8DecodePlan::cb_dc_table: j2k_cuda_jpeg_engine::CudaJpegHuffmanTable
 pub j2k_cuda_jpeg_engine::CudaJpegRgb8DecodePlan::cb_quant: [u16; 64]
@@ -4240,6 +4400,7 @@ pub struct j2k_cuda_jpeg_engine::CudaJpegChunkedEntropyConfig
 pub struct j2k_cuda_jpeg_engine::CudaJpegChunkedEntropyPlan<'a>
 pub struct j2k_cuda_jpeg_engine::CudaJpegChunkedEntropyReport
 pub struct j2k_cuda_jpeg_engine::CudaJpegDecodeStageTimings
+pub struct j2k_cuda_jpeg_engine::CudaJpegLosslessEncodeJob<'a>
 pub struct j2k_cuda_jpeg_engine::CudaJpegProfiledOutput
 pub struct j2k_cuda_jpeg_engine::CudaJpegRgb8DecodePlan<'a>
 ```

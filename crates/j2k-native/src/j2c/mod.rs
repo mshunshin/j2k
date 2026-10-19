@@ -16,7 +16,7 @@ pub(crate) mod ht_block_encode;
 pub(crate) mod ht_encode_tables;
 pub(crate) mod ht_tables;
 pub(crate) mod idwt;
-mod mct;
+pub(crate) mod mct;
 mod mq;
 pub(crate) mod packet_encode;
 mod progression;
@@ -28,6 +28,7 @@ mod segment;
 mod tag_tree;
 pub(crate) mod tag_tree_encode;
 mod tile;
+pub(crate) mod wavelets;
 
 #[cfg(test)]
 pub(crate) use tile::{reset_tile_parse_calls, tile_parse_calls};

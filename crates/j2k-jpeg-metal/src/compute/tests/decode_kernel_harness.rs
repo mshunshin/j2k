@@ -27,7 +27,7 @@ use j2k_core::{DeviceSubmission, Downscale, ImageDecodeSubmit, Rect};
 use std::time::Instant;
 
 /// Shader files in `SHADER_SOURCE` concatenation order.
-const SHADER_FILES: [&str; 9] = [
+const SHADER_FILES: [&str; 11] = [
     "shaders_shared.metal",
     "shaders_encode.metal",
     "shaders_encode_staged.metal",
@@ -37,6 +37,8 @@ const SHADER_FILES: [&str; 9] = [
     "shaders_decode_fast422_regions.metal",
     "shaders_decode_fast444.metal",
     "shaders_pack_subsampled.metal",
+    "shaders_hybrid.metal",
+    "shaders_lossless_encode.metal",
 ];
 
 const BASELINE_SHADERS_ENV: &str = "J2K_JPEG_HARNESS_BASELINE_SHADERS";
@@ -520,16 +522,22 @@ fn single_decodes_match_cpu_on_entropy_stress_fixtures() {
 }
 
 /// Marks a 3-component JPEG as RGB with an Adobe APP14 segment (transform 0),
-/// so its components decode without the YCbCr conversion.
+/// so its components decode without the YCbCr conversion. A leading JFIF
+/// APP0 is dropped: JFIF means YCbCr whatever the Adobe transform, as in
+/// libjpeg-turbo.
 fn with_adobe_rgb_transform(jpeg: &[u8]) -> Vec<u8> {
     const APP14_ADOBE_RGB: [u8; 16] = [
         0xFF, 0xEE, 0x00, 0x0E, b'A', b'd', b'o', b'b', b'e', 0x00, 0x64, 0x00, 0x00, 0x00, 0x00,
         0x00,
     ];
+    let rest = match jpeg.get(2..6) {
+        Some([0xFF, 0xE0, hi, lo]) => &jpeg[4 + usize::from(u16::from_be_bytes([*hi, *lo]))..],
+        _ => &jpeg[2..],
+    };
     let mut out = Vec::with_capacity(jpeg.len() + APP14_ADOBE_RGB.len());
     out.extend_from_slice(&jpeg[..2]);
     out.extend_from_slice(&APP14_ADOBE_RGB);
-    out.extend_from_slice(&jpeg[2..]);
+    out.extend_from_slice(rest);
     out
 }
 
