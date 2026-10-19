@@ -4,7 +4,6 @@
 //! stages in such a way that a given codestream is decoded into its
 //! component channels.
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::bitplane::{BitPlaneDecodeBuffers, BitPlaneDecodeContext};
@@ -12,7 +11,6 @@ use super::build::{CodeBlock, Decomposition, Layer, Precinct, Segment, SubBand, 
 use super::codestream::{ComponentInfo, Header, QuantizationStyle, WaveletTransform};
 use super::ht_block_decode::{self, HtBlockDecodeContext};
 use super::idwt::IDWTOutput;
-use super::progression::{progression_iterator, ProgressionData};
 use super::roi::{tile_intersects_output_region, RoiPlan};
 use super::tag_tree::TagNode;
 use super::tile::{ComponentTile, ParsedTiles, ResolutionTile, Tile};
@@ -25,8 +23,8 @@ use crate::j2c::segment::MAX_BITPLANE_COUNT;
 use crate::profile;
 use crate::reader::BitReader;
 use crate::{
-    add_roi_shift_to_bitplanes, apply_roi_maxshift_inverse_f32, apply_roi_maxshift_inverse_i32,
-    apply_roi_maxshift_inverse_i64, decode_j2k_code_block_scalar_with_workspace,
+    add_roi_shift_to_bitplanes, apply_roi_maxshift_inverse_i64,
+    decode_j2k_code_block_scalar_with_workspace,
     decode_j2k_code_block_scalar_with_workspace_midpoint, HtCodeBlockBatchJob,
     HtCodeBlockDecodeJob, HtCodeBlockDecoder, HtOwnedCodeBlockBatchJob, HtOwnedSubBandPlan,
     HtSubBandDecodeJob, J2kCodeBlockBatchJob, J2kCodeBlockDecodeJob, J2kCodeBlockDecodeWorkspace,
@@ -278,7 +276,6 @@ fn decode_parsed_tiles<'a>(
         decode_tile(
             tile,
             header,
-            progression_iterator(tile)?,
             tile_ctx,
             storage,
             ht_decoder,
@@ -342,6 +339,11 @@ pub(crate) struct DecodeDebugCounters {
     pub(crate) idwt_output_samples: usize,
     /// Sub-band coefficients held in storage, summed over decoded tiles.
     pub(crate) stored_coefficients: usize,
+    /// Progression positions region precinct selection walked, summed over
+    /// decoded tiles.
+    pub(crate) selection_scanned_packets: usize,
+    /// Empty decomposition capacity discarded before region selection.
+    pub(crate) selection_released_storage_bytes: usize,
     pub(crate) ht_phase_stats: ht_block_decode::HtBlockDecodeStats,
     #[cfg(all(test, feature = "parallel"))]
     pub(crate) ht_parallel_tasks: usize,
@@ -384,10 +386,9 @@ impl ParallelCoefficientStats {
     clippy::too_many_arguments,
     reason = "this codec boundary keeps geometry, state buffers, and validated options explicit without allocation or indirection"
 )]
-fn decode_tile<'a, 'b>(
-    tile: &'b Tile<'a>,
+fn decode_tile<'a>(
+    tile: &Tile<'a>,
     header: &Header<'_>,
-    progression_iterator: Box<dyn Iterator<Item = ProgressionData> + '_>,
     tile_ctx: &mut TileDecodeContext,
     storage: &mut DecompositionStorage<'a>,
     ht_decoder: &mut Option<&mut dyn HtCodeBlockDecoder>,
@@ -397,9 +398,8 @@ fn decode_tile<'a, 'b>(
     retained_decode_baseline: usize,
 ) -> Result<()> {
     storage.reset_for_next_tile();
-    let retained_scratch_bytes = tile_ctx.retained_scratch_bytes()?;
     let retained_decode_baseline = retained_decode_baseline
-        .checked_add(retained_scratch_bytes)
+        .checked_add(tile_ctx.retained_scratch_bytes()?)
         .ok_or(ValidationError::ImageTooLarge)?;
     if retained_decode_baseline > crate::DEFAULT_MAX_DECODE_BYTES {
         return Err(ValidationError::ImageTooLarge.into());
@@ -419,17 +419,42 @@ fn decode_tile<'a, 'b>(
     // First, we build the decompositions, including their sub-bands, precincts
     // and code blocks.
     let stage_start = profile::profile_now(profile_enabled);
+    // Region decode builds its ROI plan first so that precincts the decode
+    // will never parse get no code-blocks or tag trees.
+    let selection = match tile_ctx.output_region {
+        Some(output_region) => build::select_region_precincts(
+            tile,
+            header,
+            storage,
+            output_region,
+            retained_decode_baseline,
+        )?,
+        None => None,
+    };
+    // The selection stays live through packet parsing, so its bytes are part
+    // of the baseline every later phase budgets against until it is dropped.
+    let selection_bytes = selection
+        .as_ref()
+        .map_or(0, build::PrecinctSelection::owned_bytes);
+    tile_ctx.debug_counters.selection_scanned_packets += selection
+        .as_ref()
+        .map_or(0, build::PrecinctSelection::scanned_packets);
+    tile_ctx.debug_counters.selection_released_storage_bytes += selection
+        .as_ref()
+        .map_or(0, build::PrecinctSelection::released_storage_bytes);
     build::build(
         tile,
         storage,
-        retained_decode_baseline,
+        retained_decode_baseline
+            .checked_add(selection_bytes)
+            .ok_or(ValidationError::ImageTooLarge)?,
         tile_ctx.output_region.is_some(),
         build::BuildWorkspace::DecodePixels {
             skipped_resolution_levels: header.skipped_resolution_levels,
         },
+        selection.as_ref(),
     )?;
-    if let Some(output_region) = tile_ctx.output_region {
-        storage.roi_plan = RoiPlan::build(tile, header, storage, output_region)?;
+    if tile_ctx.output_region.is_some() {
         if storage.roi_plan.is_none() {
             build::release_unused_roi_workspace(storage, tile.component_infos.len())?;
         }
@@ -441,7 +466,12 @@ fn decode_tile<'a, 'b>(
     profile_timings.build_us += profile::elapsed_us(stage_start);
     // Next, we parse the layers/segments for each code block.
     let stage_start = profile::profile_now(profile_enabled);
-    segment::parse(tile, progression_iterator, header, storage)?;
+    segment::parse_selected(tile, header, storage, selection.as_ref())?;
+    drop(selection);
+    storage.structural_workspace_bytes = storage
+        .structural_workspace_bytes
+        .checked_sub(selection_bytes)
+        .ok_or(ValidationError::ImageTooLarge)?;
     profile_timings.segment_us += profile::elapsed_us(stage_start);
     // We then decode the bitplanes of each code block, yielding the
     // (possibly dequantized) coefficients of each code block.
@@ -469,6 +499,7 @@ fn decode_tile<'a, 'b>(
             header,
             component_info.wavelet_transform(),
             ht_decoder,
+            cpu_decode_parallelism == CpuDecodeParallelism::Auto,
         )?;
         profile_timings.idwt_us += profile::elapsed_us(stage_start);
         // Finally, we store the raw samples for the tile area in the correct
@@ -482,7 +513,15 @@ fn decode_tile<'a, 'b>(
         // store one IDWT output at a time, allowing for better reuse of
         // allocations.
         let stage_start = profile::profile_now(profile_enabled);
-        store(tile, header, tile_ctx, component_info, idx, ht_decoder)?;
+        store(
+            tile,
+            header,
+            tile_ctx,
+            component_info,
+            idx,
+            ht_decoder,
+            cpu_decode_parallelism == CpuDecodeParallelism::Auto,
+        )?;
         profile_timings.store_us += profile::elapsed_us(stage_start);
     }
 
@@ -760,6 +799,8 @@ pub(crate) struct TileDecodeContext {
     pub(crate) idwt_output: IDWTOutput,
     /// A scratch buffer used during IDWT.
     pub(crate) idwt_scratch_buffer: Vec<f32>,
+    /// Per-worker band buffers for the row-banded IDWT.
+    pub(crate) idwt_band_scratch: Vec<f32>,
     /// A scratch buffer used during exact reversible integer IDWT.
     pub(crate) idwt_scratch_buffer_i64: Vec<i64>,
     /// A reusable context for decoding code blocks.
@@ -772,6 +813,10 @@ pub(crate) struct TileDecodeContext {
     pub(in crate::j2c::decode) ht_task_workspaces: Vec<workspace::HtTaskWorkspace>,
     #[cfg(feature = "parallel")]
     pub(in crate::j2c::decode) parallel_coefficients: Vec<f32>,
+    /// Test-only switch that keeps HT tiles on the per-sub-band path so its
+    /// slab and bank behavior stays covered.
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) force_per_sub_band_ht: bool,
     /// The raw, decoded samples for each channel.
     pub(crate) channel_data: Vec<ComponentData>,
     /// Optional output window for region-local decode storage.
@@ -786,9 +831,15 @@ impl TileDecodeContext {
     fn release_all_allocations(&mut self) {
         let output_region = self.output_region;
         let round_irreversible_output = self.round_irreversible_output;
+        #[cfg(all(test, feature = "parallel"))]
+        let force_per_sub_band_ht = self.force_per_sub_band_ht;
         *self = Self::default();
         self.output_region = output_region;
         self.round_irreversible_output = round_irreversible_output;
+        #[cfg(all(test, feature = "parallel"))]
+        {
+            self.force_per_sub_band_ht = force_per_sub_band_ht;
+        }
     }
 
     fn release_tile_scratch_allocations(&mut self) {
@@ -854,6 +905,7 @@ impl TileDecodeContext {
         include_capacity::<f32>(&mut bytes, self.idwt_output.coefficients.capacity())?;
         include_capacity::<i64>(&mut bytes, self.idwt_output.coefficients_i64.capacity())?;
         include_capacity::<f32>(&mut bytes, self.idwt_scratch_buffer.capacity())?;
+        include_capacity::<f32>(&mut bytes, self.idwt_band_scratch.capacity())?;
         include_capacity::<i64>(&mut bytes, self.idwt_scratch_buffer_i64.capacity())?;
         Ok(bytes)
     }
@@ -867,6 +919,7 @@ impl TileDecodeContext {
     fn release_idwt_allocations(&mut self) {
         self.idwt_output = IDWTOutput::default();
         self.idwt_scratch_buffer = Vec::new();
+        self.idwt_band_scratch = Vec::new();
         self.idwt_scratch_buffer_i64 = Vec::new();
     }
 }

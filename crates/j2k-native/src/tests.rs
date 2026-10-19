@@ -7,6 +7,21 @@ mod ht_refinement;
 mod workspace_reuse;
 
 #[test]
+fn image_reports_high_throughput_block_coding_from_its_header() {
+    let pixels = vec![17_u8; 32 * 24];
+    let options = EncodeOptions::default();
+    let ht = encode_htj2k(&pixels, 32, 24, 1, 8, false, &options).expect("encode HTJ2K");
+    let classic = encode(&pixels, 32, 24, 1, 8, false, &options).expect("encode J2K");
+    let settings = DecodeSettings::default();
+    assert!(Image::new(&ht, &settings)
+        .expect("parse HTJ2K")
+        .uses_high_throughput_block_coding());
+    assert!(!Image::new(&classic, &settings)
+        .expect("parse J2K")
+        .uses_high_throughput_block_coding());
+}
+
+#[test]
 fn direct_grayscale_plan_rejects_rgb_image_with_typed_reason() {
     let pixels = vec![0, 16, 32, 64, 80, 96, 128, 144, 160, 192, 208, 224];
     let bytes =
@@ -819,6 +834,69 @@ fn native_sample_packing_writes_high_bit_signed_little_endian_bytes() {
     assert_eq!(out, [0x00, 0x00, 0x00, 0x00, 0xe0]);
 }
 
+#[test]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "sample magnitudes stay below 2^17 and are exact in f32"
+)]
+fn chunked_native_sample_packing_matches_per_sample_packing() {
+    let mut samples = vec![
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        0.0,
+        -0.0,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        0.499_999_97,
+        -0.499_999_97,
+        f32::MAX,
+        f32::MIN,
+    ];
+    for whole in -70_000_i32..=70_000 {
+        if whole.unsigned_abs() > 300 && whole % 97 != 0 && whole.unsigned_abs() < 32_000 {
+            continue;
+        }
+        let whole = whole as f32;
+        samples.extend([whole, whole + 0.5, whole - 0.5, whole + 0.25, whole - 0.75]);
+        samples.extend([whole.next_up(), whole.next_down()]);
+        samples.extend([(whole + 0.5).next_down(), (whole - 0.5).next_up()]);
+    }
+    for bit_depth in 1_u8..=20 {
+        for signed in [false, true] {
+            let component = crate::j2c::ComponentData {
+                container: crate::math::SimdBuffer::new(samples.clone()),
+                integer_container: None,
+                bit_depth,
+                signed,
+            };
+            let mut expected = Vec::new();
+            for index in 0..samples.len() {
+                Image::push_component_native_sample_bytes(
+                    &mut expected,
+                    &component,
+                    index,
+                    bit_depth,
+                );
+            }
+            for parallel in [false, true] {
+                let mut actual = Vec::with_capacity(expected.len());
+                Image::extend_component_native_sample_bytes(
+                    &mut actual,
+                    &component,
+                    0..samples.len(),
+                    bit_depth,
+                    parallel,
+                );
+                assert_eq!(
+                    actual, expected,
+                    "bit_depth={bit_depth} signed={signed} parallel={parallel}"
+                );
+            }
+        }
+    }
+}
+
 fn rewrite_siz_to_single_large_tile(codestream: &mut [u8], dimensions: u32) {
     let siz = codestream
         .windows(2)
@@ -1074,6 +1152,122 @@ fn decode_region_budgets_the_windowed_idwt_peak_before_packet_parsing() {
     );
 }
 
+/// A one-level gray codestream whose single tile is `dimensions` square, with
+/// the 32-layer maximum and the smallest precincts: 1x1 at resolution 0 and 2x2 at
+/// resolution 1. The encoder does not write precincts that small, so COD is
+/// rewritten after encoding. Its packet data is the 4x4 fixture's, so only a
+/// few bytes.
+fn many_precinct_layer_codestream(dimensions: u32) -> Vec<u8> {
+    let pixels: Vec<u8> = (0..16).collect();
+    let options = EncodeOptions {
+        reversible: true,
+        num_decomposition_levels: 1,
+        precinct_exponents: vec![(15, 15), (15, 15)],
+        ..EncodeOptions::default()
+    };
+    let mut codestream =
+        encode(&pixels, 4, 4, 1, 8, false, &options).expect("encode precinct fixture");
+    rewrite_siz_to_single_large_tile(&mut codestream, dimensions);
+    let cod = codestream
+        .windows(2)
+        .position(|w| w == [0xFF, 0x52])
+        .expect("COD marker");
+    assert_eq!(codestream[cod + 4] & 1, 1, "COD signals precinct sizes");
+    assert_eq!(codestream[cod + 9], 1, "one decomposition level");
+    codestream[cod + 6..cod + 8].copy_from_slice(&32_u16.to_be_bytes());
+    codestream[cod + 14] = 0x00;
+    codestream[cod + 15] = 0x11;
+    codestream
+}
+
+#[test]
+fn decode_region_rejects_an_oversized_precinct_layout_before_walking_the_progression() {
+    // 2048x2048 with these precincts has about 2.1M (component, resolution)
+    // precincts and 4.2M sub-band precincts. Their precinct records and root
+    // tag-tree nodes alone exceed the cap, however few the region keeps, and
+    // at 32 layers the progression has about 67M positions. The selection
+    // must reject the tile from its counts, without walking any of them.
+    let codestream = many_precinct_layer_codestream(2_048);
+    let image = Image::new(&codestream, &DecodeSettings::default()).expect("large SIZ parses");
+    let mut context = DecoderContext::default();
+    let Err(error) = image.decode_region_with_context((0, 0, 1, 1), &mut context) else {
+        panic!("the precinct layout must exceed the structural budget");
+    };
+    assert_eq!(
+        error,
+        DecodeError::Validation(ValidationError::ImageTooLarge)
+    );
+    assert_eq!(
+        context
+            .tile_decode_context
+            .debug_counters
+            .selection_scanned_packets,
+        0
+    );
+}
+
+#[test]
+fn region_precinct_selection_walks_no_more_packets_than_the_tile_has_header_bytes() {
+    // 1024x1024 with the same precincts fits the structural budget, and at
+    // 32 layers the progression still has about 17M positions. Without PLT
+    // the selection walks the progression to find the precincts parsed before
+    // the last required packet. Every packet header takes at least one byte,
+    // so it must stop once the tile's few header bytes are used up.
+    let codestream = many_precinct_layer_codestream(1_024);
+    let image = Image::new(&codestream, &DecodeSettings::default()).expect("large SIZ parses");
+    let mut context = DecoderContext::default();
+    // The packet data does not cover this layout, so the decode result itself
+    // is not the point here.
+    let _ = image.decode_region_with_context((512, 512, 1, 1), &mut context);
+    let scanned = context
+        .tile_decode_context
+        .debug_counters
+        .selection_scanned_packets;
+    assert!(
+        scanned > 0 && scanned <= codestream.len(),
+        "walked {scanned} progression positions for a {}-byte codestream",
+        codestream.len()
+    );
+}
+
+#[test]
+fn region_selection_releases_the_previous_tiles_retained_decomposition_capacity() {
+    let pixels = (0..128_u8).collect::<Vec<_>>();
+    let bytes = encode(
+        &pixels,
+        16,
+        8,
+        1,
+        8,
+        false,
+        &EncodeOptions {
+            reversible: true,
+            num_decomposition_levels: 0,
+            code_block_width_exp: 0,
+            code_block_height_exp: 0,
+            precinct_exponents: vec![(2, 2)],
+            tile_size: Some((8, 8)),
+            ..EncodeOptions::default()
+        },
+    )
+    .expect("encode two-tile region fixture");
+    let image = Image::new(&bytes, &DecodeSettings::default()).expect("two-tile image");
+    let mut context = DecoderContext::default();
+
+    image
+        .decode_region_with_context((0, 0, 16, 8), &mut context)
+        .expect("decode both selected tiles");
+
+    assert!(
+        context
+            .tile_decode_context
+            .debug_counters
+            .selection_released_storage_bytes
+            > 0,
+        "the second selection must release the first tile's retained decomposition owner"
+    );
+}
+
 #[test]
 fn decode_region_rejects_code_block_layer_metadata_amplification() {
     let pixels: Vec<u8> = (0..64).collect();
@@ -1114,21 +1308,25 @@ fn fixture_ht_multi_block() -> Vec<u8> {
         num_decomposition_levels: 0,
         code_block_width_exp: 0,
         code_block_height_exp: 0,
+        precinct_exponents: vec![(2, 2)],
+        write_plt: true,
         ..EncodeOptions::default()
     };
     encode_htj2k(&pixels, 8, 8, 1, 8, false, &options).expect("encode multi-block HT gray8")
 }
 
 fn fixture_ht_rgb_multi_block() -> Vec<u8> {
-    let pixels = gradient_pixels(8, 8, 3);
+    let pixels = gradient_pixels(16, 16, 3);
     let options = EncodeOptions {
         reversible: true,
         num_decomposition_levels: 0,
         code_block_width_exp: 0,
         code_block_height_exp: 0,
+        precinct_exponents: vec![(2, 2)],
+        write_plt: true,
         ..EncodeOptions::default()
     };
-    encode_htj2k(&pixels, 8, 8, 3, 8, false, &options).expect("encode multi-block HT RGB8")
+    encode_htj2k(&pixels, 16, 16, 3, 8, false, &options).expect("encode multi-block HT RGB8")
 }
 
 fn direct_ht_job_count(plan: &J2kDirectGrayscalePlan) -> usize {
@@ -1143,6 +1341,44 @@ fn direct_ht_job_count(plan: &J2kDirectGrayscalePlan) -> usize {
 
 fn direct_color_ht_job_count(plan: &J2kDirectColorPlan) -> usize {
     plan.component_plans.iter().map(direct_ht_job_count).sum()
+}
+
+fn corrupt_last_plt_packet(bytes: &mut [u8]) {
+    let plt = bytes
+        .windows(2)
+        .position(|window| window == [0xFF, 0x58])
+        .expect("PLT marker");
+    let marker_len = usize::from(u16::from_be_bytes([bytes[plt + 2], bytes[plt + 3]]));
+    let mut packet_lengths = Vec::new();
+    let mut length = 0usize;
+    for &byte in &bytes[plt + 5..plt + 2 + marker_len] {
+        length = length
+            .checked_mul(128)
+            .and_then(|value| value.checked_add(usize::from(byte & 0x7f)))
+            .expect("packet length fits");
+        if byte & 0x80 == 0 {
+            packet_lengths.push(length);
+            length = 0;
+        }
+    }
+    assert_eq!(length, 0, "PLT packet length terminates");
+    assert!(packet_lengths.len() > 1, "fixture has trailing packets");
+
+    let sod = bytes
+        .windows(2)
+        .position(|window| window == [0xFF, 0x93])
+        .expect("SOD marker");
+    let last_start = sod
+        + 2
+        + packet_lengths[..packet_lengths.len() - 1]
+            .iter()
+            .sum::<usize>();
+    let last_end = last_start + packet_lengths[packet_lengths.len() - 1];
+    assert!(
+        last_end <= bytes.len(),
+        "last PLT packet fits the tile-part"
+    );
+    bytes[last_start..last_end].fill(0xff);
 }
 
 fn gradient_pixels(width: u32, height: u32, components: u8) -> Vec<u8> {
@@ -1727,6 +1963,45 @@ fn grayscale_direct_plan_region_prunes_unneeded_ht_code_blocks() {
         roi_jobs < full_jobs,
         "ROI direct plan must prune HT jobs before device preparation"
     );
+    assert!(
+        roi_context.direct_plan_code_blocks < full_context.direct_plan_code_blocks,
+        "ROI direct plan must not build unneeded grayscale code-block metadata"
+    );
+}
+
+#[test]
+fn grayscale_direct_region_does_not_parse_an_unneeded_trailing_packet() {
+    let pixels: Vec<u8> = (0..64).collect();
+    let mut bytes = encode_htj2k(
+        &pixels,
+        8,
+        8,
+        1,
+        8,
+        false,
+        &EncodeOptions {
+            reversible: true,
+            num_decomposition_levels: 0,
+            code_block_width_exp: 0,
+            code_block_height_exp: 0,
+            precinct_exponents: vec![(2, 2)],
+            write_plt: true,
+            ..EncodeOptions::default()
+        },
+    )
+    .expect("encode grayscale PLT fixture");
+    corrupt_last_plt_packet(&mut bytes);
+    let image = Image::new(&bytes, &DecodeSettings::default()).expect("corrupted packet image");
+
+    image
+        .build_direct_grayscale_plan_with_context(&mut DecoderContext::default())
+        .expect_err("the full direct plan parses the corrupted trailing packet");
+    image
+        .build_direct_grayscale_plan_region_with_context(
+            &mut DecoderContext::default(),
+            (0, 0, 1, 1),
+        )
+        .expect("the region plan stops before the unneeded trailing packet");
 }
 
 #[test]
@@ -1750,6 +2025,44 @@ fn color_direct_plan_region_prunes_unneeded_ht_code_blocks() {
         roi_jobs < full_jobs,
         "RGB ROI direct plan must prune HT jobs before device preparation"
     );
+    assert!(
+        roi_context.direct_plan_code_blocks < full_context.direct_plan_code_blocks,
+        "ROI direct plan must not build unneeded color code-block metadata: full={}, roi={}",
+        full_context.direct_plan_code_blocks,
+        roi_context.direct_plan_code_blocks,
+    );
+}
+
+#[test]
+fn color_direct_region_does_not_parse_an_unneeded_trailing_packet() {
+    let pixels = gradient_pixels(8, 8, 3);
+    let mut bytes = encode_htj2k(
+        &pixels,
+        8,
+        8,
+        3,
+        8,
+        false,
+        &EncodeOptions {
+            reversible: true,
+            num_decomposition_levels: 0,
+            code_block_width_exp: 0,
+            code_block_height_exp: 0,
+            precinct_exponents: vec![(2, 2)],
+            write_plt: true,
+            ..EncodeOptions::default()
+        },
+    )
+    .expect("encode color PLT fixture");
+    corrupt_last_plt_packet(&mut bytes);
+    let image = Image::new(&bytes, &DecodeSettings::default()).expect("corrupted packet image");
+
+    image
+        .build_direct_color_plan_with_context(&mut DecoderContext::default())
+        .expect_err("the full direct plan parses the corrupted trailing packet");
+    image
+        .build_direct_color_plan_region_with_context(&mut DecoderContext::default(), (0, 0, 1, 1))
+        .expect("the region plan stops before the unneeded trailing packet");
 }
 
 #[test]

@@ -221,10 +221,9 @@ pub use jp2::{
 };
 #[doc(hidden)]
 pub use roi::idwt_band_index;
-pub(crate) use roi::{
-    add_roi_shift_to_bitplanes, apply_roi_maxshift_inverse_f32, apply_roi_maxshift_inverse_i32,
-    apply_roi_maxshift_inverse_i64, validate_roi,
-};
+pub(crate) use roi::{add_roi_shift_to_bitplanes, apply_roi_maxshift_inverse_i64, validate_roi};
+#[cfg(test)]
+pub(crate) use roi::{apply_roi_maxshift_inverse_f32, apply_roi_maxshift_inverse_i32};
 
 pub use error::{
     ColorError, DecodeError, DecodeErrorClass, DecodingError, DirectPlanUnsupportedReason,
@@ -385,10 +384,10 @@ fn native_bytes_per_sample(bit_depth: u8) -> Result<usize> {
 #[doc(hidden)]
 pub use backend::{
     HtCleanupEncodeDistribution, HtCodeBlockBatchJob, HtCodeBlockDecodeJob,
-    HtCodeBlockDecodePhaseLimit, HtCodeBlockDecoder, HtSubBandDecodeJob, J2kCodeBlockBatchJob,
-    J2kCodeBlockDecodeJob, J2kIdwtBand, J2kIdwtNormalization, J2kInverseMctJob, J2kRect,
-    J2kSingleDecompositionIdwtJob, J2kStoreComponentJob, J2kSubBandDecodeJob, J2kTier1TokenSegment,
-    J2kWaveletTransform,
+    HtCodeBlockDecodePhaseLimit, HtCodeBlockDecoder, HtSubBandDecodeJob, J2kClassicReconstruction,
+    J2kCodeBlockBatchJob, J2kCodeBlockDecodeJob, J2kIdwtBand, J2kIdwtNormalization,
+    J2kInverseMctJob, J2kRect, J2kSingleDecompositionIdwtJob, J2kStoreComponentJob,
+    J2kSubBandDecodeJob, J2kTier1TokenSegment, J2kWaveletTransform,
 };
 #[doc(hidden)]
 pub use ht_adapter::{
