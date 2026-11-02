@@ -48,18 +48,6 @@ fn subband_scale_for_step_index(
     }
 }
 
-fn subband_scale_for_subband(
-    scales: IrreversibleQuantizationSubbandScales,
-    subband: J2kSubBandType,
-) -> f32 {
-    match subband {
-        J2kSubBandType::LowLow => scales.low_low,
-        J2kSubBandType::HighLow => scales.high_low,
-        J2kSubBandType::LowHigh => scales.low_high,
-        J2kSubBandType::HighHigh => scales.high_high,
-    }
-}
-
 impl QuantStepSize {
     /// Compute the JPEG 2000 irreversible step size:
     /// `Δ = 2^(R_b - exponent) × (1 + mantissa / 2048)`.
@@ -125,14 +113,22 @@ impl QuantStepSize {
     }
 }
 
-/// Unrounded irreversible step for QCD/QCC position `index` before any
-/// component profile, with invalid multipliers treated as one.
+/// Unrounded irreversible step for QCD/QCC position `index`, including the
+/// band's synthesis-norm weight and the validated component weight. Invalid
+/// global/orientation multipliers are treated as one for the compatibility
+/// step-query API.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "narrow the complete product once at the existing f32 quantization boundary"
+)]
 fn irreversible_step_delta(
     bit_depth: u8,
     guard_bits: u8,
     irreversible_quantization_scale: f32,
     irreversible_quantization_subband_scales: IrreversibleQuantizationSubbandScales,
     index: usize,
+    norm_weight: f32,
+    weight: f32,
 ) -> f32 {
     let base_step = QuantStepSize {
         exponent: u16::from(bit_depth) + u16::from(guard_bits),
@@ -149,16 +145,34 @@ fn irreversible_step_delta(
     } else {
         IrreversibleQuantizationSubbandScales::default()
     };
-    base_step.delta(bit_depth) * scale * subband_scale_for_step_index(subband_scales, index)
+    let base = base_step.delta(bit_depth);
+    let orientation = subband_scale_for_step_index(subband_scales, index);
+    let scaled = base * scale;
+    let oriented = scaled * orientation;
+    // A unit norm weight leaves `oriented` exact, preserving earlier steps.
+    let normed = oriented * norm_weight;
+    let weighted = normed * weight;
+    if scaled.is_normal() && oriented.is_normal() && normed.is_normal() && weighted.is_normal() {
+        // Preserve the established f32 evaluation for ordinary inputs.
+        weighted
+    } else {
+        // Five positive f32 factors fit in f64, including a subnormal scale
+        // rescued by another factor. Narrow only after the complete product.
+        (libm::scalbn(1.0, -i32::from(guard_bits))
+            * f64::from(scale)
+            * f64::from(orientation)
+            * f64::from(norm_weight)
+            * f64::from(weight)) as f32
+    }
 }
 
-/// Compute the exact irreversible 9/7 quantization step tuple the native encoder
-/// writes for one subband under a global plus per-subband profile.
+/// Compute the irreversible 9/7 step tuple the native encoder writes for one subband.
 ///
-/// # Panics
-///
-/// Panics if the internal quantization step exponent is not clamped to the
-/// JPEG 2000 exponent range before conversion.
+/// `level` is 1 for the finest bands; LL lies at `levels`, the decomposition
+/// depth. The step includes the band's synthesis-norm weight and the global and
+/// per-subband scales.
+/// Invalid scale arguments are treated as one; valid positive products
+/// saturate monotonically at the complete stored-step endpoints.
 #[must_use]
 pub fn irreversible_quantization_step_for_subband(
     bit_depth: u8,
@@ -166,25 +180,27 @@ pub fn irreversible_quantization_step_for_subband(
     irreversible_quantization_scale: f32,
     irreversible_quantization_subband_scales: IrreversibleQuantizationSubbandScales,
     subband: J2kSubBandType,
+    level: u8,
+    levels: u8,
 ) -> IrreversibleQuantizationStep {
-    let base_step = QuantStepSize {
-        exponent: u16::from(bit_depth) + u16::from(guard_bits),
-        mantissa: 0,
-    };
-    let scale =
-        if irreversible_quantization_scale.is_finite() && irreversible_quantization_scale > 0.0 {
-            irreversible_quantization_scale
-        } else {
-            1.0
-        };
-    let subband_scales = if subband_scales_all_valid(irreversible_quantization_subband_scales) {
-        irreversible_quantization_subband_scales
-    } else {
-        IrreversibleQuantizationSubbandScales::default()
+    // Only the orientation is read from this position.
+    let index = match subband {
+        J2kSubBandType::LowLow => 0,
+        J2kSubBandType::HighLow => 1,
+        J2kSubBandType::LowHigh => 2,
+        J2kSubBandType::HighHigh => 3,
     };
     let step_size = QuantStepSize::from_delta(
         bit_depth,
-        base_step.delta(bit_depth) * scale * subband_scale_for_subband(subband_scales, subband),
+        irreversible_step_delta(
+            bit_depth,
+            guard_bits,
+            irreversible_quantization_scale,
+            irreversible_quantization_subband_scales,
+            index,
+            synthesis_norm_weight(subband, level, levels),
+            1.0,
+        ),
     );
     IrreversibleQuantizationStep {
         exponent: u8::try_from(step_size.exponent).unwrap_or(u8::MAX),
@@ -297,9 +313,9 @@ pub(crate) fn append_step_sizes_with_irreversible_profile(
             });
         }
     } else {
-        // Quality-first irreversible 9-7 default. Use one exponent/mantissa for all
-        // subbands and let R_b = bit_depth + log_gain make LL finest and HH
-        // coarsest under the decoder's QCD formula.
+        // Irreversible 9-7 default: each band's step shrinks with its synthesis
+        // norm, and R_b = bit_depth + log_gain still makes LL finest and HH
+        // coarsest within a level under the decoder's QCD formula.
         let step_count = 1usize + usize::from(num_decompositions) * 3;
 
         for index in 0..step_count {
@@ -311,10 +327,19 @@ pub(crate) fn append_step_sizes_with_irreversible_profile(
                     irreversible_quantization_scale,
                     irreversible_quantization_subband_scales,
                     index,
+                    qcd_synthesis_norm_weight(index, num_decompositions),
+                    1.0,
                 ),
             ));
         }
     }
+}
+
+/// Decomposition levels implied by a QCD/QCC step or profile row length.
+fn levels_for_band_count(bands: usize) -> EncodeResult<u8> {
+    u8::try_from(bands.saturating_sub(1) / 3).map_err(|_| EncodeError::InvalidInput {
+        what: "quantization profile band count exceeds the supported decomposition levels",
+    })
 }
 
 /// Return whether every profile multiplier is exactly one, which keeps the
@@ -355,6 +380,7 @@ pub(crate) fn apply_component_profile(
     if profile_is_unity(profile) {
         return Ok(());
     }
+    let levels = levels_for_band_count(steps.len())?;
     for (index, (step, &weight)) in steps.iter_mut().zip(weights).enumerate() {
         let delta = irreversible_step_delta(
             bit_depth,
@@ -362,7 +388,9 @@ pub(crate) fn apply_component_profile(
             irreversible_quantization_scale,
             irreversible_quantization_subband_scales,
             index,
-        ) * weight;
+            qcd_synthesis_norm_weight(index, levels),
+            weight,
+        );
         *step =
             QuantStepSize::try_from_delta(bit_depth, delta).ok_or(EncodeError::InvalidInput {
                 what: "quantization profile step is outside the representable QCD/QCC range",
@@ -371,58 +399,122 @@ pub(crate) fn apply_component_profile(
     Ok(())
 }
 
-/// Largest global scale, from `start` upward, at which every step of
-/// `profile` stays representable. `start` is returned unchanged when it is
-/// already out of range, so the encode at that scale reports the error.
+/// First and last positive finite f32 scales whose rounded weighted steps
+/// fit both QCD/QCC and the coding mode's exponent limit. An inverted interval
+/// means the bands have no common
+/// admissible scale. With no active profile, include the saturated default
+/// steps of a `levels`-level decomposition at scale one and stop once every
+/// band has reached its coarsest step. Profile rows carry their own band count.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "rate-search scales are f32; the widened saturation calculation is bounded before narrowing"
+)]
+pub(crate) fn quantization_scale_bounds(
+    bit_depth: u8,
+    guard_bits: u8,
+    subband_scales: IrreversibleQuantizationSubbandScales,
+    profile: Option<&[Vec<f32>]>,
+    levels: u8,
+    maximum_exponent: u16,
+) -> (f32, f32) {
+    let profile = profile.filter(|profile| !profile_is_unity(profile));
+    let finest = pow2i(i32::from(bit_depth) - i32::from(maximum_exponent));
+    let default_bands = 1 + 3 * usize::from(levels);
+    let within_bound = |scale, lower: bool| {
+        let accepts = |index, levels, weight| {
+            let delta = irreversible_step_delta(
+                bit_depth,
+                guard_bits,
+                scale,
+                subband_scales,
+                index,
+                qcd_synthesis_norm_weight(index, levels),
+                weight,
+            );
+            QuantStepSize::try_from_delta(bit_depth, delta)
+                .is_some_and(|step| step.exponent <= maximum_exponent)
+                || if lower {
+                    delta >= finest
+                } else {
+                    delta < finest
+                }
+        };
+        profile.map_or_else(
+            || (0..default_bands).all(|index| accepts(index, levels, 1.0)),
+            |profile| {
+                profile.iter().all(|row| {
+                    let row_levels = levels_for_band_count(row.len()).unwrap_or(u8::MAX);
+                    row.iter()
+                        .enumerate()
+                        .all(|(index, &weight)| accepts(index, row_levels, weight))
+                })
+            },
+        )
+    };
+    // Positive f32 bit patterns are ordered by value. Bisect that finite set,
+    // using zero/infinity as excluded sentinels, without exponential jumps.
+    let boundary = |lower| {
+        let mut low = 0;
+        let mut high = f32::INFINITY.to_bits();
+        while high - low > 1 {
+            let middle = low + (high - low) / 2;
+            if within_bound(f32::from_bits(middle), lower) == lower {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        f32::from_bits(if lower { high } else { low })
+    };
+    let lower = boundary(true);
+    let upper = boundary(false);
+    if profile.is_some() {
+        (lower, upper)
+    } else {
+        // Global scaling saturates independently in each band. Its last
+        // changing band, not the first to saturate, determines search's end.
+        let coarsest = pow2i(i32::from(bit_depth)) * (1.0 + 2047.0 / 2048.0);
+        let smallest_factor = (0..default_bands)
+            .map(|index| {
+                f64::from(subband_scale_for_step_index(subband_scales, index))
+                    * f64::from(qcd_synthesis_norm_weight(index, levels))
+            })
+            .fold(f64::MAX, f64::min);
+        let saturation = (f64::from(coarsest) * libm::scalbn(1.0, i32::from(guard_bits))
+            / smallest_factor)
+            .min(f64::from(f32::MAX)) as f32;
+        (1.0, saturation.max(1.0))
+    }
+}
+
+/// Compatibility helper: an invalid starting scale is left for encode to reject.
 pub(crate) fn profile_scale_ceiling(
     bit_depth: u8,
     guard_bits: u8,
     start: f32,
-    irreversible_quantization_subband_scales: IrreversibleQuantizationSubbandScales,
+    subband_scales: IrreversibleQuantizationSubbandScales,
     profile: &[Vec<f32>],
 ) -> f32 {
-    let representable = |scale: f32| {
-        profile.iter().all(|weights| {
-            weights.iter().enumerate().all(|(index, &weight)| {
-                let delta = irreversible_step_delta(
-                    bit_depth,
-                    guard_bits,
-                    scale,
-                    irreversible_quantization_subband_scales,
-                    index,
-                ) * weight;
-                QuantStepSize::try_from_delta(bit_depth, delta).is_some()
-            })
-        })
-    };
-    if !(start.is_finite() && start > 0.0 && representable(start)) {
-        return start;
-    }
-    // A larger scale only coarsens steps, so the representable scales end at
-    // one bound: double past it, then bisect down to the last f32 inside.
-    let mut low = start;
-    let mut high = start * 2.0;
-    while high.is_finite() && representable(high) {
-        low = high;
-        high *= 2.0;
-    }
-    if !high.is_finite() {
-        return low;
-    }
-    loop {
-        let middle = f32::midpoint(low, high);
-        if middle <= low || middle >= high {
-            return low;
-        }
-        if representable(middle) {
-            low = middle;
-        } else {
-            high = middle;
-        }
+    let levels = levels_for_band_count(profile.first().map_or(1, Vec::len)).unwrap_or(u8::MAX);
+    let (lower, upper) = quantization_scale_bounds(
+        bit_depth,
+        guard_bits,
+        subband_scales,
+        Some(profile),
+        levels,
+        MAX_STEP_EXPONENT,
+    );
+    if start >= lower && start <= upper {
+        upper
+    } else {
+        start
     }
 }
 
-const OPENHTJ2K_D97_ENERGY_NORMS: [(f64, f64); 16] = [
+/// One-dimensional CDF 9/7 synthesis energy gains `(lowpass, highpass)` for
+/// decomposition levels 1 to 16, finest first. A 2-D band's squared synthesis
+/// norm is the product of its two directional gains.
+const D97_ENERGY_GAINS: [(f64, f64); 16] = [
     (1.965_907_314_575_295_7, 2.080_871_927_589_849),
     (4.122_409_873_969_023, 3.868_863_224_131_922),
     (8.416_744_177_952_724, 8.317_022_299_806_517),
@@ -440,6 +532,64 @@ const OPENHTJ2K_D97_ENERGY_NORMS: [(f64, f64); 16] = [
     (34_757.792_077_060_57, 35_705.366_586_020_52),
     (69_515.584_180_957_42, 71_410.733_353_619_97),
 ];
+
+/// L2 norm of the 2-D 9/7 synthesis basis of `subband` at `level`, where
+/// level 1 is the finest, LL lies at the deepest level, and level 0 is an
+/// untransformed component.
+fn d97_synthesis_norm(subband: J2kSubBandType, level: u8) -> f64 {
+    if level == 0 {
+        return 1.0;
+    }
+    let tabulated = usize::from(level).min(D97_ENERGY_GAINS.len());
+    let (low, high) = D97_ENERGY_GAINS[tabulated - 1];
+    let energy = match subband {
+        J2kSubBandType::LowLow => low * low,
+        J2kSubBandType::HighLow | J2kSubBandType::LowHigh => low * high,
+        J2kSubBandType::HighHigh => high * high,
+    };
+    // Each directional gain doubles per level beyond the table, so the norm
+    // does too. Doubling is exact, as scaling by a power of two would be.
+    (tabulated..usize::from(level)).fold(libm::sqrt(energy), |norm, _| norm * 2.0)
+}
+
+/// Subband and level of QCD/QCC position `index` in a `levels`-level
+/// decomposition: LL, then HL, LH and HH from the coarsest level to the finest.
+fn qcd_band(index: usize, levels: u8) -> (J2kSubBandType, u8) {
+    if index == 0 {
+        return (J2kSubBandType::LowLow, levels);
+    }
+    let subband = match (index - 1) % 3 {
+        0 => J2kSubBandType::HighLow,
+        1 => J2kSubBandType::LowHigh,
+        _ => J2kSubBandType::HighHigh,
+    };
+    let finer_levels = u8::try_from((index - 1) / 3).unwrap_or(u8::MAX);
+    (subband, levels.saturating_sub(finer_levels))
+}
+
+/// Rate-distortion weight of a default irreversible step: steps shrink in
+/// proportion to each band's 9/7 synthesis norm, as standard JPEG 2000 encoders
+/// signal them. The band with the smallest norm (the finest HL/LH, or LL of a
+/// one-level decomposition) keeps the unweighted step, so no band is quantized
+/// more coarsely than with orientation-only steps.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "weights lie in (0, 1] and narrow once to the f32 step arithmetic"
+)]
+fn synthesis_norm_weight(subband: J2kSubBandType, level: u8, levels: u8) -> f32 {
+    let smallest = if levels == 0 {
+        1.0
+    } else {
+        d97_synthesis_norm(J2kSubBandType::LowLow, levels)
+            .min(d97_synthesis_norm(J2kSubBandType::HighLow, 1))
+    };
+    (smallest / d97_synthesis_norm(subband, level)) as f32
+}
+
+fn qcd_synthesis_norm_weight(index: usize, levels: u8) -> f32 {
+    let (subband, level) = qcd_band(index, levels);
+    synthesis_norm_weight(subband, level, levels)
+}
 
 const OPENHTJ2K_VISUAL_WEIGHTS_444: [[f64; 15]; 3] = [
     [
@@ -477,7 +627,7 @@ pub(crate) fn append_openhtj2k_qfactor_step_sizes(
         });
     };
     let level_count = usize::from(num_decompositions);
-    if level_count > OPENHTJ2K_D97_ENERGY_NORMS.len() {
+    if level_count > D97_ENERGY_GAINS.len() {
         return Err(EncodeError::Unsupported {
             what: "OpenHTJ2K Qfactor supports at most 16 decomposition levels",
         });
@@ -506,7 +656,7 @@ pub(crate) fn append_openhtj2k_qfactor_step_sizes(
     let delta_reference = alpha * magnitude * OPENHTJ2K_COLOR_GAINS[0] + epsilon;
     let component_gain = OPENHTJ2K_COLOR_GAINS[component];
     let start = step_sizes.len();
-    for (level, &(low, high)) in OPENHTJ2K_D97_ENERGY_NORMS[..level_count].iter().enumerate() {
+    for (level, &(low, high)) in D97_ENERGY_GAINS[..level_count].iter().enumerate() {
         let base = level * 3;
         for (offset, wmse) in [high * high, low * high, high * low]
             .into_iter()
@@ -521,7 +671,7 @@ pub(crate) fn append_openhtj2k_qfactor_step_sizes(
     let low_energy = if level_count == 0 {
         1.0
     } else {
-        let low = OPENHTJ2K_D97_ENERGY_NORMS[level_count - 1].0;
+        let low = D97_ENERGY_GAINS[level_count - 1].0;
         low * low
     };
     let low_delta = delta_reference / (libm::sqrt(low_energy) * component_gain);
@@ -612,15 +762,12 @@ pub(crate) fn quantize_subband(
     clippy::trivially_copy_pass_by_ref,
     reason = "the stable codec boundary borrows shared Copy metadata used across nested calls"
 )]
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "finite wavelet coefficients are intentionally rounded at the codec quantization boundary"
-)]
 pub(crate) fn try_quantize_subband(
     coefficients: &[f32],
     step_size: &QuantStepSize,
     range_bits: u8,
     reversible: bool,
+    parallel: bool,
 ) -> EncodeResult<Vec<i32>> {
     let requested_bytes = coefficients
         .len()
@@ -635,29 +782,123 @@ pub(crate) fn try_quantize_subband(
             what: "quantized subband coefficients",
             bytes: requested_bytes,
         })?;
-    if reversible {
-        for &coefficient in coefficients {
-            quantized.push(round_f32(coefficient) as i32);
+    match Quantizer::new(*step_size, range_bits, reversible) {
+        Quantizer::Round => extend_quantized(&mut quantized, coefficients, parallel, round_sample),
+        Quantizer::Zero => quantized.resize(coefficients.len(), 0),
+        Quantizer::Deadzone(delta) => {
+            extend_quantized(&mut quantized, coefficients, parallel, |c| {
+                deadzone_sample(c, delta)
+            });
         }
-        return Ok(quantized);
-    }
-
-    let delta = step_size.delta(range_bits);
-    if delta <= 0.0 {
-        quantized.resize(coefficients.len(), 0);
-        return Ok(quantized);
-    }
-    for &coefficient in coefficients {
-        let sign = if coefficient < 0.0 { -1 } else { 1 };
-        let magnitude = floor_f32(coefficient.abs() / delta) as i32;
-        quantized.push(sign * magnitude);
     }
     Ok(quantized)
 }
 
+/// How a subband's coefficients quantize: rounded when reversible, otherwise
+/// a deadzone quantizer of step `delta`, or all zero without a positive step.
+#[derive(Clone, Copy)]
+pub(crate) enum Quantizer {
+    Round,
+    Zero,
+    Deadzone(f32),
+}
+
+impl Quantizer {
+    pub(crate) fn new(step_size: QuantStepSize, range_bits: u8, reversible: bool) -> Self {
+        if reversible {
+            return Self::Round;
+        }
+        let delta = step_size.delta(range_bits);
+        if delta <= 0.0 {
+            Self::Zero
+        } else {
+            Self::Deadzone(delta)
+        }
+    }
+
+    /// Append the quantized `coefficients` to `quantized`.
+    pub(crate) fn extend(self, quantized: &mut Vec<i32>, coefficients: &[f32]) {
+        match self {
+            Self::Round => quantized.extend(coefficients.iter().map(|&c| round_sample(c))),
+            Self::Zero => quantized.resize(quantized.len() + coefficients.len(), 0),
+            Self::Deadzone(delta) => {
+                quantized.extend(coefficients.iter().map(|&c| deadzone_sample(c, delta)));
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "finite wavelet coefficients are intentionally rounded at the codec quantization boundary"
+)]
+fn round_sample(coefficient: f32) -> i32 {
+    round_f32(coefficient) as i32
+}
+
+/// Deadzone quantization: `sign(c) * floor(|c| / delta)`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "finite wavelet coefficients are intentionally rounded at the codec quantization boundary"
+)]
+fn deadzone_sample(coefficient: f32, delta: f32) -> i32 {
+    let sign = if coefficient < 0.0 { -1 } else { 1 };
+    sign * floor_f32(coefficient.abs() / delta) as i32
+}
+
+fn extend_quantized(
+    quantized: &mut Vec<i32>,
+    coefficients: &[f32],
+    parallel: bool,
+    quantize: impl Fn(f32) -> i32 + Send + Sync,
+) {
+    #[cfg(feature = "parallel")]
+    if parallel
+        && coefficients.len() >= PARALLEL_QUANTIZE_SAMPLES
+        && rayon::current_num_threads() > 1
+    {
+        use rayon::prelude::*;
+        quantized.par_extend(
+            coefficients
+                .par_iter()
+                .with_min_len(1 << 14)
+                .map(|&c| quantize(c)),
+        );
+        return;
+    }
+    let _ = parallel;
+    quantized.extend(coefficients.iter().map(|&c| quantize(c)));
+}
+
+/// Smaller subbands quantize on one thread.
+#[cfg(feature = "parallel")]
+const PARALLEL_QUANTIZE_SAMPLES: usize = 1 << 16;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallible_quantization_matches_the_reference_on_one_thread_and_the_pool() {
+        // 70,000 samples are enough to quantize on the Rayon pool when allowed.
+        let coefficients = (0..70_000_u32)
+            .map(|index| {
+                f32::from(u16::try_from(index * 7919 % 65_536).expect("u16")) / 7.0 - 4681.0
+            })
+            .collect::<Vec<_>>();
+        let step = QuantStepSize {
+            exponent: 9,
+            mantissa: 1000,
+        };
+        for (reversible, parallel) in [(true, false), (true, true), (false, false), (false, true)] {
+            assert_eq!(
+                try_quantize_subband(&coefficients, &step, 9, reversible, parallel)
+                    .expect("fallible quantization"),
+                quantize_subband(&coefficients, &step, 9, reversible),
+                "reversible {reversible}, parallel {parallel}"
+            );
+        }
+    }
 
     #[test]
     fn openhtj2k_qfactor_90_matches_reference_qcd_and_qcc() {
@@ -764,61 +1005,48 @@ mod tests {
         assert_eq!(steps.len(), 10);
     }
 
+    /// One-level 9/7 synthesis norms relative to LL, the smallest: HL/LH, HH.
+    const ONE_LEVEL_DETAIL_WEIGHTS: [f32; 2] = [0.971_983, 0.944_752];
+
+    /// Decoder deltas of a one-level LL, HL, LH, HH step set at `base`, the LL
+    /// delta, checked to the 11-bit mantissa's relative precision.
+    fn assert_one_level_deltas(steps: &[QuantStepSize], base: f32) {
+        let [high_low, high_high] = ONE_LEVEL_DETAIL_WEIGHTS;
+        let expected = [
+            base,
+            2.0 * base * high_low,
+            2.0 * base * high_low,
+            4.0 * base * high_high,
+        ];
+        for ((&range_bits, step), expected) in [8u8, 9, 9, 10].iter().zip(steps).zip(expected) {
+            let delta = step.delta(range_bits);
+            assert!(
+                (delta / expected - 1.0).abs() < 1e-3,
+                "{delta} vs {expected}"
+            );
+        }
+    }
+
     #[test]
     fn irreversible_steps_match_decoder_qcd_contract() {
         let steps = compute_step_sizes(8, 1, false, 2);
-        let exponents: Vec<u16> = steps.iter().map(|step| step.exponent).collect();
-        let mantissas: Vec<u16> = steps.iter().map(|step| step.mantissa).collect();
-        assert_eq!(exponents, vec![10, 10, 10, 10]);
-        assert_eq!(mantissas, vec![0, 0, 0, 0]);
-
-        let deltas: Vec<f32> = [8u8, 9, 9, 10]
-            .iter()
-            .zip(&steps)
-            .map(|(&range_bits, step)| step.delta(range_bits))
-            .collect();
-        assert!((deltas[0] - 0.25).abs() < 0.001);
-        assert!((deltas[1] - 0.5).abs() < 0.001);
-        assert!((deltas[2] - 0.5).abs() < 0.001);
-        assert!((deltas[3] - 1.0).abs() < 0.001);
+        // LL has the smallest one-level norm and keeps the unweighted step.
+        assert_eq!((steps[0].exponent, steps[0].mantissa), (10, 0));
+        assert_one_level_deltas(&steps, 0.25);
     }
 
     #[test]
     fn irreversible_quantization_scale_coarsens_qcd_deltas() {
         let steps = compute_step_sizes_with_irreversible_scale(8, 1, false, 2, 4.0);
-        let exponents: Vec<u16> = steps.iter().map(|step| step.exponent).collect();
-        let mantissas: Vec<u16> = steps.iter().map(|step| step.mantissa).collect();
-        assert_eq!(exponents, vec![8, 8, 8, 8]);
-        assert_eq!(mantissas, vec![0, 0, 0, 0]);
-
-        let deltas: Vec<f32> = [8u8, 9, 9, 10]
-            .iter()
-            .zip(&steps)
-            .map(|(&range_bits, step)| step.delta(range_bits))
-            .collect();
-        assert!((deltas[0] - 1.0).abs() < 0.001);
-        assert!((deltas[1] - 2.0).abs() < 0.001);
-        assert!((deltas[2] - 2.0).abs() < 0.001);
-        assert!((deltas[3] - 4.0).abs() < 0.001);
+        assert_eq!((steps[0].exponent, steps[0].mantissa), (8, 0));
+        assert_one_level_deltas(&steps, 1.0);
     }
 
     #[test]
     fn irreversible_quantization_scale_uses_mantissa_for_fractional_steps() {
         let steps = compute_step_sizes_with_irreversible_scale(8, 1, false, 2, 5.0);
-        let exponents: Vec<u16> = steps.iter().map(|step| step.exponent).collect();
-        let mantissas: Vec<u16> = steps.iter().map(|step| step.mantissa).collect();
-        assert_eq!(exponents, vec![8, 8, 8, 8]);
-        assert_eq!(mantissas, vec![512, 512, 512, 512]);
-
-        let deltas: Vec<f32> = [8u8, 9, 9, 10]
-            .iter()
-            .zip(&steps)
-            .map(|(&range_bits, step)| step.delta(range_bits))
-            .collect();
-        assert!((deltas[0] - 1.25).abs() < 0.001);
-        assert!((deltas[1] - 2.5).abs() < 0.001);
-        assert!((deltas[2] - 2.5).abs() < 0.001);
-        assert!((deltas[3] - 5.0).abs() < 0.001);
+        assert_eq!((steps[0].exponent, steps[0].mantissa), (8, 512));
+        assert_one_level_deltas(&steps, 1.25);
     }
 
     #[test]
@@ -973,9 +1201,12 @@ mod tests {
 
     #[test]
     fn profile_steps_follow_weight_order_until_they_are_rejected() {
-        // Guard bits 2 make the LL step 0.25 * weight before rounding.
-        assert_eq!(profiled_ll_delta(1536.0, 1.0).ok(), Some(384.0));
-        assert!(profiled_ll_delta(2048.0, 1.0).is_err());
+        // Guard bits 2 give an unweighted step of 0.25; a two-level LL's
+        // synthesis norm refines it to 0.25 * 0.490629 * weight before rounding.
+        let delta = profiled_ll_delta(1536.0, 1.0).unwrap();
+        assert!((delta / 188.4015 - 1.0).abs() < 1e-3, "{delta}");
+        assert!(profiled_ll_delta(4096.0, 1.0).is_ok());
+        assert!(profiled_ll_delta(4400.0, 1.0).is_err());
 
         let mut previous = None;
         let mut leaving_range = false;
@@ -996,7 +1227,8 @@ mod tests {
 
     #[test]
     fn profile_weights_the_unrounded_globally_scaled_step() {
-        // 0.25 * 4096 = 1024 is past the coarsest step, but a quarter of it is not.
+        // 0.25 * 4096 = 1024 is past the coarsest step for the finest bands, but
+        // a quarter of it is not: the profile reproduces the default at 1024.
         let mut steps = compute_step_sizes_with_irreversible_scale(8, 2, false, 2, 4096.0);
         apply_component_profile(
             &mut steps,
@@ -1008,11 +1240,57 @@ mod tests {
             0,
         )
         .unwrap();
-        assert!(steps
-            .iter()
-            .all(|step| (step.delta(8) - 256.0).abs() < 0.001));
+        assert_eq!(
+            steps,
+            compute_step_sizes_with_irreversible_scale(8, 2, false, 2, 1024.0)
+        );
         // Unity bands of an active profile must also stay representable.
         assert!(profiled_ll_delta(0.25, 4096.0).is_err());
+    }
+
+    #[test]
+    fn profile_product_can_reenter_range_after_an_intermediate_overflow() {
+        let scales = IrreversibleQuantizationSubbandScales {
+            low_low: 1e20,
+            ..IrreversibleQuantizationSubbandScales::default()
+        };
+        let mut steps = compute_step_sizes_with_irreversible_profile(8, 0, false, 2, 1e20, scales);
+        apply_component_profile(&mut steps, 8, 2, 1e20, scales, Some(&[vec![1e-40]]), 0)
+            .expect("the complete positive product is approximately 0.25");
+        assert_eq!((steps[0].exponent, steps[0].mantissa), (10, 0));
+    }
+
+    #[test]
+    fn global_product_preserves_a_subnormal_factor_before_rescaling() {
+        let scales = IrreversibleQuantizationSubbandScales {
+            low_low: f32::MAX,
+            ..IrreversibleQuantizationSubbandScales::default()
+        };
+        let steps =
+            compute_step_sizes_with_irreversible_profile(1, 0, false, 2, f32::from_bits(1), scales);
+        // 2^-2 * 2^-149 * (2^128 - 2^104) rounds to 2^-23.
+        assert_eq!((steps[0].exponent, steps[0].mantissa), (24, 0));
+    }
+
+    #[test]
+    fn profile_interval_checks_both_limits_of_every_weighted_band() {
+        let profile = [vec![1.0 / 16_777_216.0, 1.0, 3.0, 8.0]];
+        let scales = IrreversibleQuantizationSubbandScales::default();
+        let (lower, upper) =
+            quantization_scale_bounds(8, 2, scales, Some(&profile), 1, MAX_STEP_EXPONENT);
+        let accepted = |scale| {
+            let mut steps = compute_step_sizes_with_irreversible_scale(8, 1, false, 2, scale);
+            apply_component_profile(&mut steps, 8, 2, scale, scales, Some(&profile), 0).is_ok()
+        };
+        assert!(lower > 7.0 && lower <= 8.0);
+        // HH weight 8 on a one-level HH norm weight of 0.944752: 511.875 / 1.889504.
+        assert!(upper > 270.0 && upper < 271.5, "{upper}");
+        assert!(accepted(lower) && accepted(upper));
+        assert!(!accepted(lower.next_down()) && !accepted(upper.next_up()));
+        let incompatible = [vec![1e-20, 1e20, 1.0, 1.0]];
+        let (lower, upper) =
+            quantization_scale_bounds(8, 2, scales, Some(&incompatible), 1, MAX_STEP_EXPONENT);
+        assert!(lower > upper);
     }
 
     #[test]
@@ -1029,5 +1307,65 @@ mod tests {
         assert!(!representable(ceiling.next_up()));
         // An out-of-range start is returned for encode to reject.
         assert_eq!(profile_scale_ceiling(8, 2, 1e9, scales, &profile), 1e9);
+    }
+
+    #[test]
+    fn synthesis_norms_double_per_level_beyond_the_table() {
+        for subband in [
+            J2kSubBandType::LowLow,
+            J2kSubBandType::HighLow,
+            J2kSubBandType::LowHigh,
+            J2kSubBandType::HighHigh,
+        ] {
+            let last = d97_synthesis_norm(subband, 16);
+            assert_eq!(d97_synthesis_norm(subband, 17), last * 2.0);
+            assert_eq!(d97_synthesis_norm(subband, 32), last * 65_536.0);
+            assert_eq!(
+                d97_synthesis_norm(subband, u8::MAX),
+                libm::scalbn(last, 239)
+            );
+        }
+    }
+
+    #[test]
+    fn default_irreversible_steps_follow_97_synthesis_norms() {
+        // OpenJPEG 2.5, Grok and OpenJPH signal HL steps about 2x larger per
+        // finer level and about 17x larger at level 1 than at level 5.
+        let steps = compute_step_sizes(8, 5, false, 2);
+        let high_low = |level: usize| steps[1 + 3 * (5 - level)].delta(9);
+        let ladder = high_low(1) / high_low(5);
+        assert!((16.5..17.5).contains(&ladder), "{ladder}");
+        for level in 1..5 {
+            let ratio = high_low(level) / high_low(level + 1);
+            assert!((1.9..2.2).contains(&ratio), "level {level}: {ratio}");
+        }
+    }
+
+    #[test]
+    fn default_irreversible_steps_keep_the_smallest_norm_band_and_refine_the_rest() {
+        // Without norm weighting every band here signals exponent 10, mantissa 0.
+        let unweighted = QuantStepSize {
+            exponent: 10,
+            mantissa: 0,
+        };
+        for levels in 1..=6_u8 {
+            let steps = compute_step_sizes(8, levels, false, 2);
+            // One level: LL has the smallest norm; otherwise the finest HL/LH.
+            let kept = if levels == 1 {
+                vec![0]
+            } else {
+                vec![steps.len() - 3, steps.len() - 2]
+            };
+            for (index, step) in steps.iter().enumerate() {
+                if kept.contains(&index) {
+                    assert_eq!(*step, unweighted, "{levels} levels, band {index}");
+                } else {
+                    assert!(
+                        step.delta(8) < unweighted.delta(8),
+                        "{levels} levels, band {index}: {step:?}"
+                    );
+                }
+            }
+        }
     }
 }

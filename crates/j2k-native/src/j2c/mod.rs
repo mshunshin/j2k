@@ -8,6 +8,8 @@ pub(crate) mod codestream;
 pub(crate) mod codestream_write;
 pub(crate) mod coefficient_view;
 mod decode;
+#[cfg(all(test, feature = "parallel"))]
+pub(crate) use decode::MIN_BAND_WORK;
 pub(crate) mod encode;
 pub(crate) mod fdwt;
 pub(crate) mod forward_mct;
@@ -46,19 +48,27 @@ use crate::{resolve_alpha_and_color_space, DecodeSettings, Image};
 use crate::math::{SimdBuffer, SIMD_WIDTH};
 pub(crate) use codestream::Header;
 #[cfg(test)]
+pub(crate) use decode::decode_with_capacity_retry as decode;
+#[cfg(any(test, feature = "std"))]
+pub(crate) use decode::is_capacity_error;
+#[cfg(test)]
 pub(crate) use decode::should_decode_classic_sub_band_in_parallel;
 pub(crate) use decode::{
     build_component_grid_color_plan, build_direct_color_plan, build_direct_grayscale_plan,
     build_referenced_classic_color_plan, build_referenced_classic_grayscale_plan,
     build_referenced_classic_rgba_plan, build_referenced_htj2k_color_plan,
     build_referenced_htj2k_grayscale_plan, build_referenced_htj2k_rgba_plan,
-    decode_preparsed_with_capacity_retry as decode_preparsed, decode_with_capacity_retry as decode,
+    decode_preparsed_with_capacity_retry as decode_preparsed,
+    decode_rows_with_capacity_retry as decode_rows, full_decode_planes_floor, image_streams_rows,
     prepare_region_tiles,
 };
 pub use decode::{CpuDecodeParallelism, DecoderContext, DecoderWorkspace, DecoderWorkspaceStats};
 pub use recode::Reversible53CoefficientImage;
+pub(crate) use roi::output_grid_offset;
+#[cfg(feature = "std")]
+pub(crate) use segment::directory::PacketDirectory;
 pub(crate) use segment::MAX_BITPLANE_COUNT;
-pub(crate) use tile::ParsedTiles;
+pub(crate) use tile::{tile_rect, ParsedTiles};
 
 pub(crate) struct ParsedCodestream<'a> {
     pub(crate) header: Header<'a>,

@@ -1,0 +1,174 @@
+version: 3
+baseline_tag: v0.13.1
+baseline_version: 0.13.1
+candidate_version: "0.13.2"
+break_ledger: []
+reviews:
+  j2k-core:
+    removed_fingerprint: "none"
+    added_fingerprint: "fnv1a64:1783cd7e6f188540"
+    hidden_count: 226
+    hidden_fingerprint: "fnv1a64:487523cc4e7f504e"
+    rationale: "Adds AdapterErrorKind::Decode to an existing non-exhaustive enum for backend decode-execution failures. The variant is appended, preserving existing discriminants. AdapterErrorParts method signatures and the existing codec-error boolean helpers are unchanged; existing wildcard matches remain valid."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-profile:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 117
+    hidden_fingerprint: "fnv1a64:a1546f56ae38f2e3"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-types:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 111
+    hidden_fingerprint: "fnv1a64:6eaf63f068893d17"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-codec-math:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 0
+    hidden_fingerprint: "none"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-cuda-build-support:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 0
+    hidden_fingerprint: "none"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-cuda-runtime:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 255
+    hidden_fingerprint: "fnv1a64:57c61a4568990ce6"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-cuda-j2k-engine:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 692
+    hidden_fingerprint: "fnv1a64:684fbcddde38e1f1"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-cuda-jpeg-engine:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 205
+    hidden_fingerprint: "fnv1a64:ad37da6966da1cfd"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-cuda-transcode-engine:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 84
+    hidden_fingerprint: "fnv1a64:b2fcaa9b0171aba7"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-metal-support:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 11
+    hidden_fingerprint: "fnv1a64:02139606f1202938"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-mpsgraph-support:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 0
+    hidden_fingerprint: "none"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-native:
+    removed_fingerprint: "none"
+    added_fingerprint: "fnv1a64:22b943651a07318e"
+    hidden_count: 595
+    hidden_fingerprint: "fnv1a64:0d8774f02739bc1e"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1. Adds DecodeErrorClass::ResourceLimit { requested, cap } to an already non-exhaustive enum; no existing item changes and existing variant discriminants are preserved. AllocationTooLarge and ImageTooLarge now classify as ResourceLimit instead of the generic Backend class. This is a compatible refinement of the extensible error taxonomy: invalid-input and allocator-failure classes stay unchanged. Callers that want to handle memory limits separately can match the new variant; existing wildcard matches remain valid."
+    hidden_rationale: "Adds referenced_classic_plan_execution_bytes and referenced_htj2k_plan_execution_bytes for sibling CPU batch adapters to check planned live execution memory before allocation. For the facade's streamed routes, j2k-native also adds decode_native_region_components_rows_with_context, full_decode_planes_floor, output_tile_rects, region_decode_streams_rows and streamed_rows_native_precision; cpu_decode_pool_threads reports the pool thread count for facade routing, DecoderContext::set_shared_pool marks CpuBatchDecoder's shared-pool images, and pack_rgb8 shares the existing pixel conversion. ComponentRowSink::rgb8_region is an optional default method, so existing sink implementations remain valid. These are unsupported implementation helpers; existing signatures are unchanged."
+  j2k-jpeg:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 701
+    hidden_fingerprint: "fnv1a64:bd0cf738a0f96592"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-tilecodec:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 32
+    hidden_fingerprint: "fnv1a64:eb677842559d9b0e"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k:
+    removed_fingerprint: "none"
+    added_fingerprint: "fnv1a64:78b9622111db3437"
+    hidden_count: 109
+    hidden_fingerprint: "fnv1a64:0427dd567531c8dd"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1. Adds J2kError::ResourceLimit { requested, cap, source } to an already non-exhaustive enum; no existing item changes and existing variant discriminants are preserved. Budget and image-size failures now use this variant instead of NativeDecode, retaining the structured native cause. Callers specifically handling budget failures through NativeDecode should also handle ResourceLimit. Batches prepared by CpuBatchDecoder report items whose output allocation or planned execution cannot fit as indexed preparation errors and exclude those items from the prepared groups. Backend-neutral prepare_batch and prepare_batch_from_images retain whole-call output-cap failures for a single oversized image when subsequently decoded on the CPU. On either preparation path, groups whose combined output exceeds the allocation cap are decoded into several result groups, each with a buffer within the cap. Automatic streamed routes also allow requests that previously exceeded working-memory limits to succeed. The documented deep-sample conversion fixes make 16-bit outputs of images deeper than 16 bits hold the native sample value clamped to the 16-bit range (two's complement when signed), as scaled decodes already did, and quantize 8-bit outputs over the full component precision, correcting the prior wider-sample byte interpretation and 16-bit scaling ceiling. These preserve the output contracts and ordinary decode signatures. Adds BackendErrorKind::Decode at the end of its existing non-exhaustive enum and BackendError::decode for failures during backend decode execution. Existing discriminants and constructors are preserved. The public error documentation and changelog describe the refinements."
+    hidden_rationale: "Adds set_full_decode_planes_budget as an unsupported test hook for isolated integration tests of automatic planes/streamed routing. Existing public decode methods continue choosing their routes automatically; no supported user configuration is added. All other hidden facade items are unchanged."
+  j2k-transcode:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 458
+    hidden_fingerprint: "fnv1a64:449a76476549c1e2"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-transcode-cuda:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 20
+    hidden_fingerprint: "fnv1a64:be22ca1d5e12b043"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-jpeg-metal:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 83
+    hidden_fingerprint: "fnv1a64:79397ffc221464c3"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-metal:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 321
+    hidden_fingerprint: "fnv1a64:41513c1e93413909"
+    rationale: "No ordinary signatures or error variants were added, removed, or changed. Classic and HT Tier-1 FAIL statuses now use the existing Error::Decode(J2kError::Backend) wrapper with BackendErrorKind::Decode instead of Error::MetalKernel. Their display prefix becomes backend failed (decode):; the diagnostic retains the coding path, status code, detail and batch source index. Unsupported and unknown statuses, runtime failures, cleanup failures, session retirement and fallback classification keep their existing behavior. This is a documented refinement of failure classification, not a new Metal error variant."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-transcode-metal:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 49
+    hidden_fingerprint: "fnv1a64:b4a8b53d5e10bb00"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-jpeg-cuda:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 133
+    hidden_fingerprint: "fnv1a64:9aa724bde7af1618"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-cuda:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 193
+    hidden_fingerprint: "fnv1a64:8a9b0ac701f08d00"
+    rationale: "No ordinary signatures or error variants were added, removed, or changed. AdapterErrorParts reports Decode only for a CudaTier1JobFailed with a direct bare KernelJobStatus source whose code is the classic/HT FAIL value 1. The typed CUDA source and job attribution remain available. Unsupported or unknown statuses, raw runtime errors and nested completion, release or adapter-cleanup failures retain their existing classes and fallback behavior."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-ml:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 0
+    hidden_fingerprint: "none"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."
+  j2k-mpsgraph:
+    removed_fingerprint: "none"
+    added_fingerprint: "none"
+    hidden_count: 0
+    hidden_fingerprint: "none"
+    rationale: "Compared the complete ordinary API inventory against v0.13.1; no signatures were added, removed, or changed."
+    hidden_rationale: "Compared the complete hidden API inventory against v0.13.1; it is unchanged."

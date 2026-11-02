@@ -3,13 +3,16 @@
 //! Persistent CPU batch session and public native output owners.
 
 use super::{
-    decode_cpu_group, fmt, generic_batch_worker_limit, prepare_batch_from_images,
+    decode_cpu_group, fmt, generic_batch_worker_limit, prepare_batch_from_images_for,
     prepare_batch_with_workers, BatchDecodeOptions, BatchDecoder, BatchGroupInfo,
     BatchInfrastructureError, BatchWorker, CpuBatchWorkspaceStats, CpuGroupFastWorkspace,
-    CpuStagedWorkspace, EncodedImage, IndexedBatchError, J2kDecodeWarning, Mutex, NativeSampleType,
-    NonZeroUsize, PreparedBatch, PreparedImage, Rect, Vec,
+    CpuStagedWorkspace, CpuStreamPool, EncodedImage, IndexedBatchError, J2kDecodeWarning, Mutex,
+    NativeSampleType, NonZeroUsize, PrepareFor, PreparedBatch, PreparedBatchGroup,
+    PreparedBatchGroupRef, PreparedImage, Rect, Vec,
 };
 use crate::batch::allocation::try_vec_with_capacity;
+use crate::batch::scheduler::decode_retained_tiles;
+use crate::{DecodeOutcome, PixelFormat, TileBatchError, TileBatchOptions, TileDecodeJob};
 
 /// Native-width contiguous samples returned by the CPU batch decoder.
 #[derive(Debug, PartialEq, Eq)]
@@ -171,6 +174,7 @@ pub struct CpuBatchDecoder {
     workers: Mutex<Vec<BatchWorker>>,
     fast_workspace: CpuGroupFastWorkspace,
     staged_workspace: CpuStagedWorkspace,
+    stream_pool: Mutex<CpuStreamPool>,
 }
 
 impl fmt::Debug for CpuBatchDecoder {
@@ -199,6 +203,7 @@ impl CpuBatchDecoder {
             workers: Mutex::new(workers),
             fast_workspace: CpuGroupFastWorkspace::default(),
             staged_workspace: CpuStagedWorkspace::default(),
+            stream_pool: Mutex::default(),
         }
     }
 
@@ -206,6 +211,27 @@ impl CpuBatchDecoder {
     #[must_use]
     pub const fn options(&self) -> BatchDecodeOptions {
         self.options
+    }
+
+    /// Threads of the session's streamed-group pool, once a group used it.
+    #[cfg(test)]
+    pub(super) fn stream_pool_threads(&mut self) -> Option<usize> {
+        self.stream_pool
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .threads()
+    }
+
+    /// Offset-plan executions of this session's workers with nested
+    /// parallelism.
+    #[cfg(test)]
+    pub(super) fn parallel_plan_decodes(&mut self) -> u64 {
+        self.workers
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(BatchWorker::parallel_plan_decode_calls)
+            .sum()
     }
 
     /// Number of reusable worker context/scratch owners retained by this session.
@@ -286,7 +312,42 @@ impl CpuBatchDecoder {
         aggregate
     }
 
+    /// Decode independent J2K/HTJ2K tiles into caller-owned output buffers.
+    ///
+    /// Behaves like [`decode_tiles_into`](crate::decode_tiles_into) with this
+    /// session's worker count and decoder settings; `layout` does not apply
+    /// because `fmt` defines the output. Each retained worker keeps its
+    /// decoded-component, Tier-1, and IDWT allocations across tiles and calls,
+    /// so repeated batches neither reallocate nor re-fault them.
+    ///
+    /// # Errors
+    /// Same as [`decode_tiles_into`](crate::decode_tiles_into).
+    pub fn decode_tiles_into(
+        &mut self,
+        jobs: &mut [TileDecodeJob<'_, '_>],
+        fmt: PixelFormat,
+    ) -> Result<Vec<DecodeOutcome<J2kDecodeWarning>>, TileBatchError> {
+        let workers = self
+            .workers
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        decode_retained_tiles(
+            workers,
+            jobs,
+            fmt,
+            TileBatchOptions {
+                workers: self.options.workers,
+            },
+            self.options.settings,
+        )
+    }
+
     /// Inspect and group owned encoded inputs for repeated decode.
+    ///
+    /// Inputs whose output allocation or planned execution exceeds a memory
+    /// limit are recorded as indexed preparation errors in the returned batch.
+    /// Preparation checks individual images. During decoding, a group too
+    /// large for one output allocation is split into smaller result groups.
     pub fn prepare(
         &self,
         inputs: Vec<EncodedImage>,
@@ -295,15 +356,17 @@ impl CpuBatchDecoder {
             .workers
             .lock()
             .map_err(|_| BatchInfrastructureError::SchedulerPoisoned)?;
-        prepare_batch_with_workers(inputs, self.options, &mut workers)
+        prepare_batch_with_workers(inputs, self.options, &mut workers, PrepareFor::CpuDecoder)
     }
 
     /// Regroup caller-supplied prepared images under this session's output policy.
+    ///
+    /// This applies the same per-image memory checks as [`Self::prepare`].
     pub fn prepare_prepared_images(
         &self,
         images: Vec<PreparedImage>,
     ) -> Result<PreparedBatch, BatchInfrastructureError> {
-        prepare_batch_from_images(images, self.options)
+        prepare_batch_from_images_for(images, self.options, PrepareFor::CpuDecoder)
     }
 
     /// Prepare and decode one batch.
@@ -333,6 +396,10 @@ impl CpuBatchDecoder {
             .workers
             .get_mut()
             .map_err(|_| BatchInfrastructureError::SchedulerPoisoned)?;
+        let stream_pool = self
+            .stream_pool
+            .get_mut()
+            .map_err(|_| BatchInfrastructureError::SchedulerPoisoned)?;
         let input_count = prepared
             .groups()
             .iter()
@@ -349,21 +416,69 @@ impl CpuBatchDecoder {
         let mut errors = try_vec_with_capacity(input_count, "J2K owned batch indexed errors")?;
         errors.extend_from_slice(prepared.errors());
         for group in prepared.groups() {
-            if let Some(decoded) = decode_cpu_group(
-                workers,
-                &mut self.fast_workspace,
-                &mut self.staged_workspace,
-                group,
-                prepared.options,
-                self.options.workers,
-                &mut errors,
-            )? {
-                groups.push(decoded);
+            let images_per_group = output_images_per_group(group);
+            // One dense buffer for the whole group would exceed the
+            // per-allocation cap: decode consecutive images as several
+            // groups with the same info, each buffer within the cap.
+            for (images, source_indices) in group
+                .images
+                .chunks(images_per_group)
+                .zip(group.source_indices.chunks(images_per_group))
+            {
+                let part = PreparedBatchGroupRef {
+                    info: &group.info,
+                    images,
+                    source_indices,
+                };
+                if let Some(decoded) = decode_cpu_group(
+                    workers,
+                    &mut self.fast_workspace,
+                    &mut self.staged_workspace,
+                    stream_pool,
+                    part,
+                    prepared.options,
+                    self.options.workers,
+                    &mut errors,
+                )? {
+                    push_group(&mut groups, decoded)?;
+                }
             }
         }
         errors.sort_by_key(|error| error.index);
         Ok(CpuBatchDecodeResult { groups, errors })
     }
+}
+
+/// Images whose dense outputs fit one per-allocation-capped buffer together
+/// (at least one). An image whose own output exceeds the cap still fails in
+/// its own group, as before.
+fn output_images_per_group(group: &PreparedBatchGroup) -> usize {
+    group
+        .info
+        .output_bytes(1)
+        .map_or(group.images.len(), |image_bytes| {
+            images_within_cap(image_bytes, j2k_core::DEFAULT_MAX_HOST_ALLOCATION_BYTES)
+        })
+}
+
+/// How many images of `image_bytes` one buffer of at most `cap` bytes holds,
+/// never fewer than one.
+fn images_within_cap(image_bytes: usize, cap: usize) -> usize {
+    cap.checked_div(image_bytes).unwrap_or(usize::MAX).max(1)
+}
+
+fn push_group(
+    groups: &mut Vec<CpuBatchGroup>,
+    group: CpuBatchGroup,
+) -> Result<(), BatchInfrastructureError> {
+    groups
+        .try_reserve(1)
+        .map_err(|_| BatchInfrastructureError::HostAllocationFailed {
+            what: "J2K owned batch result groups",
+            bytes: core::mem::size_of::<CpuBatchGroup>(),
+        })?;
+    groups.push(group);
+    Ok(())
 }
 
 impl BatchDecoder for CpuBatchDecoder {
@@ -387,5 +502,22 @@ impl BatchDecoder for CpuBatchDecoder {
 
     fn decode_prepared(&mut self, prepared: &PreparedBatch) -> Result<Self::Output, Self::Error> {
         Self::decode_prepared(self, prepared)
+    }
+}
+
+#[cfg(test)]
+mod output_group_tests {
+    use super::images_within_cap;
+
+    #[test]
+    fn groups_above_the_cap_split_into_buffers_within_it() {
+        const MIB: usize = 1024 * 1024;
+        // Eight 5792² RGB8 images (96 MiB each) under a 512 MiB cap.
+        assert_eq!(images_within_cap(96 * MIB, 512 * MIB), 5);
+        assert_eq!(images_within_cap(512 * MIB, 512 * MIB), 1);
+        // An image above the cap keeps a group of its own.
+        assert_eq!(images_within_cap(768 * MIB, 512 * MIB), 1);
+        assert_eq!(images_within_cap(3 * MIB, 512 * MIB), 170);
+        assert_eq!(images_within_cap(0, 512 * MIB), usize::MAX);
     }
 }

@@ -6,7 +6,10 @@ use crate::{
     },
     layout::{output_pixel_index, pixel_coords, source_index},
     memory::{load_f32, store_u8, store_u16},
-    sample::{round_ties_even_f32, sample_as_u8, sample_as_u16},
+    sample::{
+        opaque_alpha_u16, round_integer_output_then_add, round_ties_even_f32, sample_as_u8,
+        sample_as_u16,
+    },
     transform::inverse_mct_sample,
 };
 
@@ -39,17 +42,26 @@ pub(crate) fn store_rgb8_sample(
     store_u8(
         output,
         dst,
-        sample_as_u8(load_f32(plane0, src0) + job.addend0, job.bit_depth0),
+        sample_as_u8(
+            round_integer_output_then_add(load_f32(plane0, src0), job.addend0),
+            job.bit_depth0,
+        ),
     );
     store_u8(
         output,
         dst + 1,
-        sample_as_u8(load_f32(plane1, src1) + job.addend1, job.bit_depth1),
+        sample_as_u8(
+            round_integer_output_then_add(load_f32(plane1, src1), job.addend1),
+            job.bit_depth1,
+        ),
     );
     store_u8(
         output,
         dst + 2,
-        sample_as_u8(load_f32(plane2, src2) + job.addend2, job.bit_depth2),
+        sample_as_u8(
+            round_integer_output_then_add(load_f32(plane2, src2), job.addend2),
+            job.bit_depth2,
+        ),
     );
     if job.rgba != 0 {
         store_u8(output, dst + 3, 255);
@@ -75,20 +87,36 @@ pub(crate) fn store_rgb16_sample(
     store_u16(
         output,
         dst,
-        sample_as_u16(load_f32(plane0, src0) + job.addend0, job.bit_depth0),
+        sample_as_u16(
+            round_integer_output_then_add(load_f32(plane0, src0), job.addend0),
+            job.bit_depth0,
+            job.signed != 0,
+        ),
     );
     store_u16(
         output,
         dst + 1,
-        sample_as_u16(load_f32(plane1, src1) + job.addend1, job.bit_depth1),
+        sample_as_u16(
+            round_integer_output_then_add(load_f32(plane1, src1), job.addend1),
+            job.bit_depth1,
+            job.signed != 0,
+        ),
     );
     store_u16(
         output,
         dst + 2,
-        sample_as_u16(load_f32(plane2, src2) + job.addend2, job.bit_depth2),
+        sample_as_u16(
+            round_integer_output_then_add(load_f32(plane2, src2), job.addend2),
+            job.bit_depth2,
+            job.signed != 0,
+        ),
     );
     if job.rgba != 0 {
-        store_u16(output, dst + 3, 65535);
+        store_u16(
+            output,
+            dst + 3,
+            opaque_alpha_u16(job.bit_depth0.max(job.bit_depth1).max(job.bit_depth2)),
+        );
     }
 }
 
@@ -191,6 +219,7 @@ pub(crate) fn store_rgb16_mct_sample(
         sample_as_u16(
             add_mct_level_shift(out0, job.addend0, mct_job.irreversible97),
             job.bit_depth0,
+            job.signed != 0,
         ),
     );
     store_u16(
@@ -199,6 +228,7 @@ pub(crate) fn store_rgb16_mct_sample(
         sample_as_u16(
             add_mct_level_shift(out1, job.addend1, mct_job.irreversible97),
             job.bit_depth1,
+            job.signed != 0,
         ),
     );
     store_u16(
@@ -207,9 +237,14 @@ pub(crate) fn store_rgb16_mct_sample(
         sample_as_u16(
             add_mct_level_shift(out2, job.addend2, mct_job.irreversible97),
             job.bit_depth2,
+            job.signed != 0,
         ),
     );
     if job.rgba != 0 {
-        store_u16(output, dst + 3, 65535);
+        store_u16(
+            output,
+            dst + 3,
+            opaque_alpha_u16(job.bit_depth0.max(job.bit_depth1).max(job.bit_depth2)),
+        );
     }
 }

@@ -11,6 +11,7 @@ use super::super::{
 };
 
 pub(in crate::j2c::encode) struct ForwardDwtRequest<'a, 'input> {
+    pub(in crate::j2c::encode) origin: (u32, u32),
     pub(in crate::j2c::encode) component: Vec<f32>,
     pub(in crate::j2c::encode) width: u32,
     pub(in crate::j2c::encode) height: u32,
@@ -19,6 +20,9 @@ pub(in crate::j2c::encode) struct ForwardDwtRequest<'a, 'input> {
     pub(in crate::j2c::encode) session: &'a NativeEncodeSession<'input>,
     pub(in crate::j2c::encode) retained_base_bytes: usize,
     pub(in crate::j2c::encode) line_scratch: &'a mut [f32],
+    /// A plane as long as `component` for the out-of-place first level; it
+    /// comes back holding the consumed input plane.
+    pub(in crate::j2c::encode) spare: Option<&'a mut Vec<f32>>,
 }
 
 pub(in crate::j2c::encode) fn encode_forward_dwt(
@@ -26,6 +30,7 @@ pub(in crate::j2c::encode) fn encode_forward_dwt(
     accelerator: &mut impl J2kEncodeStageAccelerator,
 ) -> NativeEncodePipelineResult<OwnedDwtComponent> {
     let ForwardDwtRequest {
+        origin,
         mut component,
         width,
         height,
@@ -34,15 +39,19 @@ pub(in crate::j2c::encode) fn encode_forward_dwt(
         session,
         retained_base_bytes,
         line_scratch,
+        mut spare,
     } = request;
     if reversible {
         let output = accelerator
-            .encode_forward_dwt53(J2kForwardDwt53Job {
-                samples: &component,
-                width,
-                height,
-                num_levels,
-            })
+            .encode_forward_dwt53_at_origin(
+                J2kForwardDwt53Job {
+                    samples: &component,
+                    width,
+                    height,
+                    num_levels,
+                },
+                origin,
+            )
             .map_err(|source| crate::EncodeError::Accelerator {
                 operation: "forward 5/3 DWT",
                 source,
@@ -58,12 +67,15 @@ pub(in crate::j2c::encode) fn encode_forward_dwt(
         }
     } else {
         let output = accelerator
-            .encode_forward_dwt97(J2kForwardDwt97Job {
-                samples: &component,
-                width,
-                height,
-                num_levels,
-            })
+            .encode_forward_dwt97_at_origin(
+                J2kForwardDwt97Job {
+                    samples: &component,
+                    width,
+                    height,
+                    num_levels,
+                },
+                origin,
+            )
             .map_err(|source| crate::EncodeError::Accelerator {
                 operation: "forward 9/7 DWT",
                 source,
@@ -86,7 +98,12 @@ pub(in crate::j2c::encode) fn encode_forward_dwt(
         num_levels,
         reversible,
         line_scratch,
+        spare.as_deref_mut().map(Vec::as_mut_slice),
+        origin,
     )?;
+    if let Some(spare) = spare {
+        core::mem::swap(&mut component, spare);
+    }
     let geometry = fdwt::PackedDwtGeometry::try_new(width, height, component.len(), shape)?;
     Ok(OwnedDwtComponent::Packed(PackedF32DwtComponent {
         coefficients: component,

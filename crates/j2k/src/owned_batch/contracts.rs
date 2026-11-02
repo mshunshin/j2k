@@ -65,16 +65,7 @@ impl DecodeRequest {
     }
 }
 
-/// Tensor-compatible channel ordering requested from a batch decoder.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum BatchLayout {
-    /// Batch, channel, height, width.
-    #[default]
-    Nchw,
-    /// Batch, height, width, channel.
-    Nhwc,
-}
+pub use j2k_core::BatchLayout;
 
 /// One owned encoded image submitted to a batch decoder.
 #[derive(Debug, Clone)]
@@ -109,6 +100,7 @@ impl EncodedImage {
 
 /// Options shared by preparation and CPU batch decode.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct BatchDecodeOptions {
     /// Output channel ordering.
     pub layout: BatchLayout,
@@ -196,6 +188,22 @@ impl BatchGroupInfo {
         (self.dimensions.0 as usize)
             .checked_mul(self.dimensions.1 as usize)?
             .checked_mul(self.color.channels())
+    }
+
+    /// Bytes in one native sample represented by this group.
+    pub(super) const fn sample_bytes(&self) -> Option<usize> {
+        match self.sample_type {
+            SampleType::U8 => Some(1),
+            SampleType::U16 | SampleType::I16 => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Bytes in the dense native output of `image_count` images.
+    pub(super) fn output_bytes(&self, image_count: usize) -> Option<usize> {
+        self.samples_per_image()?
+            .checked_mul(image_count)?
+            .checked_mul(self.sample_bytes()?)
     }
 
     /// Exact native integer pixel format represented by this group.
@@ -354,5 +362,14 @@ mod tests {
         ] {
             assert_eq!(info.native_pixel_format(), None);
         }
+    }
+
+    #[test]
+    fn native_output_bytes_are_checked_once_from_group_metadata() {
+        let mut info = group_info(PixelLayout::Rgb, SampleType::U16, 12, false);
+        assert_eq!(info.output_bytes(3), Some(8 * 8 * 3 * 2 * 3));
+
+        info.dimensions = (u32::MAX, u32::MAX);
+        assert_eq!(info.output_bytes(usize::MAX), None);
     }
 }

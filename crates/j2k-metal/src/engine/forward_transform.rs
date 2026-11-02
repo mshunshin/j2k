@@ -14,11 +14,12 @@ use super::abi::{
     J2kLosslessDeinterleaveParams,
 };
 use super::{
-    checked_buffer_slice, commit_and_wait_metal, copied_slice_buffer, new_blit_command_encoder,
-    new_command_buffer, new_compute_command_encoder, new_shared_buffer, with_runtime, Buffer,
-    CommandBufferRef, ComputePipelineState, Error, J2kDeinterleaveMctToF32Job,
-    J2kDeinterleaveToF32Job, J2kForwardDwt53Level, J2kForwardDwt53Output, J2kForwardDwt97Level,
-    J2kForwardDwt97Output,
+    checked_buffer_slice, commit_and_wait_metal, copied_recyclable_shared_slice_buffer,
+    copied_slice_buffer, new_blit_command_encoder, new_command_buffer, new_compute_command_encoder,
+    new_shared_buffer, read_completed_buffer, recycle_shared_buffers,
+    take_recyclable_shared_buffer, with_runtime, Buffer, CommandBufferRef, ComputePipelineState,
+    Error, J2kDeinterleaveMctToF32Job, J2kDeinterleaveToF32Job, J2kForwardDwt53Level,
+    J2kForwardDwt53Output, J2kForwardDwt97Level, J2kForwardDwt97Output,
 };
 
 #[cfg(target_os = "macos")]
@@ -111,11 +112,16 @@ pub(crate) fn encode_deinterleave_mct_to_f32(
 }
 
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "DWT command assembly keeps per-level phase, buffer swaps, and packed-band ownership together"
+)]
 pub(crate) fn encode_forward_dwt53(
     samples: &[f32],
     width: u32,
     height: u32,
     num_levels: u8,
+    origin: (u32, u32),
 ) -> Result<J2kForwardDwt53Output, Error> {
     if width == 0 || height == 0 {
         return Err(Error::MetalKernel {
@@ -141,14 +147,22 @@ pub(crate) fn encode_forward_dwt53(
 
         let mut current_width = width;
         let mut current_height = height;
+        let mut level_origin = origin;
         let mut shapes = Vec::new();
         let mut levels_run = 0u8;
         let mut active_is_a = true;
 
         while levels_run < num_levels && (current_width >= 2 || current_height >= 2) {
-            let low_width = current_width.div_ceil(2);
-            let low_height = current_height.div_ceil(2);
+            let dimensions = j2k_types::encode_geometry::encode_dwt_level_dimensions_at_origin(
+                current_width,
+                current_height,
+                level_origin,
+            );
+            let low_width = dimensions.low_width;
+            let low_height = dimensions.low_height;
             let params = J2kForwardDwt53Params {
+                x_phase: level_origin.0 & 1,
+                y_phase: level_origin.1 & 1,
                 full_width: width,
                 current_width,
                 current_height,
@@ -156,7 +170,18 @@ pub(crate) fn encode_forward_dwt53(
                 low_height,
             };
 
-            if current_height >= 2 {
+            let vertical = current_width != 0
+                && (current_height >= 2 || (current_height == 1 && params.y_phase != 0));
+            let horizontal = current_height != 0
+                && (current_width >= 2 || (current_width == 1 && params.x_phase != 0));
+            if levels_run > 0 && vertical != horizontal {
+                let (input, output) =
+                    active_forward_dwt53_buffers(&buffer_a, &buffer_b, active_is_a);
+                let blit = new_blit_command_encoder(&command_buffer)?;
+                blit.copy_from_buffer(input, 0, output, 0, bytes as u64)?;
+                blit.endEncoding();
+            }
+            if vertical {
                 let (input, output) =
                     active_forward_dwt53_buffers(&buffer_a, &buffer_b, active_is_a);
                 dispatch_forward_dwt53_pass(
@@ -170,7 +195,7 @@ pub(crate) fn encode_forward_dwt53(
                 )?;
                 active_is_a = !active_is_a;
             }
-            if current_width >= 2 {
+            if horizontal {
                 let (input, output) =
                     active_forward_dwt53_buffers(&buffer_a, &buffer_b, active_is_a);
                 dispatch_forward_dwt53_pass(
@@ -179,7 +204,9 @@ pub(crate) fn encode_forward_dwt53(
                     input,
                     output,
                     params,
-                    params.low_width,
+                    params
+                        .low_width
+                        .max(params.current_width - params.low_width),
                     "J2K forward DWT 5/3 horizontal",
                 )?;
                 active_is_a = !active_is_a;
@@ -193,11 +220,12 @@ pub(crate) fn encode_forward_dwt53(
                 height: current_height,
                 low_width,
                 low_height,
-                high_width: current_width / 2,
-                high_height: current_height / 2,
+                high_width: dimensions.high_width,
+                high_height: dimensions.high_height,
             });
             current_width = low_width;
             current_height = low_height;
+            level_origin = (level_origin.0.div_ceil(2), level_origin.1.div_ceil(2));
             levels_run = levels_run.saturating_add(1);
         }
 
@@ -240,7 +268,7 @@ pub(super) struct J2kForwardDwt97Params {
     pub(super) low_height: u32,
     pub(super) parity: u32,
     pub(super) coefficient: f32,
-    pub(super) _reserved: u32,
+    pub(super) origin_phase: u32,
 }
 
 const _: [(); 0] = [(); core::mem::offset_of!(J2kForwardDwt97Params, full_width)];
@@ -250,7 +278,7 @@ const _: [(); 12] = [(); core::mem::offset_of!(J2kForwardDwt97Params, low_width)
 const _: [(); 16] = [(); core::mem::offset_of!(J2kForwardDwt97Params, low_height)];
 const _: [(); 20] = [(); core::mem::offset_of!(J2kForwardDwt97Params, parity)];
 const _: [(); 24] = [(); core::mem::offset_of!(J2kForwardDwt97Params, coefficient)];
-const _: [(); 28] = [(); core::mem::offset_of!(J2kForwardDwt97Params, _reserved)];
+const _: [(); 28] = [(); core::mem::offset_of!(J2kForwardDwt97Params, origin_phase)];
 const _: [(); 32] = [(); core::mem::size_of::<J2kForwardDwt97Params>()];
 
 // SAFETY: The compile-time field walk proves the repr(C) value is exactly
@@ -267,6 +295,7 @@ pub(crate) fn encode_forward_dwt97(
     width: u32,
     height: u32,
     num_levels: u8,
+    origin: (u32, u32),
 ) -> Result<J2kForwardDwt97Output, Error> {
     if width == 0 || height == 0 {
         return Err(Error::MetalKernel {
@@ -291,8 +320,10 @@ pub(crate) fn encode_forward_dwt97(
     }
     let bytes = size_of_val(samples);
     with_runtime(|runtime| {
-        let buffer_a = copied_slice_buffer(&runtime.device, samples)?;
-        let buffer_b = new_shared_buffer(&runtime.device, bytes)?;
+        // Pooled, so repeated stage calls reuse mapped memory.
+        let mut pooled = Vec::new();
+        let buffer_a = copied_recyclable_shared_slice_buffer(runtime, samples, &mut pooled)?;
+        let buffer_b = take_recyclable_shared_buffer(runtime, bytes, &mut pooled)?;
         let command_buffer = new_command_buffer(&runtime.queue)?;
 
         let layout = encode_forward_dwt97_commands(
@@ -301,6 +332,7 @@ pub(crate) fn encode_forward_dwt97(
             (&buffer_a, &buffer_b),
             (width, height),
             num_levels,
+            origin,
         )?;
         commit_and_wait_metal(&command_buffer)?;
 
@@ -309,14 +341,18 @@ pub(crate) fn encode_forward_dwt97(
         } else {
             &buffer_b
         };
-        let transformed = checked_buffer_slice::<f32>(active_buffer, samples.len(), "DWT 9/7")?;
-        extract_forward_dwt97_output(
-            &transformed,
-            width,
-            layout.ll_width,
-            layout.ll_height,
-            layout.levels,
-        )
+        let output =
+            read_completed_buffer(active_buffer, samples.len(), "DWT 9/7", |transformed| {
+                extract_forward_dwt97_output(
+                    transformed,
+                    width,
+                    layout.ll_width,
+                    layout.ll_height,
+                    layout.levels,
+                )
+            })??;
+        recycle_shared_buffers(runtime, pooled)?;
+        Ok(output)
     })
 }
 
@@ -361,15 +397,25 @@ pub(crate) fn encode_deinterleave_to_f32(
         })?;
 
     with_runtime(|runtime| {
-        let input_buffer = copied_slice_buffer(&runtime.device, job.pixels)?;
+        // Pooled, so repeated stage calls reuse mapped memory.
+        let mut pooled = Vec::new();
+        let input_buffer = copied_recyclable_shared_slice_buffer(runtime, job.pixels, &mut pooled)?;
         let mut plane_budget = crate::batch_allocation::BatchMetadataBudget::new(
             "J2K Metal encode deinterleave plane buffers",
         );
-        let mut plane_buffers =
-            plane_budget.try_vec(4, "J2K Metal deinterleave plane buffer handles")?;
-        for _ in 0..4 {
-            plane_buffers.push(new_shared_buffer(&runtime.device, plane_bytes)?);
+        let mut plane_buffers = plane_budget.try_vec(
+            usize::from(job.num_components),
+            "J2K Metal deinterleave plane buffer handles",
+        )?;
+        for _ in 0..job.num_components {
+            plane_buffers.push(take_recyclable_shared_buffer(
+                runtime,
+                plane_bytes,
+                &mut pooled,
+            )?);
         }
+        // The kernel writes only the first `num_components` planes.
+        let plane = |component: usize| plane_buffers.get(component).unwrap_or(&plane_buffers[0]);
         let params = J2kLosslessDeinterleaveParams {
             src_width: pixel_count,
             src_height: 1,
@@ -391,11 +437,11 @@ pub(crate) fn encode_deinterleave_to_f32(
         label_compute_encoder(&encoder, "J2K encode-stage deinterleave");
         encoder.setComputePipelineState(&runtime.encode()?.lossless_deinterleave_to_planes);
         encoder.set_buffer(0, Some(&input_buffer), 0);
-        encoder.set_buffer(1, Some(&plane_buffers[0]), 0);
-        encoder.set_buffer(2, Some(&plane_buffers[1]), 0);
-        encoder.set_buffer(3, Some(&plane_buffers[2]), 0);
+        encoder.set_buffer(1, Some(plane(0)), 0);
+        encoder.set_buffer(2, Some(plane(1)), 0);
+        encoder.set_buffer(3, Some(plane(2)), 0);
         encoder.set_bytes::<J2kLosslessDeinterleaveParams>(4, &params);
-        encoder.set_buffer(5, Some(&plane_buffers[3]), 0);
+        encoder.set_buffer(5, Some(plane(3)), 0);
         dispatch_2d_pipeline(
             &encoder,
             &runtime.encode()?.lossless_deinterleave_to_planes,
@@ -406,7 +452,6 @@ pub(crate) fn encode_deinterleave_to_f32(
 
         let planes = plane_buffers
             .iter()
-            .take(usize::from(job.num_components))
             .map(|buffer| {
                 checked_buffer_slice::<f32>(buffer, job.num_pixels, "deinterleaved plane")
             })
@@ -415,6 +460,7 @@ pub(crate) fn encode_deinterleave_to_f32(
             sample_count.checked_mul(bytes_per_sample),
             Some(expected_len)
         );
+        recycle_shared_buffers(runtime, pooled)?;
         Ok(Some(planes))
     })
 }
@@ -437,7 +483,7 @@ pub(super) fn dispatch_forward_dwt97_lift_steps(
         (FDWT97_LOW_PASS, FDWT97_DELTA),
     ] {
         let params = J2kForwardDwt97Params {
-            parity,
+            parity: parity ^ base_params.origin_phase,
             coefficient,
             ..base_params
         };

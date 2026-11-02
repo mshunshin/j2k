@@ -130,7 +130,7 @@ pub struct HtCodeBlockDecodeProfile {
 /// Whole-image cleanup-only fast path. Unlike the public scalar helpers, this
 /// may publish a prefix before malformed entropy is rejected; callers discard
 /// their internal coefficient plane when the image decode returns an error.
-#[cfg(feature = "simd")]
+#[cfg(all(feature = "simd", any(feature = "parallel", test)))]
 pub(crate) fn try_decode_ht_code_block_to_f32(
     job: HtCodeBlockDecodeJob<'_>,
     output: &mut [f32],
@@ -393,11 +393,13 @@ fn write_ht_code_block_output(
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "simd")]
-    use super::try_decode_ht_code_block_to_f32;
     use super::{
         decode_ht_code_block_scalar_with_workspace,
-        decode_ht_code_block_scalar_with_workspace_midpoint, write_ht_code_block_output,
-        CodeBlockOutputLayout, HtCodeBlockDecodeJob, HtCodeBlockDecodeWorkspace,
+        decode_ht_code_block_scalar_with_workspace_midpoint, try_decode_ht_code_block_to_f32,
+    };
+    use super::{
+        write_ht_code_block_output, CodeBlockOutputLayout, HtCodeBlockDecodeJob,
+        HtCodeBlockDecodeWorkspace,
     };
     #[cfg(feature = "simd")]
     use crate::encode_ht_code_block_scalar;

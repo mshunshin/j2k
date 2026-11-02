@@ -19,6 +19,7 @@ use core::mem::size_of;
 mod referenced;
 pub(super) use self::referenced::{
     max_referenced_classic_dimensions, max_referenced_ht_dimensions,
+    planned_referenced_classic_execution_bytes, planned_referenced_htj2k_execution_bytes,
     prepare_referenced_classic_scratch, prepare_referenced_classic_staged_scratch,
     prepare_referenced_direct_scratch, prepare_referenced_htj2k_staged_scratch,
 };
@@ -186,6 +187,8 @@ fn normalize_retained_scratch(
         scratch.ht_workspace = crate::HtCodeBlockDecodeWorkspace::default();
         scratch.ht_task_workspaces = Vec::new();
     }
+    // Only referenced classic execution decodes classic blocks in parallel.
+    scratch.classic_task_workspaces = Vec::new();
     Ok(())
 }
 
@@ -446,6 +449,107 @@ fn parallel_ht_task_workspace_count(
     }
     let _ = (parallel, ht_workspace_dimensions);
     0
+}
+
+/// Largest code block and most code-block rows of any sub-band a parallel
+/// referenced classic execution decodes, and its largest payload split over
+/// several input fragments. One dispatch decodes at most one row per Rayon
+/// worker, so it never needs more workspaces than rows.
+#[derive(Debug, Clone, Copy)]
+struct ClassicTaskShape {
+    dimensions: (u32, u32),
+    #[cfg_attr(
+        not(feature = "parallel"),
+        expect(dead_code, reason = "rows bound parallel dispatch only")
+    )]
+    rows: usize,
+    /// Bytes each task joins one fragmented payload into; zero when every
+    /// payload is one input slice.
+    fragmented_payload_bytes: usize,
+}
+
+/// Extra classic workspaces beside the main one: one per additional Rayon
+/// worker that a dispatch can occupy, or none when serial.
+fn classic_task_workspace_count(parallel: bool, classic_tasks: Option<ClassicTaskShape>) -> usize {
+    #[cfg(feature = "parallel")]
+    if let (true, Some(shape)) = (parallel, classic_tasks) {
+        return rayon::current_num_threads()
+            .min(shape.rows)
+            .saturating_sub(1);
+    }
+    let _ = (parallel, classic_tasks);
+    0
+}
+
+/// Charge the extra classic workspaces of parallel referenced classic
+/// execution and their payload buffers. `classic_tasks` is `None` for every
+/// other route.
+fn include_classic_task_workspaces(
+    budget: &mut DirectAllocationBudget,
+    classic_tasks: Option<ClassicTaskShape>,
+    scratch: &J2kDirectCpuScratch,
+) -> Result<()> {
+    let target_count = classic_task_workspace_count(scratch.parallel, classic_tasks);
+    budget.include_capacity::<super::ClassicTaskWorkspace>(
+        scratch.classic_task_workspaces.capacity().max(target_count),
+    )?;
+    let target_workspace_bytes = classic_tasks.map_or(Ok(0), |shape| {
+        bitplane::classic_decode_workspace_bytes(shape.dimensions.0, shape.dimensions.1)
+    })?;
+    let target_payload_bytes = classic_tasks.map_or(0, |shape| shape.fragmented_payload_bytes);
+    for index in 0..scratch.classic_task_workspaces.len().max(target_count) {
+        let (retained_workspace, retained_payload) = scratch
+            .classic_task_workspaces
+            .get(index)
+            .map_or(Ok((0, 0)), |task| {
+                task.decode
+                    .allocated_bytes()
+                    .map(|bytes| (bytes, task.payload.capacity()))
+            })?;
+        let (target_workspace, target_payload) = if index < target_count {
+            (target_workspace_bytes, target_payload_bytes)
+        } else {
+            (0, 0)
+        };
+        budget.include_bytes(retained_workspace.max(target_workspace))?;
+        budget.include_bytes(retained_payload.max(target_payload))?;
+    }
+    Ok(())
+}
+
+/// Keep exactly the extra classic workspaces parallel referenced classic
+/// execution uses, each prepared for the plan's largest code block and
+/// holding a buffer for its largest fragmented payload.
+fn reserve_classic_task_workspaces(
+    classic_tasks: Option<ClassicTaskShape>,
+    scratch: &mut J2kDirectCpuScratch,
+) -> Result<()> {
+    let count = classic_task_workspace_count(scratch.parallel, classic_tasks);
+    scratch.classic_task_workspaces.truncate(count);
+    try_reserve_decode_elements(&mut scratch.classic_task_workspaces, count)?;
+    while scratch.classic_task_workspaces.len() < count {
+        scratch
+            .classic_task_workspaces
+            .push(super::ClassicTaskWorkspace::default());
+    }
+    if let Some(ClassicTaskShape {
+        dimensions: (width, height),
+        fragmented_payload_bytes,
+        ..
+    }) = classic_tasks
+    {
+        for task in &mut scratch.classic_task_workspaces {
+            task.decode.prepare(width, height)?;
+            task.payload.clear();
+            if task.payload.capacity() < fragmented_payload_bytes {
+                // Release before growing so the old and new buffers never
+                // coexist beyond the charged maximum.
+                task.payload = Vec::new();
+            }
+            try_reserve_decode_elements(&mut task.payload, fragmented_payload_bytes)?;
+        }
+    }
+    Ok(())
 }
 
 fn reserve_scratch(

@@ -99,13 +99,15 @@ impl crate::J2kCudaEngine<'_> {
         let mut current_width = pass.current_width;
         let mut current_height = pass.current_height;
         let mut low_extent = pass.low_extent;
+        let mut phase = pass.phase;
         let mut params = cuda_kernel_params!(
             input_ptr,
             output_ptr,
             full_width,
             current_width,
             current_height,
-            low_extent
+            low_extent,
+            phase
         );
         let geometry = j2k_dwt53_launch_geometry(current_width, current_height).ok_or(
             CudaError::ImageTooLarge {
@@ -147,15 +149,22 @@ impl crate::J2kCudaEngine<'_> {
         self.launch_kernel(function, geometry, &mut params)
     }
 
+    /// Quantize `job` into `coefficients` starting at coefficient `offset`;
+    /// the caller sized `coefficients` for every region it writes.
     pub(super) fn launch_j2k_quantize_subband_region(
         &self,
         samples: &CudaDeviceBuffer,
         coefficients: &CudaDeviceBuffer,
+        offset: usize,
         job: CudaJ2kQuantizeSubbandRegionJob,
     ) -> Result<(), CudaError> {
         let function = Self::j2k_encode_kernel_function(CudaKernel::J2kQuantizeSubbandStrided)?;
         let mut samples_ptr = samples.device_ptr();
-        let mut coefficients_ptr = coefficients.device_ptr();
+        let mut coefficients_ptr = offset
+            .checked_mul(std::mem::size_of::<i32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .and_then(|bytes| coefficients.device_ptr().checked_add(bytes))
+            .ok_or(CudaError::LengthTooLarge { len: offset })?;
         let mut x0 = job.x0;
         let mut y0 = job.y0;
         let mut width = job.width;

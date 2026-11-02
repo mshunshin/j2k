@@ -4,7 +4,9 @@
 
 use alloc::vec::Vec;
 
-use crate::color::{ComponentPlane, DecodedComponents, DecodedNativeComponents, RawBitmap};
+use crate::color::{
+    ComponentPlane, ComponentRowSink, DecodedComponents, DecodedNativeComponents, RawBitmap,
+};
 use crate::error::{bail, DecodingError, Result, ValidationError};
 use crate::j2c::{self, ComponentData, DecoderContext, Reversible53CoefficientImage};
 use crate::jp2::DecodedImage;
@@ -29,13 +31,15 @@ impl<'a> Image<'a> {
         context: &mut DecoderContext<'a>,
         selection: &crate::WaveletSelection,
     ) -> Result<crate::WaveletImage> {
-        j2c::wavelets::extract(
-            self.codestream,
-            &self.header,
-            self.retained_metadata_bytes()?,
-            context,
-            selection,
-        )
+        self.with_packet_cache_retry(|| {
+            j2c::wavelets::extract(
+                self.codestream,
+                &self.header,
+                self.retained_metadata_bytes()?,
+                context,
+                selection,
+            )
+        })
     }
 
     /// Decode the image at native bit depth without scaling to 8-bit.
@@ -72,7 +76,7 @@ impl<'a> Image<'a> {
     ) -> Result<RawBitmap> {
         let retained_baseline_bytes = super::allocation::combine_retained_bytes(
             retained_capacity,
-            self.retained_metadata_bytes()?,
+            self.retained_header_metadata_bytes()?,
         )?;
         let mut decoder_context = DecoderContext::default();
         self.decode_native_with_context_and_retained_baseline(
@@ -99,12 +103,14 @@ impl<'a> Image<'a> {
         &self,
         decoder_context: &mut DecoderContext<'a>,
     ) -> Result<Reversible53CoefficientImage> {
-        j2c::recode::extract_reversible_53_coefficients(
-            self.codestream,
-            &self.header,
-            self.retained_metadata_bytes()?,
-            decoder_context,
-        )
+        self.with_packet_cache_retry(|| {
+            j2c::recode::extract_reversible_53_coefficients(
+                self.codestream,
+                &self.header,
+                self.retained_metadata_bytes()?,
+                decoder_context,
+            )
+        })
     }
 
     /// Decode a region of the image at native bit depth.
@@ -139,7 +145,7 @@ impl<'a> Image<'a> {
         &self,
         decoder_context: &mut DecoderContext<'a>,
     ) -> Result<RawBitmap> {
-        let retained_baseline_bytes = self.retained_metadata_bytes()?;
+        let retained_baseline_bytes = self.retained_header_metadata_bytes()?;
         self.decode_native_with_context_and_retained_baseline(
             decoder_context,
             retained_baseline_bytes,
@@ -151,83 +157,77 @@ impl<'a> Image<'a> {
         decoder_context: &mut DecoderContext<'a>,
         retained_baseline_bytes: usize,
     ) -> Result<RawBitmap> {
-        let bit_depth = self.uniform_header_bit_depth()?;
-        let mut ht_decoder = None;
-        let parallel = decoder_context.cpu_decode_parallelism() == CpuDecodeParallelism::Auto;
-        decoder_context.set_output_region(None);
-        decoder_context.set_round_irreversible_output(true);
-        let decode_result = j2c::decode(
-            self.codestream,
-            &self.header,
-            retained_baseline_bytes,
-            decoder_context,
-            &mut ht_decoder,
-        );
-        decoder_context.set_output_region(None);
-        decoder_context.set_round_irreversible_output(false);
-        decode_result?;
+        self.with_packet_cache_retry(|| {
+            let bit_depth = self.uniform_header_bit_depth()?;
+            let parallel = decoder_context.cpu_decode_parallelism() == CpuDecodeParallelism::Auto;
+            let retained_baseline_bytes =
+                self.run_decode(decoder_context, None, None, true, retained_baseline_bytes)?;
 
-        let components = &decoder_context.tile_decode_context.channel_data;
-        let component_owner_capacity = components.capacity();
-        let num_components =
-            u16::try_from(components.len()).map_err(|_| ValidationError::TooManyChannels)?;
-        let width = self.width();
-        let height = self.height();
-        let pixel_count = checked_decode_sample_count(width, height)?;
-        let bytes_per_sample = native_bytes_per_sample(bit_depth)?;
-        let capacity =
-            checked_decode_byte_len3(pixel_count, usize::from(num_components), bytes_per_sample)?;
-        let mut budget = NativeOutputBudget::for_decoded_channels(
-            retained_baseline_bytes,
-            components,
-            component_owner_capacity,
-        )?;
-        budget.include_bit_capacity(components.len())?;
-        budget.include_elements::<u8>(capacity)?;
-        let component_signed = Self::try_component_signedness(components)?;
-        budget.include_bit_capacity_overage(components.len(), component_signed.capacity())?;
-        let signed = component_signed.iter().all(|signed| *signed);
-        let mut data = Vec::new();
-        try_reserve_decode_elements(&mut data, capacity)?;
-        budget.include_capacity_overage::<u8>(capacity, data.capacity())?;
-        if let [component] = components.as_slice() {
-            Self::extend_component_native_sample_bytes(
-                &mut data,
-                component,
-                0..pixel_count,
-                bit_depth,
-                parallel,
-            );
-        } else {
-            for index in 0..pixel_count {
-                for component in components {
-                    Self::push_component_native_sample_bytes(
-                        &mut data, component, index, bit_depth,
-                    );
-                }
+            let components = &decoder_context.tile_decode_context.channel_data;
+            let component_owner_capacity = components.capacity();
+            let num_components =
+                u16::try_from(components.len()).map_err(|_| ValidationError::TooManyChannels)?;
+            let width = self.width();
+            let height = self.height();
+            let pixel_count = checked_decode_sample_count(width, height)?;
+            let bytes_per_sample = native_bytes_per_sample(bit_depth)?;
+            let capacity = checked_decode_byte_len3(
+                pixel_count,
+                usize::from(num_components),
+                bytes_per_sample,
+            )?;
+            let mut budget = NativeOutputBudget::for_decoded_channels(
+                retained_baseline_bytes,
+                components,
+                component_owner_capacity,
+            )?;
+            budget.include_bit_capacity(components.len())?;
+            budget.include_elements::<u8>(capacity)?;
+            let component_signed = Self::try_component_signedness(components)?;
+            budget.include_bit_capacity_overage(components.len(), component_signed.capacity())?;
+            let signed = component_signed.iter().all(|signed| *signed);
+            let mut data = Vec::new();
+            try_reserve_decode_elements(&mut data, capacity)?;
+            budget.include_capacity_overage::<u8>(capacity, data.capacity())?;
+            if let [component] = components.as_slice() {
+                Self::extend_component_native_sample_bytes(
+                    &mut data,
+                    component,
+                    0..pixel_count,
+                    bit_depth,
+                    parallel,
+                );
+            } else {
+                Self::extend_interleaved_native_sample_bytes(
+                    &mut data,
+                    components,
+                    pixel_count,
+                    bit_depth,
+                    parallel,
+                );
             }
-        }
-        if data.len() != capacity {
-            bail!(DecodingError::CodeBlockDecodeFailure);
-        }
-        let bitmap = RawBitmap {
-            data,
-            width,
-            height,
-            bit_depth,
-            signed,
-            component_signed,
-            num_components,
-            bytes_per_sample: u8::try_from(bytes_per_sample)
-                .map_err(|_| ValidationError::ImageTooLarge)?,
-        };
-        NativeOutputBudget::validate_raw_pack(
-            retained_baseline_bytes,
-            components,
-            component_owner_capacity,
-            &bitmap,
-        )?;
-        Ok(bitmap)
+            if data.len() != capacity {
+                bail!(DecodingError::CodeBlockDecodeFailure);
+            }
+            let bitmap = RawBitmap {
+                data,
+                width,
+                height,
+                bit_depth,
+                signed,
+                component_signed,
+                num_components,
+                bytes_per_sample: u8::try_from(bytes_per_sample)
+                    .map_err(|_| ValidationError::ImageTooLarge)?,
+            };
+            NativeOutputBudget::validate_raw_pack(
+                retained_baseline_bytes,
+                components,
+                component_owner_capacity,
+                &bitmap,
+            )?;
+            Ok(bitmap)
+        })
     }
 
     /// Decode a region of the image at native bit depth using a caller-provided
@@ -241,93 +241,84 @@ impl<'a> Image<'a> {
         roi: (u32, u32, u32, u32),
         decoder_context: &mut DecoderContext<'a>,
     ) -> Result<RawBitmap> {
-        validate_roi((self.width(), self.height()), roi)?;
-        if self.requires_exact_integer_decode() {
-            return self.decode_native_region_via_full_decode(roi, decoder_context);
-        }
-        let bit_depth = self.uniform_header_bit_depth()?;
-        let retained_image_bytes = self.retained_metadata_bytes()?;
-        let mut ht_decoder = None;
-        let parallel = decoder_context.cpu_decode_parallelism() == CpuDecodeParallelism::Auto;
-        decoder_context.set_output_region(Some(roi));
-        decoder_context.set_round_irreversible_output(true);
-        let decode_result = j2c::decode(
-            self.codestream,
-            &self.header,
-            retained_image_bytes,
-            decoder_context,
-            &mut ht_decoder,
-        );
-        decoder_context.set_output_region(None);
-        decoder_context.set_round_irreversible_output(false);
-        decode_result?;
-
-        let components = &decoder_context.tile_decode_context.channel_data;
-        let component_owner_capacity = components.capacity();
-        let num_components =
-            u16::try_from(components.len()).map_err(|_| ValidationError::TooManyChannels)?;
-        let bytes_per_sample = native_bytes_per_sample(bit_depth)?;
-        let (_x, _y, width, height) = roi;
-        let capacity = checked_decode_byte_len4(
-            width as usize,
-            height as usize,
-            usize::from(num_components),
-            bytes_per_sample,
-        )?;
-        let mut budget = NativeOutputBudget::for_decoded_channels(
-            retained_image_bytes,
-            components,
-            component_owner_capacity,
-        )?;
-        budget.include_bit_capacity(components.len())?;
-        budget.include_elements::<u8>(capacity)?;
-        let mut data = Vec::new();
-        let component_signed = Self::try_component_signedness(components)?;
-        budget.include_bit_capacity_overage(components.len(), component_signed.capacity())?;
-        try_reserve_decode_elements(&mut data, capacity)?;
-        budget.include_capacity_overage::<u8>(capacity, data.capacity())?;
-        let signed = component_signed.iter().all(|signed| *signed);
-
-        let pixel_count = width as usize * height as usize;
-        if let [component] = components.as_slice() {
-            Self::extend_component_native_sample_bytes(
-                &mut data,
-                component,
-                0..pixel_count,
-                bit_depth,
-                parallel,
-            );
-        } else {
-            for index in 0..pixel_count {
-                for component in components {
-                    Self::push_component_native_sample_bytes(
-                        &mut data, component, index, bit_depth,
-                    );
-                }
+        self.with_packet_cache_retry(|| {
+            validate_roi((self.width(), self.height()), roi)?;
+            if self.requires_exact_integer_decode() {
+                return self.decode_native_region_via_full_decode(roi, decoder_context);
             }
-        }
-        if data.len() != capacity {
-            bail!(DecodingError::CodeBlockDecodeFailure);
-        }
+            let bit_depth = self.uniform_header_bit_depth()?;
+            let retained_image_bytes = self.retained_header_metadata_bytes()?;
+            let parallel = decoder_context.cpu_decode_parallelism() == CpuDecodeParallelism::Auto;
+            let retained_image_bytes =
+                self.run_decode(decoder_context, Some(roi), None, true, retained_image_bytes)?;
 
-        let bitmap = RawBitmap {
-            data,
-            width,
-            height,
-            bit_depth,
-            signed,
-            component_signed,
-            num_components,
-            bytes_per_sample: u8::try_from(bytes_per_sample)
-                .map_err(|_| ValidationError::ImageTooLarge)?,
-        };
-        NativeOutputBudget::validate_raw_pack(
-            retained_image_bytes,
-            components,
-            component_owner_capacity,
-            &bitmap,
-        )?;
-        Ok(bitmap)
+            let components = &decoder_context.tile_decode_context.channel_data;
+            let component_owner_capacity = components.capacity();
+            let num_components =
+                u16::try_from(components.len()).map_err(|_| ValidationError::TooManyChannels)?;
+            let bytes_per_sample = native_bytes_per_sample(bit_depth)?;
+            let (_x, _y, width, height) = roi;
+            let capacity = checked_decode_byte_len4(
+                width as usize,
+                height as usize,
+                usize::from(num_components),
+                bytes_per_sample,
+            )?;
+            let mut budget = NativeOutputBudget::for_decoded_channels(
+                retained_image_bytes,
+                components,
+                component_owner_capacity,
+            )?;
+            budget.include_bit_capacity(components.len())?;
+            budget.include_elements::<u8>(capacity)?;
+            let mut data = Vec::new();
+            let component_signed = Self::try_component_signedness(components)?;
+            budget.include_bit_capacity_overage(components.len(), component_signed.capacity())?;
+            try_reserve_decode_elements(&mut data, capacity)?;
+            budget.include_capacity_overage::<u8>(capacity, data.capacity())?;
+            let signed = component_signed.iter().all(|signed| *signed);
+
+            let pixel_count = width as usize * height as usize;
+            if let [component] = components.as_slice() {
+                Self::extend_component_native_sample_bytes(
+                    &mut data,
+                    component,
+                    0..pixel_count,
+                    bit_depth,
+                    parallel,
+                );
+            } else {
+                Self::extend_interleaved_native_sample_bytes(
+                    &mut data,
+                    components,
+                    pixel_count,
+                    bit_depth,
+                    parallel,
+                );
+            }
+            if data.len() != capacity {
+                bail!(DecodingError::CodeBlockDecodeFailure);
+            }
+
+            let bitmap = RawBitmap {
+                data,
+                width,
+                height,
+                bit_depth,
+                signed,
+                component_signed,
+                num_components,
+                bytes_per_sample: u8::try_from(bytes_per_sample)
+                    .map_err(|_| ValidationError::ImageTooLarge)?,
+            };
+            NativeOutputBudget::validate_raw_pack(
+                retained_image_bytes,
+                components,
+                component_owner_capacity,
+                &bitmap,
+            )?;
+            Ok(bitmap)
+        })
     }
 
     fn try_component_signedness(components: &[ComponentData]) -> Result<Vec<bool>> {
@@ -352,21 +343,6 @@ impl<'a> Image<'a> {
             })
     }
 
-    pub(super) fn try_borrow_component_planes<'ctx>(
-        &self,
-        components: &'ctx [ComponentData],
-        component_owner_capacity: usize,
-        dimensions: (u32, u32),
-    ) -> Result<DecodedComponents<'ctx>> {
-        let retained_image_bytes = self.retained_metadata_bytes()?;
-        self.try_borrow_component_planes_with_retained_baseline(
-            components,
-            component_owner_capacity,
-            dimensions,
-            retained_image_bytes,
-        )
-    }
-
     pub(super) fn try_borrow_component_planes_with_retained_baseline<'ctx>(
         &self,
         components: &'ctx [ComponentData],
@@ -374,43 +350,52 @@ impl<'a> Image<'a> {
         dimensions: (u32, u32),
         retained_image_bytes: usize,
     ) -> Result<DecodedComponents<'ctx>> {
-        let mut budget = NativeOutputBudget::for_decoded_channels(
-            retained_image_bytes,
-            components,
-            component_owner_capacity,
-        )?;
-        budget.include_elements::<ComponentPlane<'_>>(components.len())?;
-        budget.include_color_space_clone(&self.color_space)?;
-        let color_space = try_clone_color_space(&self.color_space)?;
-        budget.include_color_space_clone_overage(&self.color_space, &color_space)?;
-        let mut planes = Vec::new();
-        try_reserve_decode_elements(&mut planes, components.len())?;
-        budget
-            .include_capacity_overage::<ComponentPlane<'_>>(components.len(), planes.capacity())?;
-        for (component_idx, component) in components.iter().enumerate() {
-            planes.push(ComponentPlane {
-                samples: component.container.truncated(),
-                dimensions,
-                bit_depth: component.bit_depth,
-                signed: component.signed,
-                sampling: self.component_plane_sampling_at(component_idx),
-            });
-        }
+        self.with_packet_cache_retry(|| {
+            #[cfg(feature = "std")]
+            let retained_image_bytes = super::allocation::combine_retained_bytes(
+                retained_image_bytes,
+                self.packet_cache.retained_bytes(),
+            )?;
+            let mut budget = NativeOutputBudget::for_decoded_channels(
+                retained_image_bytes,
+                components,
+                component_owner_capacity,
+            )?;
+            budget.include_elements::<ComponentPlane<'_>>(components.len())?;
+            budget.include_color_space_clone(&self.color_space)?;
+            let color_space = try_clone_color_space(&self.color_space)?;
+            budget.include_color_space_clone_overage(&self.color_space, &color_space)?;
+            let mut planes = Vec::new();
+            try_reserve_decode_elements(&mut planes, components.len())?;
+            budget.include_capacity_overage::<ComponentPlane<'_>>(
+                components.len(),
+                planes.capacity(),
+            )?;
+            for (component_idx, component) in components.iter().enumerate() {
+                planes.push(ComponentPlane {
+                    samples: component.container.truncated(),
+                    dimensions,
+                    bit_depth: component.bit_depth,
+                    signed: component.signed,
+                    sampling: self.component_plane_sampling_at(component_idx),
+                });
+            }
 
-        let mut packed = DecodedComponents {
-            dimensions,
-            color_space,
-            has_alpha: self.has_alpha,
-            planes,
-            live_bytes: 0,
-        };
-        packed.live_bytes = NativeOutputBudget::validate_borrowed_pack(
-            retained_image_bytes,
-            components,
-            component_owner_capacity,
-            &packed,
-        )?;
-        Ok(packed)
+            let mut packed = DecodedComponents {
+                dimensions,
+                color_space,
+                has_alpha: self.has_alpha,
+                planes,
+                live_bytes: 0,
+            };
+            packed.live_bytes = NativeOutputBudget::validate_borrowed_pack(
+                retained_image_bytes,
+                components,
+                component_owner_capacity,
+                &packed,
+            )?;
+            Ok(packed)
+        })
     }
 
     fn uniform_header_bit_depth(&self) -> Result<u8> {
@@ -489,6 +474,144 @@ impl<'a> Image<'a> {
         self.decode_borrowed_component_planes(decoder_context, Some(roi), None, true)
     }
 
+    /// [`Self::decode_region_components_for_integer_output_with_context`]
+    /// that hands the region's samples to `sink` instead of returning
+    /// component planes. A plain region decode streams them as they are
+    /// finished and never holds the whole planes, its Tier-1 bands decoded
+    /// serially or on the worker pool; any other decode hands over its planes
+    /// as one rectangle at the end.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the region is invalid, precision is unsupported,
+    /// or decoding fails. A decode that fails may have handed `sink` some of
+    /// the region already.
+    #[doc(hidden)]
+    pub fn decode_region_rows_for_integer_output_with_context(
+        &self,
+        roi: (u32, u32, u32, u32),
+        decoder_context: &mut DecoderContext<'a>,
+        sink: &mut dyn ComponentRowSink,
+    ) -> Result<()> {
+        validate_roi((self.width(), self.height()), roi)?;
+        self.validate_component_plane_precision()?;
+        let charged_image_bytes = self.run_decode_rows(
+            decoder_context,
+            Some(roi),
+            None,
+            true,
+            self.retained_header_metadata_bytes()?,
+            Some(&mut *sink),
+        )?;
+        if decoder_context.tile_decode_context.stream_rows {
+            return Ok(());
+        }
+        let DecodedImage {
+            decoded_components,
+            boxes: _,
+        } = self.finish_decoded_image(
+            &mut decoder_context.tile_decode_context.channel_data,
+            charged_image_bytes,
+        )?;
+        let components = self.try_borrow_component_planes_with_retained_baseline(
+            decoded_components.as_slice(),
+            decoded_components.capacity(),
+            (roi.2, roi.3),
+            self.retained_header_metadata_bytes()?,
+        )?;
+        sink.write_rows(0, 0, &components.planes);
+        Ok(())
+    }
+
+    /// Whether [`Self::decode_region_rows_for_integer_output_with_context`]
+    /// can stream this image's rows, as far as its main header and boxes
+    /// say: the image has no palette, channel definition, sYCC or `CIELab`
+    /// (see `permits_line_region_idwt`), its components are at full sampling
+    /// with at most 24 bits, and the image and its tiles have no offsets and
+    /// one to four components (see `j2c::image_streams_rows`, which the
+    /// decode checks before it streams). Any other region decode falls back
+    /// to component planes of the region and hands them over at the end.
+    /// A tile's own coding can still keep it there (see
+    /// [`Self::full_decode_planes_floor`], which plans the full image only
+    /// when this holds).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn region_decode_streams_rows(&self) -> bool {
+        self.permits_line_region_idwt()
+            && self.header.component_infos.iter().all(|component| {
+                component.size_info.precision <= 24
+                    && component.size_info.horizontal_resolution == 1
+                    && component.size_info.vertical_resolution == 1
+            })
+            && j2c::image_streams_rows(&self.header)
+    }
+
+    /// The bytes a full-image decode into component planes charges the
+    /// decode budget at least, planned from the codestream's tiles without
+    /// decoding, when [`Self::decode_region_rows_for_integer_output_with_context`]
+    /// over the whole image could stream its rows instead and so need no
+    /// planes. A caller holding the planes to `budget` bytes runs that
+    /// region decode when the floor passes it: the planes decode would be
+    /// refused, and an image it can finish never has a floor past the
+    /// budget.
+    ///
+    /// `None` when the region decode could not stream (see
+    /// [`Self::region_decode_streams_rows`], or a tile with an inverse MCT
+    /// over fewer than three components or over wavelets that differ), or
+    /// when the header alone puts the planes and one tile's coefficients and
+    /// IDWT buffers within half of `budget`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error parsing the tiles meets, which the planes decode
+    /// meets as well.
+    #[doc(hidden)]
+    pub fn full_decode_planes_floor(&self, budget: usize) -> Result<Option<usize>> {
+        if !self.region_decode_streams_rows() {
+            return Ok(None);
+        }
+        j2c::full_decode_planes_floor(
+            self.codestream,
+            &self.header,
+            self.retained_header_metadata_bytes()?,
+            budget,
+        )
+    }
+
+    /// The output rectangles `(x, y, width, height)` of the image's tiles at
+    /// this image's resolution, in raster order, leaving out tiles with no
+    /// output samples. A region decode of each rectangle decodes that tile
+    /// alone, and together they cover the image once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the header's sampling factors are invalid.
+    #[doc(hidden)]
+    pub fn output_tile_rects(&self) -> Result<Vec<(u32, u32, u32, u32)>> {
+        let size = &self.header.size_data;
+        let (x_shrink, y_shrink) = (
+            size.checked_x_shrink_factor()?,
+            size.checked_y_shrink_factor()?,
+        );
+        let (x_origin, y_origin) = j2c::output_grid_offset(size);
+        let mut rects = Vec::new();
+        for ty in 0..size.num_y_tiles() {
+            for tx in 0..size.num_x_tiles() {
+                let rect = j2c::tile_rect(size, tx, ty);
+                let x = rect.x0.div_ceil(x_shrink).saturating_sub(x_origin);
+                let y = rect.y0.div_ceil(y_shrink).saturating_sub(y_origin);
+                let x1 = rect.x1.div_ceil(x_shrink).saturating_sub(x_origin);
+                let y1 = rect.y1.div_ceil(y_shrink).saturating_sub(y_origin);
+                let width = x1.saturating_sub(x);
+                let height = y1.saturating_sub(y);
+                if width > 0 && height > 0 {
+                    rects.push((x, y, width, height));
+                }
+            }
+        }
+        Ok(rects)
+    }
+
     /// Rounded-for-integer-output counterpart of
     /// [`Self::decode_components_with_ht_decoder`].
     ///
@@ -535,21 +658,22 @@ impl<'a> Image<'a> {
             None => (self.width(), self.height()),
         };
         self.validate_component_plane_precision()?;
-        let decoded_image = self.decode_image(
+        let (decoded_image, _charged_image_bytes) = self.decode_image(
             decoder_context,
             roi,
             ht_decoder,
             round_irreversible_output,
-            self.retained_metadata_bytes()?,
+            self.retained_header_metadata_bytes()?,
         )?;
         let DecodedImage {
             decoded_components,
             boxes: _,
         } = decoded_image;
-        self.try_borrow_component_planes(
+        self.try_borrow_component_planes_with_retained_baseline(
             decoded_components.as_slice(),
             decoded_components.capacity(),
             dimensions,
+            self.retained_header_metadata_bytes()?,
         )
     }
 }

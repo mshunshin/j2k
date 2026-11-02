@@ -25,6 +25,12 @@ fn round_f32(value: f32) -> f32 {
 
 #[inline(always)]
 pub(crate) fn round_ties_even_f32(value: f32) -> f32 {
+    // Ordered comparisons also preserve NaN/infinity and integral f32 values
+    // at magnitude >= 2^23. Avoid abs(): CUDA-Oxide lowers it to libdevice,
+    // switching this PTX-only store build to NVVM IR.
+    if !(value > -8_388_608.0 && value < 8_388_608.0) {
+        return value;
+    }
     let lower = floor_f32(value);
     let upper = lower + 1.0;
     let midpoint = lower + 0.5;
@@ -68,25 +74,48 @@ fn max_int_for_bit_depth(bit_depth: u32) -> u32 {
 #[inline(always)]
 pub(crate) fn sample_as_u8(sample: f32, bit_depth: u32) -> u8 {
     let rounded = round_f32(sample);
-    if bit_depth >= 8 {
+    if bit_depth == 8 {
         return clamp_f32(rounded, 0.0, 255.0) as u8;
     }
 
-    let max_int = (1_u32 << bit_depth) - 1;
+    let max_int = max_int_for_bit_depth(bit_depth.min(16));
     let max_value = if max_int > 1 { max_int as f32 } else { 1.0 };
     round_f32((clamp_f32(rounded, 0.0, max_value) / max_value) * 255.0) as u8
 }
 
 #[inline(always)]
-pub(crate) fn sample_as_u16(sample: f32, bit_depth: u32) -> u16 {
+pub(crate) fn sample_as_u16(sample: f32, bit_depth: u32, signed: bool) -> u16 {
     let rounded = round_f32(sample);
-    if bit_depth >= 16 {
-        return clamp_f32(rounded, 0.0, 65535.0) as u16;
+    if signed {
+        return signed_sample_as_u16(rounded, bit_depth);
+    }
+    if bit_depth > 8 {
+        return sample_as_native_u16(rounded, bit_depth);
     }
 
     let max_int = max_int_for_bit_depth(bit_depth);
     let max_value = if max_int > 1 { max_int as f32 } else { 1.0 };
     round_f32((clamp_f32(rounded, 0.0, max_value) / max_value) * 65535.0) as u16
+}
+
+// As the CPU decoder: signed samples above eight bits keep their two's
+// complement 16-bit pattern; at most eight bits, the two's-complement byte is
+// widened by the declared precision, saturating at 65535.
+#[inline(always)]
+fn signed_sample_as_u16(rounded: f32, bit_depth: u32) -> u16 {
+    let precision = bit_depth.clamp(1, 16);
+    let magnitude = 1_i32 << (precision - 1);
+    let value = clamp_f32(rounded, (-magnitude) as f32, (magnitude - 1) as f32) as i32;
+    if bit_depth > 8 {
+        return value as i16 as u16;
+    }
+    let max_value = max_int_for_bit_depth(precision);
+    let widened = (u32::from(value as i8 as u8) * 65535 + max_value / 2) / max_value;
+    if widened > 65535 {
+        65535
+    } else {
+        widened as u16
+    }
 }
 
 #[inline(always)]
@@ -110,4 +139,15 @@ pub(crate) fn sample_as_native_i16(sample: f32, bit_depth: u32) -> i16 {
         (-magnitude) as f32,
         (magnitude - 1) as f32,
     ) as i16
+}
+
+// Synthesized alpha follows the requested U16 storage domain: widened through
+// eight bits, native significant precision above eight bits.
+#[inline(always)]
+pub(crate) fn opaque_alpha_u16(bit_depth: u32) -> u16 {
+    if bit_depth <= 8 {
+        65535
+    } else {
+        max_int_for_bit_depth(bit_depth.min(16)) as u16
+    }
 }

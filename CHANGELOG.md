@@ -5,6 +5,1101 @@ and stale roadmap entries have been removed from the public documentation set.
 
 ## [Unreleased]
 
+Staged workspace version: `0.13.2`.
+
+- SOP marker segments a decode parses require `Lsop` 4 and an `Nsop` equal to
+  the tile-wide packet ordinal modulo 65536. The ordinal continues across
+  tile-parts and counts packets skipped without parsing; an invalid SOP in a
+  discarded packet remains unread by a selective decode.
+- A strict CUDA decode of a classic code-block whose ROI maxshift raises its
+  coded bit-plane count beyond the native decoder's limit fails with the
+  native `TooManyBitplanes` error, as a CPU decode does, instead of reporting
+  an unsupported CUDA request. Counts within the native limit but beyond the
+  device's limit remain unsupported.
+- A tile-part COD replaces all of the main-header COD style flags instead
+  of retaining its SOP and EPH flags. Valid codestreams that disable packet
+  markers for a tile now decode on the CPU, Metal and CUDA, at full and
+  reduced resolution, instead of requiring markers that the packets do not
+  contain.
+- `AdapterErrorKind::Decode`, `BackendErrorKind::Decode` and
+  `BackendError::decode` classify GPU Tier-1 device decode failures. Metal FAIL
+  statuses now use the existing `Error::Decode` and `J2kError::Backend`
+  wrappers instead of `Error::MetalKernel`, so their display starts with
+  `backend failed (decode):`; the diagnostic keeps the classic or HT path,
+  status, detail and batch source index. CUDA keeps its typed source and job
+  attribution. Unsupported statuses, raw runtime failures and combined
+  cleanup or release failures keep their existing classes.
+- The CPU batch decoder converts the rows a streamed image hands over a
+  row at a time instead of a sample at a time, with the same rounding and
+  saturation, so the same bytes. The decode hands its rows over on the
+  thread that reads them, between the batches it reconstructs, while the
+  pool's band workers decode only as far ahead as their band rings hold,
+  so the conversion held the whole decode back. On an 18-core ARM64
+  machine a 5661 x 8287 RGB image as a one-image batch decodes in 127 ms
+  instead of 196 ms, at half resolution in 65 ms instead of 79 ms, and
+  four and eight copies with automatic workers in 447 and 876 ms instead
+  of 592 and 1065 ms.
+- A strict CUDA decode of a classic code-block whose packet headers claim
+  more missing bit-planes than its sub-band codes, or more coding passes
+  than its bit-planes hold, fails with a native decode error,
+  `InvalidBitplaneCount` or `TooManyCodingPasses`, of the class the CPU
+  decode reports for the same codestream, on the single-image decode, the
+  batch of images and the prepared batch. It was rejected as an unsupported
+  CUDA request, a different error class.
+- Grayscale direct and referenced plans, which GPU decodes and decode
+  batches execute, reject a one-component codestream whose COD asks for a
+  multiple component transform, as decodes of it already did. A 39 x 7
+  one-bit gray image in five tiles with that flag failed every decode and
+  decoded in decode batches on the CPU and on CUDA.
+- A PLT length shorter than any packet, zero or, where EPH markers are
+  required, below three bytes, for a packet that a region or
+  reduced-resolution decode skips by its length is a packet error. Skipping
+  by such a length made the decode read the next packet it needs from the
+  skipped packet's bytes: in a flat three-component image whose last needed
+  packet was found that way, reduced decodes wrote other colours and
+  reported success. Full decodes already rejected these lengths.
+- Decodes below full resolution read the packets the reduced output needs on
+  every route: the packets of the resolutions they keep, the others only
+  where they must be parsed to find a later needed one and their PLT
+  lengths cannot skip them, and none after the last needed one, as region
+  decodes already did. Decodes on the component planes and the direct plans
+  that GPU decodes and the staged batch run read every packet, so a
+  codestream damaged only in packets of the discarded resolutions decoded or
+  failed depending on the route and the pool's size; it now decodes
+  everywhere, as the undamaged codestream does at that resolution. Damage in
+  a packet the output needs, or in one parsed to find a later needed one,
+  remains an error. Full-resolution decodes are unchanged, except that the
+  packets of precincts holding no code-block, as at a one-sample tile
+  corner, are read on every route as region decodes read them.
+- A tile-part that holds data after its tile's last packet, bytes or PLT
+  packet lengths past it, decodes on every route. Decodes on the component
+  planes failed with a packet parse error where decodes that stream their
+  rows succeeded, so the same codestream decoded or failed depending on the
+  route, which can follow the pool's size (a half-resolution decode of a
+  512 x 512 RGB image failed on one thread and decoded on four). The output
+  is that of the codestream without the extra data. PLT lengths left over
+  while the tile's packets continue in a later tile-part remain an error.
+- Row-streamed decodes on serial bands finish directly from the inverse
+  transform's own rows. The streamed inverse transform lifts every level
+  with the banded transform's kernels, one arrival at a time on each level's
+  ring of rows; on serial bands, a row is finished directly from the ring
+  (inverse colour transform, level shift, rounding and packing) once no
+  lifting step reads it, in place of a copy into scratch rows, and the 8-bit
+  RGB finish is shared with the component planes' fused last level. A tile
+  on the worker pool with one reader finishes its rows the same way instead
+  of copying them into batches of up to 32 rows, and an HTJ2K tile whose
+  components reconstruct on readers of their own keeps each of its two
+  pipelined row batches to at most 256 rows. On an 18-core ARM64 machine a
+  5428 x 4460 RGB image at 1.5 bits per pixel streams in 0.92 of its
+  previous time on 6 threads, a 4096 x 2048 HTJ2K image in 0.90 to 0.95 on 1
+  to 18 threads and with 48 MiB in place of 72 MiB on a pool, an 18000 x
+  12000 HTJ2K image in 0.88 on 18 threads and 1024 x 1024 HTJ2K regions in
+  0.90 to 0.94. Output is unchanged; a decode that fails partway can leave a
+  different number of rows written, each of them a row the successful decode
+  writes.
+- Streamed decodes keep to the memory they charge and hand each row over
+  once. A tile whose components reconstruct on readers of their own sized
+  its batch of rows by the region's width while the decode charged the
+  tile's width, so a tile just narrower than its region could hold twice its
+  charge (an 8,192-wide tile of an 8,200-wide image: 6.4 M against 3.4 M
+  samples); its batch now keeps to the charge, and such an image decodes in
+  0.98 of the time on 12 and 18 threads, with 60.7 MiB in place of 72.6 MiB
+  on 12. A serial HTJ2K region decode allocated the scratch for code-blocks
+  its region clips when it met the first one, so a decode short of budget
+  could fail after its first rows reached the sink, where the retries
+  without retained scratch or without the packet directory no longer run;
+  the scratch is now sized with the rest of the Tier-1 workspace before the
+  first row. A tile packing two batches of rows into an RGB8 destination
+  counted a packed batch only once the next batch had reconstructed, so a
+  scheduler fault there could decode the tile again and write those rows
+  twice; the packed rows now count at once. Output of decodes that succeed
+  is unchanged.
+- Images that a batch with an explicit worker count decodes together on
+  its stream pool, when it plans as many images at once as the pool has
+  threads and the pool has fewer than 12, hold two bands in every ring of
+  the pool's bands in place of three at the finest level, and keep their
+  bands whole: a pool thread with no band of one image to decode takes
+  another image's bands. Eight 2048 x 2048 RGB images peak at 116.9, 138.3
+  and 182.6 MiB in place of 121.4, 147.3 and 200.6 MiB on 2, 4 and 8
+  workers, and ten on 10 workers at 229.5 in place of 252.0 MiB, in the
+  same batch time. From 12 threads, where a lone tile holds deeper rings,
+  the images keep the usual rings, as do an image encoded in more than one
+  and a half times its group's mean bytes, the likeliest to decode last
+  with the pool to itself, groups planned with fewer images at once than
+  pool threads, and single-image decodes. Output is unchanged.
+- Classic tiles of several components that stream their rows from the
+  worker pool's bands with a reader per component and full-width reads,
+  but without the deeper band rings of 12 threads and more, as on 10 and
+  11 threads or at a reduced resolution, hold two bands in each
+  finest-level ring in place of three when the pool has more threads than
+  three per component. The bands ahead of the readers are then fewer than
+  the pool's threads, so they split into parts that every thread takes. A
+  5661 x 8287 RGB image on 10 threads peaks at 49.2 MiB in place of 55.3
+  MiB and an 18000 x 12000 one at 148 MiB in place of 168 MiB, and the
+  latter at half resolution on 12 threads at 79 MiB in place of 89 MiB,
+  with the same or slightly shorter decode times. Output is unchanged.
+- `decode_rows_u8_bounded` and `decode_rows_u16_bounded` decode an image
+  whose tiles span its width, and whose headers let its region decode stream
+  its rows, once, as a region decode of the whole image that streams its
+  rows into a buffer of at most the requested stripe rows and hands them
+  over a stripe at a time. They decoded every stripe as a region decode of
+  its own, which decoded each code-block again for every stripe its wavelet
+  support reaches: at the default 64-row stripes 6.0 to 7.4 times the
+  code-block samples of one full decode on 2048- to 8287-row images. On an
+  18-core ARM64 machine the default stripes of a 5661 x 8287 RGB image take
+  1.34 s instead of 12.9 s on one thread and 0.11 s instead of 1.52 s on 18.
+  The decode's peak heap is then that of the streamed full-image decode
+  (22.5 MiB instead of 10.3 on one thread, 69 instead of 12.8 on 18); the
+  process's peak resident memory beside its input and output falls on such
+  classic images (25.6 MiB instead of 31.8, 72.8 instead of 77.4) and rises
+  on HTJ2K images on a pool (a 4096 x 2048 image on 18 threads: 76.9 MiB
+  instead of 42.6). Rows, bytes, the stripe bound and errors are unchanged:
+  a decode that fails before its first row reaches the sink decodes a stripe
+  at a time instead, and a sink that refuses a row still stops the rows
+  there, though a one-pass decode now goes on until it completes or fails.
+  Whether an image decodes once is planned from its main and tile headers:
+  images whose tiles sit side by side, whose headers keep region decodes on
+  component planes, or whose main header codes no decomposition level, and
+  16-bit rows of images deeper than 24 bits, still decode a stripe at a
+  time, and an image whose tiles turn out not to stream (a tile-level coding
+  style without decomposition levels, or HTJ2K code-blocks mixed with
+  classic ones) decodes into component planes of the whole image and hands
+  their rows over a stripe at a time. The stripe bound covers the packed
+  output stripe, not the decoder's working memory.
+- Classic code-blocks of several codeword segments, with selective bypass
+  or per-pass termination (as archival images and multi-layer encodes of
+  this crate often have), decode on the worker pool's tile route and pool
+  bands like single-segment ones: each worker collects a block's segment
+  descriptors into its own scratch, reserved before it starts, from the
+  segment records it already reads, with no per-block allocation or plan
+  growth. Region decodes and full-image decodes that stream their rows now
+  stream such images on the pool without component planes, and full-image
+  decodes into planes decode their blocks in place instead of on the
+  per-sub-band path. Output is unchanged.
+- A region decode on the worker pool that streams its rows to a sink, such
+  as an 8-bit full-image decode whose component planes would pass the
+  decode budget, now streams them from serial bands when the pool's bands
+  cannot decode a tile but serial bands can, and the region's planes would
+  pass the budget. Such decodes of classic images with BYPASS or per-pass
+  termination failed with a resource limit on pools of two or more threads,
+  and decode as on one thread now. Decodes whose planes fit keep their
+  route.
+- Parallel band decoding charges each component's plan and the band
+  executor's records to one decode budget, across all components when a
+  tile's rows stream together, and releases the plans and the records before
+  whole-window error recovery or the serial fallback. Band bookkeeping no
+  longer rescans completed bands, and components whose bands average too
+  little work for the pool decode over whole windows instead, or on serial
+  bands when their rows stream.
+- Classic code-blocks with BYPASS, per-pass termination, context resets or
+  segmentation symbols use the packed-column passes, including raw segments.
+  Vertically causal blocks retain the per-coefficient passes. Clean and corrupt
+  code-blocks preserve the same samples and errors in strict and lenient modes.
+- Decodes into a validated caller buffer whose stride is wider than a row
+  and which ends before a full stride after the last row now write that
+  last row, including buffers of exactly `strided_output_len` bytes. Full-image
+  and scaled 8-bit decodes at such a stride and every 16-bit decode at one,
+  regions included, left it unwritten and still returned `Ok`. 8-bit region
+  decodes, and buffers padded to a full stride after the last row, were not
+  affected. The other rows are unchanged.
+- Decodes on the worker pool that reconstruct the two finest wavelet levels
+  of a component in one pass now charge the decode budget for what that pass
+  holds: each worker's rows of the coarser level, which were not charged,
+  and no intermediate buffer for the coarser level, which the pass never
+  writes and which is no longer reserved. Where those rows are the larger
+  term the charge grows to match; elsewhere it is unchanged and the IDWT
+  holds less within it (a 1024 x 768 gray image on 4 threads: 3.9 MB in
+  place of 4.5 MB, against a 4.1 MB charge). Output is unchanged.
+- On a pool of up to 10 threads, decodes take fresh component planes,
+  coefficient storage and IDWT buffers zeroed from the allocator instead of
+  zeroing them on the calling thread, so the page faults of a process's first
+  decode are spread over the threads that fill those buffers instead of
+  running one after another while the pool waits. In a fresh process,
+  4096-wide RGB images that decode to planes, HTJ2K and classic, and a
+  1/4-scale HTJ2K decode take 5 to 24% less time at 4 to 10 threads. Warm
+  decodes, output and peak heap are unchanged, and so are decodes on larger
+  pools, where the faults would contend in the kernel. New dependency:
+  `bytemuck`.
+- `CpuBatchDecoder` streams a Gray8/RGB8 image's rows only when its region
+  decode can stream them. An image with a channel definition box, or with
+  image or tile offsets, keeps its offset plan, and is rejected up front when
+  that plan exceeds the per-decode bound, as other outputs are; before, it was
+  admitted as streamed but decoded whole component planes. A group whose
+  images decode with inner parallelism no longer flattens their code-block
+  payloads first.
+- `CpuBatchDecoder` with an explicit worker count of two or more decodes a
+  group's streamed Gray8/RGB8 images on a pool of exactly that many threads,
+  so threads that finish their images help the images still running instead
+  of idling: eight 2048 x 2048 RGB images on six workers kept four threads
+  busy before. Every image whose rows stream does so at every worker count,
+  repeated or not. A group of plans that do not stream still decodes on the
+  staged route at one worker, but one image at a time when its flattened
+  code-block payloads would exceed the staging caps, instead of failing the
+  batch. Output is unchanged.
+- Decodes that would exceed a resource limit now fail with
+  `J2kError::ResourceLimit { requested, cap, source }` instead of the generic
+  `J2kError::NativeDecode`, on every decode route: `J2kDecoder`, the tile
+  batch functions (inside `TileBatchError::Tile`) and the owned batch API
+  (inside `BatchItemError::Codec`), and JP2/JPH metadata inspection.
+  `requested` and `cap` are the live bytes and the cap when the native decoder
+  knows them (`AllocationTooLarge`), and
+  `None` for `ImageTooLarge`. Callers can tell these apart from invalid input
+  and unsupported features, and retry with a smaller request such as a region
+  or a reduced resolution. The display prefix becomes `decode resource limit
+  exceeded:`; the display text and source chain keep the native error.
+  `j2k_native::DecodeError::classify` reports the same class as
+  `DecodeErrorClass::ResourceLimit`. Both enums are `#[non_exhaustive]`;
+  host allocator failures keep their previous classification.
+- Prepared classic CPU batch plans decode in parallel. Batches prepared by
+  `CpuBatchDecoder` reject individual outputs or planned executions that
+  exceed their memory limits during preparation, with the input's index,
+  and exclude those items from the prepared groups. Backend-neutral
+  `prepare_batch` and `prepare_batch_from_images` keep their existing
+  behavior: decoding them on the CPU can still fail the whole call when one
+  image's output exceeds the allocation cap. On either preparation path,
+  a group whose combined output exceeds that cap is decoded as several
+  result groups, each with an output buffer within the cap.
+  Staged windows stay within the budget computed from their planned
+  execution memory. Successful output is unchanged.
+- 16-bit full-image decodes (`J2kDecoder::decode_into`, `decode_scaled_into`
+  and the decoders behind `decode_tiles_into` at `Rgb16`, `Rgba16` and
+  `Gray16`) and `J2kDecoder::decode_native_components` whose component
+  planes, or the planes together with their packed native samples, would
+  pass the native decode budget now run as a region decode of the whole
+  image that streams its rows, as 8-bit decodes do, instead of failing with
+  a resource-limit error. `decode_native_components` packs the rows into its
+  native planes as they are finished. This covers images without palette,
+  channel definitions, sYCC or CIELab whose unsubsampled components share one
+  precision of up to 24 bits, signed or unsigned; other images keep the
+  planes route and its error. Output is unchanged apart from the fix to
+  images deeper than 16 bits below. A 5661 x 8287 RGB image decodes to `Rgb16` in about 130 ms with
+  103 MiB peak heap on an 18-thread pool (1.39 s and 26 MiB on one thread),
+  where the planes route with its budget raised to fit takes about 196 ms
+  and 984 MiB (1.49 s and 952 MiB); its native components take about 122 ms
+  and 96 MiB besides the 141 MB of planes returned.
+- 16-bit region decodes (`decode_region_into`, `decode_region_scaled_into`
+  and their power-of-two forms) and `decode_native_region_components` of RGB
+  images without palette, channel definitions, sYCC or CIELab stream their
+  rows instead of holding the region's `f32` planes and native samples, and
+  so do those of other such images whose planes would pass the native decode
+  budget. `decode_native_region_components` takes this route only for images
+  of one to four components without image or tile offsets, whose region
+  decodes stream; others keep the planes route, which meets the decode budget
+  before it allocates the returned planes. Output is unchanged.
+- Native component planes (`decode_native_components`,
+  `decode_native_region_components` and the native decoder's component-plane
+  decodes) are the decode's output on both routes: the decode budget holds
+  the `f32` planes they are packed from, and the returned planes have an
+  allowance of their own, each held to the per-allocation cap, as a
+  caller's buffer is. Before, the planes route charged them beside the
+  `f32` planes, so an image whose `f32` planes fit the budget but not
+  together with their output (one that cannot stream its rows, such as one
+  of five components or with image offsets) failed with a resource-limit
+  error; it now decodes. The streamed rows route allocates its planes when
+  the first rows arrive, once per decode, so a region decode that falls back
+  to component planes (a component without decomposition levels, or classic
+  code-blocks of several segments on the pool) meets the decode budget before
+  any output exists. Output is unchanged.
+- 16-bit outputs of images deeper than 16 bits hold each sample's value
+  clamped to the 16-bit range (two's complement when signed), as scaled
+  decodes already wrote them. Full-image and region decodes (and row decodes
+  of images deeper than 24 bits) wrote each byte of the wider native samples
+  as a sample of its own. 8-bit outputs of such images on the streamed
+  route, in scaled decodes and in `decode_rows_u8_bounded` quantize each
+  sample over its component's range, as full-image decodes on the planes
+  route do, instead of over 16 bits, which saturated most samples. Images
+  of at most 16 bits are unaffected.
+- 16-bit output and `decode_native` on the planes route are faster: two to
+  four components pack into native samples a block of pixels at a time on
+  the thread pool instead of one sample at a time, and 8-bit native samples
+  widen to 16 bits from a table instead of a division per sample. `Rgb16`
+  `decode_into` of a 4096 x 4096 RGB image takes about 40% of the time it
+  did on an 18-thread pool. Output is unchanged.
+- Region decodes of a tile whose coarse resolutions are empty while finer
+  ones are not (a one-sample tile row or column at an odd position with two
+  or more levels) reconstruct it from the first level that has samples, as
+  full-image decodes do. Before, 8-bit region decodes of such tiles failed
+  with `IncompletePlaneStore` or `CodeBlockDecodeFailure`, and 16-bit and
+  component-plane region decodes returned mid-gray samples for them.
+- An 8-bit full-image decode (`J2kDecoder::decode_into`, `decode_scaled_into`
+  and the decoders behind `decode_tiles_into`) whose component planes and
+  largest tile's workspace would pass the native decode budget now runs as a
+  region decode of the whole image, which writes rows as the streamed IDWT
+  finishes them, instead of failing with a resource-limit error. The native
+  decoder plans the planes route's charge from the codestream's tiles before
+  decoding (no planes or coefficients are allocated for it), so an image the
+  planes route decodes keeps that route, its output and its speed. A
+  5661 x 8287 RGB image now decodes at full resolution with about 100 MiB
+  peak heap on the default thread pool (26 MiB on one thread), where the
+  planes route with its budget raised to fit needs about 980 MiB. Untiled RGB
+  images decode within 8% of that route's time, 1024 x 1024-tiled RGB takes
+  up to 45% longer and grayscale up to 2.8 times as long. Images whose tiles
+  have empty coarse resolutions (a one-sample tile row or column at an odd
+  position) stream too, at 8 and 16 bits and into native component planes,
+  since region decodes reconstruct such tiles: a 20000 x 7000 gray image of
+  2857 x 2333 tiles no longer fails at the decode budget.
+- Full-image 8-bit decodes also stream when streaming was measured to be the
+  faster route for the image, chosen before decoding from the codestream's
+  header and tiles: reduced-resolution decodes (`decode_scaled_into`) of
+  untiled three-component images with an output of 1024 x 512 or more, classic
+  at any thread count and HTJ2K on two threads or more (a 5661 x 8287 RGB
+  image at 1/2 to 1/8 takes 5-47% less time on 6 threads or more, the same on
+  one, in 4 to 13 times less memory; HTJ2K images at 1/2 and 1/4 9-53% less),
+  smaller classic outputs from 256 x 256 on 2 to 11 pool threads;
+  full-resolution classic images coded at 4 bits per pixel or more from
+  512 x 512 on 2 to 11 pool threads (5-17% faster on 6 threads) and, below
+  2^19 samples, on larger pools too; full-resolution classic images coded at
+  fewer bits per pixel from 4096 x 2048 on 2 to 6 pool threads and from 12
+  (a 4096 x 2048 RGB image at 2 bpp 1% faster on 6 threads and 4-5% on
+  18, in about half the memory); and full-resolution images with a tile
+  for every thread. Those now decode their tiles at once on the calling thread
+  and scoped worker threads, each tile on one thread, instead of one tile after
+  another: a 4096 x 8192 RGB image of 1024 x 1024 tiles decodes 8% faster than
+  on the planes with 6 threads and 23% faster with 18, in less than half the
+  memory. Tiled classic images with fewer tiles stream them one after another
+  on 2 to 11 pool threads when each tile is a megapixel or more. Tiled images
+  past the decode budget decode their tiles at once too (an 8192 x 8192 RGB
+  image of 1024 x 1024 tiles 22% faster with 18 threads, a 16384 x 16384 gray
+  one 2.9 times as fast). Untiled gray classic images stream at full
+  resolution from 2896 x 2896 below 12 pool threads and from 5792 x 5792 on
+  larger pools (12-15% faster on 6 threads, as fast elsewhere, in a fifth to a
+  seventh of the memory). On one thread (`CpuDecodeParallelism::Serial` or a
+  one-thread pool) decodes stream wherever streaming was measured as fast or
+  nearly so in much less memory: classic RGB images of 512 x 512 or more at
+  4 bits per pixel or more and of 4096 x 2048 or more at fewer (a
+  5428 x 4460 RGB image at 1.5 bits per pixel 2% slower, in 16 instead of
+  309 MiB); classic images in tiles of 256 x 256 or more, one tile after
+  another; reduced classic outputs of 512 x 256 or more, tiled or not;
+  reduced HTJ2K outputs of 1024 x 512 or more at 1/4 and below; gray classic
+  images from 1024 x 1024 or in tiles of 256 x 256 or more, and reduced gray
+  outputs from 512 x 256; and 16-bit outputs of 512 x 512 samples or more of
+  any coding, untiled or in tiles of 256 x 256 or more, which the planes
+  route packs from a second set of planes (HTJ2K images 21-25% faster
+  streamed). On one thread 8-bit decodes of untiled HTJ2K images at full
+  resolution, of HTJ2K images at 1/2 and of HTJ2K gray images keep the
+  planes route, as do small images; on two threads or more reduced and
+  tiled gray images, untiled full-resolution HTJ2K images, reduced tiled
+  images, small images and images with few tiles on a large pool do. A
+  stream chosen this way whose own buffers pass the decode budget, as a very
+  wide and shallow image's line buffers can while its planes fit, now
+  decodes on the planes route instead of failing, on any thread count.
+  Output is unchanged.
+- Row-streamed decodes of three 8-bit components into RGB8 output write the
+  reconstructed rows straight into the output: 9/7 images with the
+  multiple-component transform pack each row through the planes route's
+  fused inverse-ICT pack instead of copying it out of the inverse wavelet
+  transform, transforming it in place and packing it through the row sink,
+  and other images pack into the output after the in-place transform.
+  Parallel row-streamed decodes keep a classic component's bands on the
+  worker pool when the component has fewer rows of code-blocks than the pool
+  has threads, where they decoded on one thread (a whole-image region of a
+  512 x 512 RGB image at 2 bpp decodes 4.9 times as fast on 18 threads),
+  and serial ones look each sub-band up directly instead of searching the
+  tile's sub-bands several times a row (whole-image regions of 256 x 256
+  and 512 x 512 tiles 4-9% faster on one thread). An 18000 x 12000 RGB
+  image decodes 1-2% faster on one thread and 3-5% faster on 18. Output is
+  unchanged.
+- x86-64 RGB8 decodes of 9/7 images round and pack the inverse ICT output with
+  the runtime SIMD level (AVX2 where present) instead of a scalar library
+  call per sample: the centered rounding of the inverse MCT runs eight
+  samples at a time, and the last-level RGB8 pack fuses the ICT, rounding
+  and interleave as ARM64 already does. Output is unchanged.
+- x86-64 decodes keep more of their hot loops at the runtime SIMD level
+  instead of baseline x86-64 code: the banded 9/7 IDWT's block load no
+  longer falls back to out-of-line SIMD kernels, 8-bit RGB region rows
+  use the SIMD RGB8 pack, non-MCT 9/7 rounding and the HT 9/7 magnitude
+  conversion use native instructions, the fused RGB8 pack skips a second
+  rounding, and classic Tier-1 (MQ decoding) and dequantization run inside
+  the dispatch so they use LZCNT, BMI2 and AVX2 where present. ARM64 code
+  is unchanged and output is unchanged.
+- Parallel CPU region decodes on the row-streamed IDWT decode Tier-1 band by
+  band on the worker pool while the IDWT reads the bands, instead of decoding
+  every code-block of a component first. Each sub-band holds three bands at
+  the finest level and two at the others, or its whole window when that is
+  smaller, and the IDWT decodes a band itself when no worker has started it.
+  This applies to tiles the tile-wide route decodes: HTJ2K, and classic
+  code-blocks of one arithmetic segment. A 1024 x 1024 region of an
+  18000 x 12000 RGB image decodes 3 to 11% faster at 12 threads and 9 to 18%
+  faster at 4, with about 3 MiB less peak heap. Output is unchanged, and a
+  failure reruns whole-window Tier-1 serially for the same error.
+- Classic (EBCOT) code-block decoding is faster on the CPU. The cleanup pass
+  decodes a run of all-zero run-length columns in one step while the MQ
+  decoder needs no renormalization, the significance propagation and cleanup
+  passes form a coefficient's sign context before its significance decision,
+  and reversible code-blocks decoded down to bit-plane 0 convert to samples
+  in a vectorized loop. On the tile-wide route, long classic code-block rows
+  split into parts of about equal work, so a decode no longer ends on one
+  long row. A 4096 x 2048 RGB image decodes 10% faster at 2 bpp and 14%
+  faster lossless at 1 and 6 threads (5% and 13% at 18), and 1024 x 1024
+  regions and reduced-resolution decodes of an 18000 x 12000 image 2 to 10%
+  faster. Output and peak heap are unchanged.
+- Parallel CPU region decodes of classic tiles whose rows stream to a row
+  sink run every component's bands on the pool at once, and the IDWT
+  advances the components together and hands the rows to the sink, instead
+  of decoding one component's bands, then its planes, at a time. At reduced
+  resolutions, where each sub-band holds few bands, one component's bands
+  left most of the pool idle. On an 18000 x 12000 RGB image, overviews at
+  1/16 and 1/8 scale decode 53% and 47% faster at 18 threads and 1024 x 1024
+  regions up to 5% faster, with 29 to 59% less peak heap. HTJ2K tiles are
+  unchanged.
+- The row-streamed region IDWT synthesizes rows with the banded IDWT's SIMD
+  horizontal kernel, reading the stored band rows in place, instead of
+  interleaving each row and lifting it with the scalar filter. Output is
+  bit-identical. On an 18000 x 12000 RGB image, HTJ2K regions decode 27 to
+  52% faster and classic 1024 x 1024 regions 16 to 36% faster at 6 and 18
+  threads, and 3 to 35% faster at one thread.
+- Parallel CPU region decodes streaming rows from pool bands reconstruct
+  their components in batches of rows, each component on its own pool task
+  for HTJ2K tiles and for classic tiles with 12 threads or more, and pack
+  three 8-bit components straight into interleaved RGB8 output. HTJ2K tiles
+  now stream rows from pool bands too. `ComponentRowSink` gains a
+  rustdoc-hidden `rgb8_region` method, `None` by default, through which a
+  sink offers such a destination. On an 18000 x 12000 RGB image the HTJ2K
+  overview at 1/4 scale decodes 32 to 35% faster, HTJ2K 1024 x 1024 regions
+  16 to 20%, and classic 1024 x 1024 regions at 18 threads 9 to 18%.
+- Parallel CPU region decodes with a reader per component transform and pack
+  each batch of rows on every reader's thread instead of the calling thread
+  alone. The HTJ2K overview at 1/4 scale of an 18000 x 12000 RGB image
+  decodes 10 to 15% faster.
+- Parallel CPU region decodes with a reader per component transform and pack
+  one batch of rows on the pool while the next reconstructs, in batches of
+  up to 2 Mi samples per component and a quarter of the tile's rows; a
+  single reader takes a row of each component at a time. On an 18000 x 12000
+  RGB image the HTJ2K overviews at 1/4 and 1/8 scale decode 6 to 29% faster,
+  and the classic overview at 1/16 scale 12% faster at 6 threads.
+- Parallel CPU region decodes of classic tiles that reconstruct each
+  component on its own reader hold one band more in every ring and one
+  batch of rows instead of two. On an 18000 x 12000 RGB image, 1024 x 1024
+  regions and overviews at 1/8 and 1/16 scale decode 4 to 6% faster at 18
+  threads, with less peak heap.
+- Those tiles reconstruct half as many rows at a time, while that leaves
+  at least 128 rows, since they hold only one batch. A full-image region
+  decode of a 5661 x 8287 RGB image to RGB8 peaks 12 MiB (12%) lower at 18
+  threads, at the same speed.
+- The row-streamed IDWT reads band rows of up to 16384 samples that hold no
+  code-block as zeros through its SIMD kernel; such rows wider than 4096
+  samples took the scalar path. An 18000 x 12000 RGB image, whose chroma
+  sub-bands have many such rows, decodes 11 to 12% faster at 18 threads
+  (441 to 391 ms) and 5% faster at 10. Output is bit-identical.
+- Parallel CPU region decodes of classic tiles of several components and
+  at least 4096 x 4096 samples per component reconstruct each component on
+  its own pool reader from 10 pool threads, instead of 12, holding one
+  batch of rows as before. With one reader that reconstructs every
+  component and packs every row, such tiles were bound by that reader on
+  10 and 11 threads: on a 10-thread pool an 18000 x 12000 RGB image now
+  decodes 11% faster (980 to 868 ms), 5661 x 8287 RGB 8%, 16384 x 16384
+  RGB 7% and 8192 x 8192 RGB 5%, at the same peak heap. Smaller tiles, which
+  spend more of their time in Tier-1, keep one reader. Output is
+  bit-identical.
+- Parallel CPU region decodes that reconstruct every component through one
+  reader (gray images, and classic tiles on fewer than 12 pool threads that
+  keep one reader) hold at most 32 rows of each component at a time instead
+  of up to 512, since that reader transforms and hands over each batch
+  before it reconstructs the next. A full-image decode of a 5661 x 8287 RGB
+  image to RGB8 on 6 threads peaks 22 MiB (33%) lower, at the same speed,
+  and 8 to 16 MiB lower at 1/4 and 1/2 scale; 4096 x 2048, 16384 x 16384 and
+  18000 x 12000 RGB images drop 17 to 23 MiB, gray images 7 MiB at any pool
+  size.
+- Classic tiles with a reader per component hold the extra band in every
+  ring only when they read whole rows at full resolution; overviews and
+  narrower regions keep one batch of rows without it. A 5661 x 8287 RGB
+  image's overviews at 1/2, 1/4 and 1/8 scale peak about 5.5, 2.5 and 1 MiB
+  lower at 12 threads or more, and 1024 x 1024 regions about 2.3 MiB lower.
+
+## [0.13.1] - 2026-10-29
+
+- `CpuBatchDecoder` region and region-plus-reduced requests no longer
+  allocate coefficient and IDWT buffers for whole resolution levels
+  ([#299](https://github.com/frames-sg/j2k/issues/299)). Preparation keeps
+  the shared whole-level plan that Metal and CUDA execute, and adds a CPU copy
+  whose sub-bands and IDWT levels hold only what the region's stores read,
+  with the windows native region decode uses. On an 18000 x 12000 RGB image,
+  1024 px tiles at full and half resolution failed with `ImageTooLarge`; they
+  now decode with output identical to single-image region decode. Quarter
+  resolution, which already fit, takes 24 ms instead of 48 ms for four HTJ2K
+  tiles and 310 to 317 ms instead of 343 to 346 ms for classic. The CPU uses
+  the copy only when it at least halves the plan's coefficients or the
+  whole-level plan holds 16 Mi coefficients or more, because the windowed
+  IDWT is slower per sample than the banded whole-level one; full and reduced
+  requests, and regions covering most of a small image, are unchanged. See
+  `docs/benchmark-evidence.md`.
+- Owned-batch preparation no longer fails with "failed to decode code-block"
+  on reduced-resolution regions that end where a tile begins on the reduced
+  grid ([#298](https://github.com/frames-sg/j2k/issues/298)). Tile selection
+  rounds tile bounds outward, so it can keep a boundary tile that contributes
+  no samples; the referenced plan builders rejected such a tile and now leave
+  it out. This affected the CPU and Metal batches alike. On the 19 x 13
+  OpenJPH fixture in 11 x 7 tiles, 4,598 of the 17,290 half-scale regions
+  failed to prepare; all now match single-image decode.
+- All-stage Metal lossy encodes seed code-blocks without coding passes with zero
+  in the zero-bitplane tag tree, as the CPU encoder does, so their packet headers
+  match the CPU's byte for byte. Earlier codestreams were valid but could differ
+  from the CPU's by a few header bytes.
+- CPU classic (Part 1) code-block decoding reads several MQ code bytes ahead
+  per refill instead of one per renormalization, visits each column's
+  candidate rows in the significance propagation, refinement and cleanup
+  passes as a bit set instead of testing every row, passes each row's window
+  shift instead of its row to the context helpers (the classic encoder shares
+  them), picks the next MQ probability state with one shift, and indexes its
+  contexts by label without a bounds check. On a 4096 x 2048 RGB image,
+  one-thread decodes are 11% faster lossless and 9% faster at 2 bpp, and
+  12-thread lossless decodes 11% faster; eight concurrent 1024 x 1024 region
+  decodes of an 18000 x 12000 image are 9% faster. Decoded samples and
+  encoded codestreams are unchanged. See `docs/benchmark-evidence.md`.
+- `j2k-tilecodec` LZW decode no longer reports valid TIFF strips and tiles
+  as truncated. weezl reads input ahead of decoding, so the call that
+  consumes the last byte can still hold codes up to the end code, often in
+  short streams; decoding stopped there with a truncation error. It now
+  finishes the buffered codes, and reports truncation only when no input is
+  left and decoding makes no progress. As in libtiff, a stream with no end
+  code decodes when it fills the output and is reported as truncated when it
+  stops short; a cut that loses data is always truncated. An empty or nearly
+  empty stream is reported as truncated rather than malformed.
+- Fixed CPU decodes of codestreams whose tile-part headers set their own
+  coding style ([#295](https://github.com/frames-sg/j2k/issues/295)). The
+  inverse DWT and the rounding of integer output used the main header's
+  wavelet, so a tile-part COD or COC that changed the wavelet gave the wrong
+  samples in full, region, row and reduced decodes. Each tile now uses its
+  own coding style. Images whose tiles differ in their multi-component
+  transform, or in its wavelet, apply it per tile instead of applying the
+  first tile's to every tile. A tile-part COC or QCC now takes precedence over
+  the tile-part COD or QCD whichever comes first in the header, as T.800
+  specifies. Tiles of 25 to 38-bit images that differ in needing exact
+  integer decode are rejected with `UnsupportedFeature` rather than decoded
+  wrong. Output of codestreams without tile-part coding overrides is
+  unchanged.
+- `MetalBatchDecoder` region and region-plus-reduced requests no longer
+  allocate coefficient and IDWT buffers for the whole decoded level. Their
+  prepared plans already store only the region; preparation now narrows each
+  sub-band and IDWT window to what that store reads, as the single-image Metal
+  region route does. On an 18000 x 12000 RGB image, a batch of 1024 px tiles
+  at full or half resolution requested a 2.6 GB or 648 MB buffer, failed the
+  512 MiB cap, and fell back to the CPU; those tiles now decode on Metal with
+  output identical to the CPU. Quarter resolution, which already fit, takes
+  9 ms instead of 36 ms for four HTJ2K tiles and 137 to 146 ms instead of
+  about 165 ms for classic. Cropping a prepared HTJ2K plan whose payloads stay
+  in the input no longer fails when it drops code-blocks. See
+  [`docs/benchmark-evidence.md`](docs/benchmark-evidence.md).
+- Owned batch preparation accepts images whose components use different
+  sampling factors, such as YCbCr 4:2:2, instead of reporting
+  `NonRepresentableReason::ComponentSubsampling`. Decode replicates the
+  subsampled components onto the image grid, as single-image decode does; the
+  CPU batch decoder matches it for full, region, reduced, and
+  region-plus-reduced requests. These images retain metadata only, so they
+  never share an execution group with unit-sampled images. Images whose
+  components all share one non-unit sampling still report
+  `ComponentSubsampling`, because native decode then produces the smaller
+  component grid.
+  `MetalBatchDecoder` decodes full-image subsampled RGB without MCT, such as
+  Aperio 33003 YCbCr 4:2:2 tiles, in the group's one command buffer and
+  replicates chroma on the GPU before the final store. 32 tiles of
+  `JP2K-33003-1.svs` take 11 to 30 ms instead of 150 to 390 ms through one
+  Metal decode per tile; see
+  [`docs/benchmark-evidence.md`](docs/benchmark-evidence.md). Region and
+  reduced subsampled requests on Metal, and subsampled groups on CUDA, now
+  fail as a group with a capability error (`UnsupportedMetalRequest` or
+  `UnsupportedCudaRequest`) instead of an indexed preparation error; callers
+  that fell back to single-image decode on `NonRepresentableBatchOutput`
+  should do the same for these group errors.
+- Serial CPU region decodes on the row-streamed IDWT decode each sub-band's
+  code-blocks one code-block row at a time, as the IDWT reaches it, and hold
+  only that row instead of the sub-band's whole window. A 1024 x 1024 region
+  of an 18000 x 12000 RGB image holds under 1 MiB of coefficients instead of
+  5 MiB, and peaks at 14 to 16 MiB of heap instead of 18 to 20 MiB. Every
+  code-block the whole-window path decodes is still decoded, and a failing
+  decode reruns Tier-1 over whole windows to report the same error. Parallel
+  decodes keep whole windows. Output is unchanged.
+
+- Serial 8-bit region decodes (`decode_region_into`,
+  `decode_region_scaled_into` and `decode_region_scaled_pow2_into` with
+  `Rgb8`, `Rgba8` or `Gray8`) decode all components together and write each
+  row into the caller's buffer as the streamed IDWT finishes it, instead of
+  filling whole component planes first. A 1024 x 1024 RGB region of an
+  18000 x 12000 image peaks at about 3.5 to 6 MiB of heap instead of 14 to
+  16 MiB, not counting the caller's buffer. Output is unchanged. A decode that
+  fails may leave part of the region written. A decode that streams gives up
+  the decoder context's retained scratch and component planes before the first
+  row, so a reused context fits exactly what a fresh one does without retrying
+  and writing rows twice. Parallel decodes, and images with a palette, channel
+  definitions, sYCC or CIELab, still fill planes first. The native
+  `Image::decode_region_rows_for_integer_output_with_context` and
+  `ComponentRowSink` expose this for other callers.
+
+- Security: the lockfiles move to libz-sys 1.1.31, which fixes
+  RUSTSEC-2026-0418. Its build script printed the build environment into
+  `target/` when built with cc 1.6 or later on Unix. J2K's locked builds use
+  cc 1.2 and were not affected. `cargo install --locked j2k-cli` now builds
+  the fixed version.
+
+## [0.13.0] - 2026-10-26
+
+- Migration from 0.12.0: exhaustive native `EncodeOptions` literals must add
+  `irreversible_quantization_profile: None` or use `Default` with struct update
+  syntax. Exhaustive `JpegEncodeError` matches must handle the six new encode
+  errors, and exhaustive `JpegResolvedDecodePath` matches must handle
+  `MetalHybrid`. The hidden `irreversible_quantization_step_for_subband` helper
+  requires the sub-band level and total decomposition depth as its final two
+  arguments. The one-level transcode path passes `1, 1`. See the
+  [0.13.0 API review](xtask/release-evidence/public-api/public-api-review-0.13.0.yml)
+  for the full compatibility and behavior review.
+- Migration from 0.12.0: `J2kDirectGrayscalePlan` adds the required `signed`
+  field. Existing struct literals must set it from the source component
+  signedness. Use `signed: false` for unsigned inputs and `signed: true` for
+  signed inputs, including component plans nested in colour and RGBA plans.
+  Update exhaustive field patterns to bind `signed` or include a rest pattern.
+  The output pixel format does not determine source signedness.
+- Migration from 0.12.0: `BatchDecodeOptions` is `#[non_exhaustive]`; build it
+  from `BatchDecodeOptions::default()` and assign `layout`, `settings` and
+  `workers`. `BatchLayout` is defined in `j2k-core` and still re-exported by
+  `j2k`. `j2k_jpeg::ColorTransform`, `BurnBatchTensor` and `BurnDecodeError`
+  are `#[non_exhaustive]`, so exhaustive matches need a wildcard arm.
+  `j2k_jpeg::DecodeOutcome` and `DecodedTile` add `recovered`; literals set it
+  to `false`. `BurnBatchDecode` and `BurnBatchGroup` fields are private; use
+  their accessors, `into_groups`, `into_tensor` and `j2k_info`. JPEG decode is
+  strict by default and returns `JpegError::RecoveryRequired` for damaged
+  input; pass `DecodeOptions::with_strict(false)` to accept supported
+  recovery. The `cuda-oxide-j2k-ml` feature of `j2k-cuda-j2k-engine` is
+  removed.
+
+- Security: `j2k-tilecodec` requires zstd 0.14.3, which fixes RUSTSEC-2026-0391,
+  RUSTSEC-2026-0398, RUSTSEC-2026-0403 and RUSTSEC-2026-0410. `ZstdCodec` only
+  uses the streaming read decoder, which the first three do not affect.
+  RUSTSEC-2026-0410 affects wasm32 builds that decode untrusted Zstandard tiles.
+  The bundled zstd library stays at 1.5.7 and decoded output is unchanged.
+
+- Release evidence: 0.13.0 publishes without the CUDA full release validation
+  job and the CUDA T.803 report, because the self-hosted CUDA runner is
+  offline. [`cuda-waiver-0.13.0.md`](xtask/release-evidence/cuda-waiver-0.13.0.md)
+  records the CUDA tests and byte-identity checks that passed on the same
+  crate sources. CPU and Metal evidence are required as usual. The CUDA T.803
+  report will be attached to the GitHub release once the runner is back.
+
+- CPU byte and bits-per-pixel rate searches return the last probe's
+  codestream when that probe is the selected scale, instead of encoding the
+  same scale again. Search decisions and output are unchanged.
+
+- Classic CPU Tier-1 encoding of code blocks without vertically causal
+  context scans packed column state words shared with the decoder, instead
+  of per-sample neighbor bytes. Output is unchanged.
+
+- CUDA whole-tile HTJ2K encodes group every component's code blocks in
+  bounded dispatches. Each component is quantized into its own plane of the
+  component buffer after the transform has finished reading it, avoiding a
+  separate coefficient buffer. Output is unchanged.
+
+- CUDA HTJ2K tile encodes bound each code-block scratch request to 384 MiB,
+  keeping small-block images within the scratch offset range. Blocks retain
+  their submission order and encoded bytes are unchanged.
+
+- CUDA HTJ2K tile encodes quantize every sub-band of a component into one
+  buffer and code its blocks in bounded dispatches. Sub-bands share a dispatch
+  when their combined jobs fit the scratch budget, and the encode report
+  counts the actual HT code-block dispatches. Output is unchanged.
+
+- A `CudaEncodeStageAccelerator`, and so a `CudaLosslessEncoder`, keeps one
+  best-fit device-buffer pool across its encodes, and HTJ2K tile encodes take
+  each sub-band's quantized coefficients from it, so repeated encodes no
+  longer allocate and free those buffers for every sub-band. The pool keeps
+  up to 512 MiB of idle device memory between encodes. Output is unchanged.
+
+- CUDA HTJ2K code-block encode kernels launch 32 threads per code block
+  instead of 128. Each code block is coded by one thread, so the smaller
+  thread blocks let more code blocks run at once. Output is unchanged.
+
+- CUDA sessions reuse decode device buffers best-fit, taking the smallest
+  cached buffer that is large enough, instead of first-fit, so small requests no
+  longer take large cached buffers and repeated full-image decodes stop
+  allocating and freeing device memory on every decode. Output is unchanged.
+
+- CUDA HTJ2K packetization builds each packet header with the whole thread
+  block: every thread codes one code block's tag-tree, pass and length bits
+  and one thread appends them, instead of one thread coding the whole packet.
+  Packets with blocks coded in earlier layers keep the serial header. Output is
+  unchanged.
+
+- Metal device decodes follow CPU sample conversion for signed grayscale and
+  colour sources, including prepared, referenced, repeated and distinct batches.
+  Component plans retain source signedness at construction and reject mixed
+  colour signedness. Signed MCT takes no unsigned level shift and 16-bit plane
+  packs preserve two's-complement samples.
+- `j2k-native` has a `profile` feature, on by default, for its stage
+  profiling (`J2K_PROFILE_STAGES`). Without it, profiling compiles to no-ops,
+  and `std` no longer turns on `j2k-profile/std`. A single-threaded wasm32
+  decoder built with only `std` and `simd` is 16.8 KB smaller gzipped (216 KB
+  instead of 233 KB). Default builds are unchanged.
+- CUDA device decodes follow CPU sample conversion for signed grayscale and
+  colour sources, including prepared and referenced batches. Component plans
+  retain source signedness at construction and reject mixed-signedness colour
+  stores. Signed MCT takes no unsigned level shift, native batches preserve
+  sample values, and requested 16-bit outputs keep two's-complement samples.
+  For 0.13.0, `J2kDirectGrayscalePlan` adds the public `signed: bool` field.
+  Struct literals must add `signed` from the source metadata, or use struct
+  update syntax with an existing plan that has the correct signedness.
+
+- Python `ImageRequest` accepts JPEG color-transform hints from slide readers.
+  `Tensor.to_numpy()` rejects GPU output without consuming its DLPack owner.
+- The Python adapter's optional `metal` feature supports `device="mps"` on
+  Apple Silicon. JPEG 2000 batches decode into fresh private Metal buffers
+  transferred to PyTorch through DLPack after GPU completion; consumer
+  mutation and decoder reuse do not alias codec-owned storage.
+- `CpuBurnDecoder::decode_batch` accepts mixed JPEG and JPEG 2000 inputs
+  with common private result owners, typed diagnostics and recovery metadata.
+- JPEG decode defaults to strict pixel integrity, including progressive EOF
+  verification. Explicit lenient recovery is reported per row. Python strict
+  settings and Burn session settings apply to both codec families.
+- Unconsumed DLPack capsules return storage to their live tensor owner after
+  a rejected foreign import. Python accepts `mps:0` and single ImageRequest
+  inputs; bare `cuda` binds the current PyTorch device at construction.
+- `j2k_jpeg::JpegBatchDecoder` decodes complete JPEGs on the CPU into dense
+  RGB8 groups (NCHW or NHWC), grouped by size; a failing input is reported by
+  index and the rest of its group is kept. `BatchLayout` moves to `j2k-core`
+  and `j2k::BatchLayout` re-exports it.
+- The `j2k` Python decoder's `decode` and `decode_batch` accept 8-bit JPEG
+  inputs alongside JPEG 2000 in one call, with indices and errors relative to
+  the original input list. JPEG inputs support full-image CPU decode; `prepare`
+  and `decode_prepared` stay JPEG 2000 only.
+- Removes the unused CUDA-Oxide j2k-ml conversion kernel from
+  `j2k-cuda-j2k-engine`, with its `cuda-oxide-j2k-ml` feature, the
+  rustdoc-hidden `CudaJ2kMl*` types and
+  `J2kCudaEngine::j2k_ml_convert_into_external`. No adapter called it.
+- Tight RGBA8 output from RGB images decodes into the caller's allocation
+  and adds opaque alpha in place, avoiding a separate full RGB8 buffer.
+  Pixel values and padded-output handling are unchanged.
+- Classic CPU sub-band decoding reuses one Tier-1 workspace per worker
+  across pending code blocks, bounding fallback scratch by active workers.
+  Decoded pixels and code-block ordering are unchanged.
+- ARM64 CPU decodes fuse the inverse ICT, rounding and RGB8 stores in one
+  vector loop for streamed 9/7 output. Output is unchanged.
+- Fused RGB8 CPU decodes reconstruct later components into the consumed
+  coarse-coefficient prefixes of earlier component planes. This removes two
+  separate LL buffers without copying their samples. Output is unchanged.
+- Fused RGB8 CPU packing on the pool gives its workers rings from the
+  completed coarse inverse transform's scratch buffers before allocating more,
+  reducing temporary heap allocations. Serial packing still allocates its own
+  small ring. Decoded pixels and retained workspace capacities are unchanged.
+- CPU encodes of 8-bit RGB give each wavelet worker scratch for the strips
+  it lifts, the first level in band blocks and the later levels from half the
+  rows, instead of strips of full height. On 18 threads a 4096 by 2048 image
+  needs 4.7 MB less scratch. Output is unchanged.
+- Single-tile CPU encodes free each component's wavelet coefficients as soon
+  as its code blocks are prepared, instead of after packetization, and charge
+  the later phases without them. Prepared code blocks own their samples, so
+  nothing reads the coefficients again. A lossless classic encode of a 4096
+  by 2048 RGB image peaks at about 135 MB of heap instead of 219 MB, and an
+  HTJ2K one at 106 to 110 MB instead of 127 MB. Rate searches keep their
+  transform for later candidates, so under a memory cap that admits an
+  ordinary encode but not that transform they now encode each candidate
+  afresh. Output is unchanged.
+- CPU classic Part 1 decodes on one thread decode each sub-band's code
+  blocks straight into its coefficients, as HTJ2K decodes on one thread
+  already do, instead of staging them in a sub-band slab with a Tier-1
+  workspace for every code block and copying them back. A one-thread decode
+  of a 4096 by 2048 RGB image needs about 25 MB less heap and 47 MB less
+  resident memory. Output is unchanged.
+- The Metal lossy encode stages, deinterleave, ICT, 9/7 DWT and sub-band
+  quantization, take their upload and result buffers from the runtime's pools
+  instead of allocating them on every call, and copy each result out once.
+  Output is unchanged.
+- Metal lossless single-tile encodes run the RCT and each 5/3 wavelet level in
+  one dispatch that lifts tiles in threadgroup memory and writes the sub-bands
+  straight into their code blocks, instead of separate deinterleave, vertical,
+  horizontal and coefficient-extract passes over full-size planes. Only two
+  quarter-size LL planes are allocated. Output is unchanged.
+- The Metal component-plane and single-plane decode executions turn a decoded
+  group's members into band slices through one helper instead of five copies of
+  the same loop. Output is unchanged.
+- Metal single-image colour decodes whose components all start with an HT
+  group decode the three components' HT code blocks into one coefficient buffer
+  with one set of dispatches, instead of one encoder per component, so each
+  dispatch holds enough blocks to keep the GPU busy. Output is unchanged.
+- Metal single-image colour decodes no longer zero the last wavelet level's
+  high-band code blocks that have no coding passes. A cell map built from the
+  decode jobs lets the fused last-level kernel read those blocks as zero, and a
+  band whose job edges do not fit the map is zeroed as before. Output is
+  unchanged.
+- Metal single-image MCT RGB8 decodes synthesize the last wavelet level of the
+  three components and pack RGB8 in one tile kernel when each component ends in
+  that level and an identity store of the whole plane, so the last-level float
+  planes are never written. The fused 5/3 tile loads all its rows before
+  lifting them. Output is unchanged.
+- Metal single-image colour decodes keep each MCT component's final
+  coefficient plane when the component ends in an identity store of the whole
+  plane, instead of copying it into a second plane, as stacked decodes already
+  did. Output is unchanged.
+- The Metal HT cleanup decode packs each quad's VLC word into the first half of
+  its row for code blocks at most 64 samples wide, so the round trip between its
+  two kernels writes and reads half the memory lines. A 4096 x 2048 RGB HTJ2K
+  decode took 7.1 ms against 8.4 ms lossless and 5.8 ms against 6.1 ms at 2 bpp.
+  Output is unchanged.
+- The `j2k-metal` `J2kDecoder` copies the codestream for a referenced HTJ2K
+  plan on a pool worker while the packet headers are parsed, instead of after
+  them. A 4096 x 2048 RGB HTJ2K lossless decode to an RGB8 surface took 7.56 ms
+  against 7.83 ms. Output is unchanged.
+- The CPU HTJ2K block encoder derives every quad's rho, maximum exponent, eps
+  reach mask, context, CxtVLC index, u_q and MagSgn bound in the row pre-pass
+  instead of in the quad walk, drains MagSgn words with one whole-word store,
+  and keeps its row pair in the worker's workspace. Output is unchanged.
+- The CPU HTJ2K block encoder packs a quad's MagSgn payloads and computes its
+  eps mask without branches, codes zero quad pairs under zero context as MEL
+  zeros alone, and inlines its per-pair MEL, VLC and UVLC writers. Output is
+  unchanged.
+- The CPU HTJ2K block encoder computes each row pair's exponents and MagSgn
+  values in a vectorized pre-pass into zero-padded rows, writes a quad pair's
+  CxtVLC and UVLC bits to the VLC stream at once and a quad's MagSgn payloads
+  as one word. Output is unchanged.
+- CPU encodes of 8-bit RGB under the forward MCT lift the first DWT level
+  straight from the pixels in cache-sized bands, without writing and rereading
+  three transformed planes or taking a spare plane, and with three or more
+  workers run the planes' later levels side by side on the pool. Output is
+  unchanged.
+- The Metal Auto host-output encode accelerator reports
+  `declines_every_stage` as `true` when every remaining stage hook would
+  decline, so those encodes take the CPU's stage-free paths. Routing is
+  unchanged. Output is unchanged.
+- `J2kEncodeStageAccelerator::declines_every_stage`, defaulting to `false`, lets
+  an accelerator permit native encode to skip the remaining per-stage hooks of
+  the current encode once the whole-tile hooks have declined, and the buffers
+  only those hooks read. `CpuOnlyJ2kEncodeStageAccelerator` returns `true`, so
+  CPU encodes quantize code blocks straight from the packed DWT rows and encode
+  single-layer cleanup-only HT blocks as they quantize, each worker keeping one
+  block buffer and workspace. A band whose worst-case output does not fit the
+  memory cap takes the Tier-1 path instead. Output is unchanged.
+- CPU 9/7 encodes lift each even-origin row of the forward DWT in one
+  register-window pass, splitting each block of samples into its low and high
+  samples once, running all four lifting steps and the scaling in registers,
+  and writing the low samples back in place. Output is unchanged.
+- CPU encodes lift the first forward DWT level out of place in bands of 16
+  rows when a spare plane fits the memory cap, so each band's column strips and
+  rows are lifted while cached instead of in two passes over the whole plane.
+  Without the spare the level runs in place as before. Output is unchanged.
+- CPU packet encoding builds each tag tree in one pass, setting the leaves
+  and then each level from the one below, instead of updating the path to
+  the root for every code block. Output is unchanged.
+- CPU encodes scan each subband's HT code-block magnitudes on the pool, and
+  copy the rows of large packed bands into their contiguous subband on the
+  pool, instead of in serial passes. Output is unchanged.
+- CPU encodes lift the forward DWT's column strips and rows on the pool when
+  one strip scratch per worker fits the memory cap, and run the RGB8
+  deinterleave, subband quantization and code-block copies on the pool. HT code
+  blocks take small batches from a shared queue, and the all-at-once memory
+  bound charges each worker's scratch once instead of every block's. Output is
+  unchanged.
+- CPU encodes lift the packed `f32` forward DWT in SIMD column strips of one or
+  two cache lines per row, copied into a scratch block of their low-pass rows
+  then their high-pass rows, instead of one column at a time through the line
+  transform. Every sample sees the same operations. Output is unchanged.
+- Fused RGB8 CPU decodes of single-tile colour images no longer allocate and
+  zero a last component plane that they then free unused. The last
+  component's coefficient buffer becomes its plane, so a fresh decoder
+  allocates one image-sized buffer less. Output is unchanged.
+- RGB8 CPU decodes of single-tile colour images with three 8-bit, fully
+  sampled components and at least two decomposition levels reconstruct the
+  last IDWT level inside the RGB8 pack, a few rows at a time, instead of
+  writing it as three float planes and reading them back. The decode no
+  longer needs the full-size IDWT output buffer, so its peak memory drops.
+  Output is unchanged.
+- RGB8 CPU decodes of plain colour images, without a palette, channel
+  definitions, sYCC or CIELab, leave the inverse MCT to the RGB8 pack, which
+  transforms each cache-sized chunk and packs it at once, instead of
+  transforming the three planes in place and reading them again. On the pool
+  each chunk is transformed in scratch, so the planes are not written back.
+  Output is unchanged.
+- CPU decodes of a later component on the tile-wide route zero the previous
+  component's stale coefficients on the route's workers, each strip its own
+  rows and separate tasks the ranges between strips, instead of clearing the
+  whole buffer on one thread first. Other routes still clear it. Output is
+  unchanged.
+- CPU decodes under `CpuDecodeParallelism::Auto` decode the tiles of a
+  multi-tile image concurrently when every component is sampled 1x1, each
+  worker storing into its own rows of the output planes. The workers share the
+  decode memory cap, and the image decodes serially when the cap would limit
+  them or any tile fails. Output is unchanged.
+- CPU decodes store a whole-image component whose samples need no shift by
+  swapping the IDWT output's allocation with the component plane instead of
+  copying the samples. Reused decoders keep the same allocations, rotated
+  between the two. Output is unchanged.
+- CPU banded inverse wavelet transforms on the pool hand out their strips
+  from a queue, so each worker takes the next strip when it finishes the last
+  instead of waiting for a wave of equal strips. Each strip reconstructs its
+  own rows in the output and keeps only its halo rows in worker scratch,
+  instead of copying every row out of a ring buffer. Output is unchanged.
+- The CPU 9/7 inverse DWT synthesizes most of each even-origin row in one
+  register-window pass, instead of copying both band rows and making a pass per
+  scaling and lifting step. Output is unchanged.
+- CPU HTJ2K cleanup decoding of non-initial quad rows reads both U-VLC values
+  of a quad pair and their length with one lookup in a 4096-entry table when the
+  codewords fit in ten bits, instead of decoding prefix and suffix in turn.
+  Output is unchanged.
+- CPU HTJ2K cleanup decoding skips the VLC decode of quad pairs whose two quads
+  are zeros of the current MEL run, which code no other bits. Output is
+  unchanged.
+- CPU HTJ2K cleanup decoding reads MEL symbols from a 64-bit reservoir through
+  a table, eight runs at a time and out of the quad-pair loop, instead of bit by
+  bit. Output is unchanged.
+- CPU HTJ2K cleanup decoding decodes each quad pair's symbols in one call with
+  the MEL and VLC refills inlined and masked VLC table indexes, and its
+  magnitude and sign row loops are reorganized around those pairs. Output is
+  unchanged.
+- CPU HTJ2K encodes of cleanup-only code blocks keep the cleanup segment as
+  the block's payload instead of copying it into a second buffer. Output is
+  unchanged.
+- The CPU classic Part 1 encoder plans at most 15/7 bytes per MQ symbol and
+  2.5 symbols per coefficient and bitplane, plus four for segmentation
+  symbols, instead of 4 bytes and 3 symbols, with the same per-pass
+  termination allowance. The bound follows from Qe being at least 1 and a
+  byte taking at least 7 renormalization bits, so a block's worst-case output
+  reservation is about 2.2 times smaller and longer Tier-1 waves fit the
+  memory cap. Output is unchanged; decoding does not use this plan.
+- The CPU classic Part 1 Tier-1 encoder clears its per-bitplane visit marks
+  with one pass over the block's state bytes instead of recording every
+  visited coefficient's index, so each code block no longer allocates a
+  pointer-sized scratch entry per coefficient. Output is unchanged.
+- The classic Part 1 MQ arithmetic encoder codes each symbol with selects
+  instead of branches on the MPS/LPS decision and the conditional exchange,
+  takes its next state from the packed table the decoder uses, and
+  renormalizes by the leading-zero count of A in one shift between byte
+  boundaries instead of one bit at a time. Output is unchanged.
+- CPU classic Part 1 encodes run Tier-1 code-block coding in the longest
+  waves whose worst-case output and worker scratch fit the memory cap,
+  doubling from one block per worker, instead of always one block per worker.
+  Every wave ends at a barrier, so the short waves left workers idle at each
+  of several hundred barriers per image. Output is unchanged.
+- Metal fallback decodes of tiled images store each tile on the CPU instead of
+  copying the whole output plane to the GPU and back for every tile and
+  component, and keeping each copy until the decode ends. Stores that fill the
+  whole plane still run on the GPU when coverage is unambiguous. Narrow stores
+  with trailing padding stay on the CPU so partial captures cannot replace the
+  completed plane. Decoded pixels match the CPU output.
+- Metal lossless HTJ2K host encodes reuse the thread's default Metal session,
+  take their buffers from its pools, stage the input in a pooled buffer and read
+  the encoded blocks in place, so repeated encodes no longer create a session or
+  copy the output. A thread that has encoded keeps those pooled buffers, within
+  the existing pool caps. Output is unchanged.
+- CPU decodes of colour images run the inverse multi-component transform and
+  the rounding of 9/7 output to integers together in cache-sized chunks,
+  instead of making three more passes over the planes. Planes of at least
+  2048x2048 samples run their chunks on the pool when the decode may use more
+  than one thread. Output is unchanged.
+- Auto full-image RGB8 decodes keep tiled images on the CPU, avoiding
+  repeated per-stage Metal round trips. Explicit Metal requests keep resident
+  decoding.
+- Region decodes keep no precinct records or tag-tree roots for the precincts
+  they never parse. A 1024 x 1024 region of an 18000 x 12000 RGB image with
+  PLT markers peaks at 18 to 19 MiB of heap instead of 21 to 22 MiB. Dense
+  selections keep direct precinct indexing and the existing memory budget.
+  Output is unchanged.
+- Region decodes of RPCL, PCRL and CPRL codestreams without PLT markers no
+  longer keep code-block records or tag trees for the precincts they parse
+  only to reach later packets. Those precincts take turns with up to three
+  scratch precincts while their packets are parsed. A 1024 x 1024 region of an
+  18000 x 12000 RGB RPCL image peaks at 20 to 21 MiB of heap wherever it
+  lies, instead of 24 to 32 MiB, about the same as with PLT. Output is
+  unchanged.
+- CUDA HTJ2K packetization copies each packet body one code block at a time
+  with every thread of the packet's thread block, instead of having each
+  thread search the packet's code blocks for every body byte it copies.
+  Output is unchanged.
+- Region decodes of codestreams without PLT markers keep no layer or segment
+  records for the code-blocks they parse only to reach later packets. Their
+  packet headers are still checked as before. A 1024 x 1024 region of an
+  18000 x 12000 RGB RPCL image needs 13 to 29 MiB of packet-header state
+  instead of 27 to 60 MiB, depending on where it lies. Output is unchanged.
+- CUDA region decodes lay each Tier-1 band out over the window its region
+  needs and run each IDWT level over its required output window only, instead
+  of reconstructing whole bands. The engine IDWT job band rectangles are now
+  absolute band coordinates and may cover more than the output needs. Output
+  is unchanged.
+- CUDA colour region decodes plan only the code blocks, packets and wavelet
+  levels the region needs, as grayscale region decodes already did, instead
+  of decoding every code block of the image and uploading its whole
+  codestream. Output is unchanged.
+- Region decodes reduced past every wavelet level write the LL band straight
+  into the output planes instead of copying it through an IDWT buffer first,
+  saving one component's region of `f32` samples (0.8 of 10.8 MiB for a 1/32
+  scale decode of an 18000 x 12000 RGB image). Output is unchanged.
+- CPU decodes under `CpuDecodeParallelism::Auto` decode the classic Part 1
+  code blocks of a component tile-wide, as HT blocks already were, when every
+  block is one arithmetic segment, with no selective bypass and no termination
+  on each pass. Rows of code blocks are tasks on one queue and write their
+  coefficients in place, with one Tier-1 workspace per worker, kept by the
+  decoder context for later components and decodes, instead of one per code
+  block and no per-sub-band staging slab or serial copy. Classic tiles with
+  less than 1 KiB of coded data decode serially, and those with fewer rows of
+  code blocks than workers keep the per-sub-band path. Tiles of either coding
+  below their coded-data cutoff now go serial before the route plans them.
+  Output is unchanged.
+- CPU classic Part 1 decodes build each code-block decode job and pick its
+  reconstruction in one place for every path. Output is unchanged.
+- `J2kDecoder::decode_region_into` releases its component planes and other
+  decode buffers when it returns, as the scaled region decode already does,
+  instead of keeping about 12.7 MB per 1024² RGB region in an idle decoder. The
+  planes were zeroed before every region decode anyway, so allocating them again
+  adds under 0.5% to the next decode. Output is unchanged.
+- Tag trees no longer store their root level, which is derived from the grid
+  size when read: 16 bytes less per precinct. Output is unchanged.
+- Tag trees are stored as one grid per level in smaller nodes, so some precinct
+  layouts that exceeded the structural decode cap now decode. Output is
+  unchanged.
+- CPU decodes with `J2K_PROFILE_STAGES` set take the tile-wide HTJ2K route as
+  unprofiled decodes do, and its plan, tasks and worker scratch count towards
+  the reported workspace peak. HTJ2K phase timings now cover serially decoded
+  code blocks only, such as decodes on one thread.
+- CPU tile-wide HTJ2K decodes size their code-block plan by the blocks the
+  decode needs in the planned components instead of every block in the tile,
+  so region decodes of large tiles without packet length markers no longer
+  reserve megabytes per component.
+- CPU region decodes reconstruct the IDWT a row at a time, holding a few rows
+  per level instead of each level's whole window, and write the last level
+  straight into the output planes. This applies to packed, native and
+  component-plane region outputs and to `PreparedRegionDecoder`, and lowers the
+  peak workspace of a 1024 x 1024 region of a large RGB image from 29.1 to
+  25.1 MiB. Output is unchanged. Hooked decodes, palette, component-definition,
+  sYCC and CIELab images, subsampled components and exact-integer decodes keep
+  the whole-window IDWT.
+- Reduced-resolution decodes of images whose origin is not a multiple of the
+  reduction factor no longer panic on edge tiles without samples, and match the
+  standard's output size instead of adding an unwritten row or column.
+- CPU rate- and PSNR-targeted lossy encodes of single-tile images run the
+  colour transform and DWT once per search instead of once per candidate scale;
+  output is unchanged. The retained coefficients (4 bytes per sample) count
+  against the encode and PSNR-decode budgets.
+- Default irreversible 9/7 quantization steps now follow each band's synthesis
+  norm, as standard JPEG 2000 encoders signal them: steps grow about twofold per
+  finer level instead of staying uniform across levels. The band with the
+  smallest norm keeps its previous step, so no band is quantized more coarsely;
+  default-scale lossy codestreams are larger and more accurate, and rate-targeted
+  encodes gain fidelity at equal bytes. Quantization profiles weight these steps.
+  `irreversible_quantization_step_for_subband` takes the band's level and the
+  decomposition depth, and JPEG-to-HTJ2K code-block quantizers use the one-level
+  steps written to QCD.
+- Resolve lossless facade depth against edge tiles before reporting effective
+  geometry or required accelerator stages, matching the emitted COD depth.
+- Evaluate extreme irreversible quantization products without losing a valid
+  result to intermediate overflow or underflow. Rate search now resolves both
+  profile scale bounds and preserves feasible minimum-PSNR candidates after an
+  initial quality dip; invalid fixed-scale profiles remain ordinary input errors.
+- Align CUDA requested-format precision thresholds and synthesized 16-bit alpha
+  with the CPU contract, and round centered non-MCT color samples before shifting.
+  Metal signed sources below eight bits now widen correctly to requested Gray16
+  in both fused and separate stores. Native batch sample preservation is unchanged.
+
+- Image opening and header inspection accept valid dimensions beyond 60,000
+  pixels. Precinct and code-block edges are clipped without coordinate
+  overflow, and reference-grid strides use wide arithmetic. Decode allocation
+  and structural budgets still apply to whole images and requested regions.
+- Multi-tile encoding carries absolute tile-component origins through 5/3 and
+  9/7 transforms, code-block partitioning, precincts, and packet progression.
+  Grids previously rejected for wavelet/block/precinct misalignment are supported
+  by the CPU encoder and the staged Metal/CUDA routes. Compatible grids retain
+  fused whole-tile acceleration. Tiles crossing the implicit 32,768-sample
+  precinct grid are split even when no custom precinct sizes are supplied.
+  The smallest-edge decomposition policy is unchanged.
+- Encode accelerators can implement `encode_forward_dwt53_at_origin` and
+  `encode_forward_dwt97_at_origin`. Existing zero-origin hooks and job structs
+  remain source-compatible; their default adapters decline incompatible phases.
+- Metal and CUDA packetization accept empty edge subbands within a nonempty
+  precinct, emitting no tag-tree bits for those bands.
+
 - Irreversible 9/7 encodes accept per-component quantization profiles:
   `J2kLossyEncodeOptions::quantization_profile` (`with_quantization_profile`)
   and `EncodeOptions::irreversible_quantization_profile` take one positive

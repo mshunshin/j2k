@@ -122,8 +122,9 @@ You choose the backend with `BackendRequest`:
 
 - **`Auto`** (the default) uses the GPU only for image types and sizes where it
   was measured to be faster than the CPU and to give identical output. Everything
-  else runs on the CPU. On the HTJ2K routing benchmark, `Auto` picks the GPU for 8
-  of 10 decode cases on CUDA and 3 of 10 on Metal
+  else runs on the CPU. On the cited HTJ2K routing benchmark, `Auto` picks the GPU
+  for all 8 decode cells on CUDA and 3 of 8 on Metal. The 2 encode cells stay on
+  the CPU for both backends
   ([results](docs/benchmark-evidence.md)).
 - **`Cuda`** or **`Metal`** forces the GPU. If the GPU path can't handle the
   image, you get an error. J2K never retries on the CPU: an explicit GPU
@@ -139,21 +140,33 @@ READMEs for which paths run on the GPU. Benchmark numbers are in
 ## Machine learning
 
 The optional [Rust-written PyTorch/NumPy extension](crates/j2k-python/README.md)
-exposes native pixel tensors, reusable batches, region/reduced decode, and
-selected wavelet bands. Its optional CUDA route decodes directly into
-PyTorch-owned device storage. Python is only needed by users of that extension.
+exposes native pixel tensors, batches that can mix 8-bit JPEG with JPEG 2000
+inputs, reusable prepared batches, region/reduced decode, and selected wavelet
+bands. Its optional CUDA route decodes directly into PyTorch-owned device
+storage, and its optional Metal route returns PyTorch `mps` tensors on Apple
+Silicon. Python is only needed by users of that extension.
 
 Rust callers can use `J2kDecoder::decode_wavelets` to obtain exact reversible
 5/3 coefficients or dequantized 9/7 coefficients, with tile/component metadata.
 The decoder skips entropy work for unrequested bands and omits inverse DWT.
 
-`j2k-ml` decodes batches of JPEG 2000 images into
-[Burn](https://burn.dev) tensors (`U8`, `U16`, or `I16`, NCHW or NHWC). Its
-CUDA and Metal modes decode on the GPU but copy the pixels through host memory
-before Burn uploads them. See [docs/j2k-ml.md](docs/j2k-ml.md).
+`j2k-ml` adapts JPEG, JPEG 2000, and HTJ2K batches to [Burn](https://burn.dev)
+tensors (`U8`, `U16`, or `I16`, NCHW or NHWC).
+`CpuBurnDecoder::decode_batch` accepts either codec family or mixed inputs and
+returns a common `BurnBatchDecode` with homogeneous tensor groups, source
+indices, and codec-tagged errors. A GPU Burn destination uploads the
+CPU-decoded pixels normally.
 
-`j2k-mpsgraph` hands decoded batches to Apple's MPSGraph without leaving the
-GPU. See [docs/j2k-mpsgraph.md](docs/j2k-mpsgraph.md).
+For JPEG 2000 and HTJ2K, `CudaDirectBurnDecoder` decodes directly into
+Burn-owned CUDA storage and waits for completion and status validation before
+returning the tensors. `CudaUploadBurnDecoder` and `MetalUploadBurnDecoder`
+decode on the GPU, copy decoded pixels to host memory, and upload them through
+Burn. See [docs/j2k-ml.md](docs/j2k-ml.md).
+
+`j2k-mpsgraph` is an experimental Apple Silicon adapter for JPEG 2000 and
+HTJ2K. It wraps completed Metal batches as `MPSGraphTensorData` or queues
+decode and graph execution on one Metal command queue, without decoded-pixel
+host readback. See [docs/j2k-mpsgraph.md](docs/j2k-mpsgraph.md).
 
 ## Which crate do I need?
 
@@ -165,6 +178,7 @@ Most code only needs `j2k`. Add a GPU crate if you want GPU decoding.
 | Decode with an NVIDIA GPU | `j2k` + `j2k-cuda` |
 | Decode with an Apple GPU | `j2k` + `j2k-metal` |
 | Read or write regular JPEG | `j2k-jpeg` |
+| Decode batches of JPEGs into dense RGB8 tensors | `j2k_jpeg::JpegBatchDecoder` |
 | Convert JPEG to HTJ2K | `j2k-transcode` (+ `j2k-transcode-cuda` or `j2k-transcode-metal`) |
 | JPEG on the GPU | `j2k-jpeg-cuda` or `j2k-jpeg-metal` |
 | Feed decoded images to Burn | `j2k-ml` |
@@ -186,7 +200,7 @@ published as ITU-T T.803). The CPU decoder passes all 160 test cases for the
 profiles J2K supports (90 for classic JPEG 2000 and 70 for HTJ2K) on macOS,
 Linux, and Windows. The CUDA and Metal builds pass the same 160; in those runs
 81 cases use the GPU for some stages and 79 run on the CPU. These results
-are for release 0.11.2; details and the exact profiles are in
+are for release 0.13.1; details and the exact profiles are in
 [docs/t803-conformance.md](docs/t803-conformance.md).
 
 **Safety.** The public API is safe Rust and is built to take untrusted files:
@@ -217,7 +231,7 @@ J2K does not depend on any of them.
 
 ## Status
 
-**Release status:** `0.12.0` is published and security-supported. See the
+**Release status:** `0.13.1` is published and security-supported. See the
 [changelog](CHANGELOG.md) for migration notes.
 
 `j2k`, `j2k-core`, `j2k-jpeg`, and `j2k-tilecodec` are the stable crates.
@@ -231,6 +245,9 @@ The minimum supported Rust version is 1.99.0.
 
 - [API docs on docs.rs](https://docs.rs/j2k)
 - [Project website](https://frames-sg.com/j2k/rust-jpeg2000-codec/)
+- [Rust JPEG codec](https://frames-sg.com/rust-jpeg-codec/)
+- [JPEG-to-HTJ2K transcoding](https://frames-sg.com/jpeg-to-htj2k-transcoding/)
+- [GPU image decoding for AI pipelines](https://frames-sg.com/gpu-image-decoding-ai/)
 - [docs/public-support.md](docs/public-support.md): every supported and
   unsupported feature of the format
 - [docs/architecture.md](docs/architecture.md): how the crates fit together

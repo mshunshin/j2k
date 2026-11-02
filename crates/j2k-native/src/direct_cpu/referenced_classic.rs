@@ -14,8 +14,9 @@ use super::allocation::prepare_referenced_classic_scratch;
 use super::referenced::{decoded_color_components, decoded_plane, payload_slice};
 use super::{
     apply_inverse_mct_region, checked_sub_band_job_output_range, execute_idwt_step,
-    prepare_sub_band_output, rounds_at_store, store_component, DirectComponentBandScratch,
-    DirectComponentPlane, J2kDirectCpuScratch, J2kDirectDecodedComponents, SubBandJobOutputRange,
+    prepare_sub_band_output, rounds_at_store, store_component, ClassicTaskWorkspace,
+    DirectComponentBandScratch, DirectComponentPlane, DirectWorkspaceBudget, J2kDirectCpuScratch,
+    J2kDirectDecodedComponents, SubBandJobOutputRange,
 };
 
 /// Execute retained per-tile Gray/RGB/RGBA classic JPEG 2000 geometry
@@ -76,7 +77,7 @@ fn execute_referenced_classic_plan_with_payloads<'scratch>(
         bail!(DecodingError::CodeBlockDecodeFailure);
     }
     validate_payload_ranges(encoded_input, payload_descriptors, payload_ranges)?;
-    prepare_referenced_classic_scratch(plan, scratch)?;
+    let workspace_budget = prepare_referenced_classic_scratch(plan, scratch)?;
     {
         let J2kDirectCpuScratch {
             component_band_sets,
@@ -85,9 +86,16 @@ fn execute_referenced_classic_plan_with_payloads<'scratch>(
             classic_workspace,
             ht_workspace: _,
             ht_task_workspaces: _,
-            parallel: _,
+            classic_task_workspaces,
+            parallel,
             staged_state: _,
         } = scratch;
+        let classic_workspace = &mut ClassicWorkspaces {
+            main: classic_workspace,
+            tasks: classic_task_workspaces,
+            parallel: *parallel,
+            budget: workspace_budget,
+        };
         let mut payloads =
             ClassicPayloadCursor::new(payload_descriptors, payload_ranges, encoded_input);
         let mut output_initialized = [false; 4];
@@ -171,7 +179,7 @@ fn execute_color_components_referenced(
     reconstructed_planes: &mut [DirectComponentPlane],
     payloads: &mut ClassicPayloadCursor<'_>,
     compressed_payload: &mut alloc::vec::Vec<u8>,
-    classic_workspace: &mut J2kCodeBlockDecodeWorkspace,
+    classic_workspace: &mut ClassicWorkspaces<'_>,
     output_initialized: &mut [bool; 4],
     destination: crate::J2kRect,
 ) -> Result<()> {
@@ -220,7 +228,7 @@ fn execute_component_plan_referenced(
     output: &mut DirectComponentPlane,
     payloads: &mut ClassicPayloadCursor<'_>,
     compressed_payload: &mut alloc::vec::Vec<u8>,
-    classic_workspace: &mut J2kCodeBlockDecodeWorkspace,
+    classic_workspace: &mut ClassicWorkspaces<'_>,
     output_initialized: &mut bool,
     round_irreversible_output: bool,
 ) -> Result<()> {
@@ -229,7 +237,7 @@ fn execute_component_plan_referenced(
     for step in &plan.steps {
         match step {
             J2kDirectGrayscaleStep::ClassicSubBand(sub_band) => {
-                execute_classic_sub_band_referenced(
+                execute_classic_sub_band_with_workspaces(
                     sub_band,
                     bands,
                     payloads,
@@ -242,7 +250,9 @@ fn execute_component_plan_referenced(
                     "referenced classic CPU plan encountered HT code blocks"
                 ));
             }
-            J2kDirectGrayscaleStep::Idwt(step) => execute_idwt_step(step, bands, false)?,
+            J2kDirectGrayscaleStep::Idwt(step) => {
+                execute_idwt_step(step, bands, classic_workspace.parallel)?;
+            }
             J2kDirectGrayscaleStep::Store(store) => {
                 store_component(
                     store,
@@ -262,6 +272,60 @@ fn execute_component_plan_referenced(
     }
 }
 
+/// Classic code-block workspaces for one referenced classic execution: the
+/// retained main workspace, plus one per extra Rayon worker when `parallel`
+/// is set.
+struct ClassicWorkspaces<'a> {
+    main: &'a mut J2kCodeBlockDecodeWorkspace,
+    #[cfg_attr(
+        not(feature = "parallel"),
+        expect(dead_code, reason = "extra workspaces serve parallel execution only")
+    )]
+    tasks: &'a mut [ClassicTaskWorkspace],
+    parallel: bool,
+    #[cfg_attr(
+        not(feature = "parallel"),
+        expect(
+            dead_code,
+            reason = "the workspace budget validates parallel dispatch owners"
+        )
+    )]
+    budget: DirectWorkspaceBudget,
+}
+
+fn execute_classic_sub_band_with_workspaces(
+    plan: &J2kOwnedSubBandPlan,
+    bands: &mut DirectComponentBandScratch,
+    payloads: &mut ClassicPayloadCursor<'_>,
+    compressed_payload: &mut alloc::vec::Vec<u8>,
+    workspaces: &mut ClassicWorkspaces<'_>,
+) -> Result<()> {
+    let (output, sub_band_width) =
+        prepare_sub_band_output(bands, plan.band_id, plan.rect, plan.width, plan.height)?;
+    #[cfg(feature = "parallel")]
+    if workspaces.parallel
+        && !workspaces.tasks.is_empty()
+        && decode_classic_sub_band_rows_parallel(
+            plan,
+            output,
+            sub_band_width,
+            payloads,
+            compressed_payload,
+            workspaces,
+        )?
+    {
+        return Ok(());
+    }
+    decode_classic_sub_band_jobs(
+        plan,
+        output,
+        sub_band_width,
+        payloads,
+        compressed_payload,
+        workspaces.main,
+    )
+}
+
 pub(super) fn execute_classic_sub_band_referenced(
     plan: &J2kOwnedSubBandPlan,
     bands: &mut DirectComponentBandScratch,
@@ -271,6 +335,24 @@ pub(super) fn execute_classic_sub_band_referenced(
 ) -> Result<()> {
     let (output, sub_band_width) =
         prepare_sub_band_output(bands, plan.band_id, plan.rect, plan.width, plan.height)?;
+    decode_classic_sub_band_jobs(
+        plan,
+        output,
+        sub_band_width,
+        payloads,
+        compressed_payload,
+        workspace,
+    )
+}
+
+fn decode_classic_sub_band_jobs(
+    plan: &J2kOwnedSubBandPlan,
+    output: &mut [f32],
+    sub_band_width: usize,
+    payloads: &mut ClassicPayloadCursor<'_>,
+    compressed_payload: &mut alloc::vec::Vec<u8>,
+    workspace: &mut J2kCodeBlockDecodeWorkspace,
+) -> Result<()> {
     for job in &plan.jobs {
         if !job.data.is_empty() {
             bail!(DecodingError::CodeBlockDecodeFailure);
@@ -312,6 +394,166 @@ pub(super) fn execute_classic_sub_band_referenced(
     Ok(())
 }
 
+#[cfg(feature = "parallel")]
+type ClassicRowJob<'p, 'i> =
+    super::referenced::rows::RowJob<'p, crate::J2kOwnedCodeBlockBatchJob, ClassicFragments<'i>>;
+
+/// One row task's classic state: its code-block workspace and the buffer it
+/// joins fragmented payloads into.
+#[cfg(feature = "parallel")]
+struct ClassicRowTask<'a> {
+    workspace: &'a mut J2kCodeBlockDecodeWorkspace,
+    payload: &'a mut alloc::vec::Vec<u8>,
+}
+
+/// Bytes owned together while a referenced classic sub-band is dispatched in
+/// parallel. Planning and execution share this helper so the private
+/// dispatch types cannot drift from their accounting.
+#[cfg(feature = "parallel")]
+pub(in crate::direct_cpu) fn parallel_classic_decode_transient_bytes(
+    entry_capacity: usize,
+    row_capacity: usize,
+    workspace_capacity: usize,
+) -> Result<usize> {
+    super::referenced::rows::row_dispatch_transient_bytes::<
+        crate::J2kOwnedCodeBlockBatchJob,
+        ClassicFragments<'_>,
+        ClassicRowTask<'_>,
+    >(entry_capacity, row_capacity, workspace_capacity)
+}
+
+/// Decode a classic sub-band's rows of code blocks in parallel, each writing
+/// its own rows of `output`. Each row task joins fragmented (multi-layer)
+/// payloads in its own buffer: the main task in `compressed_payload`, every
+/// extra one in its task workspace. Returns `false` without consuming
+/// payloads when the blocks do not tile the sub-band in rows; the serial path
+/// then decodes the sub-band. Every block decodes exactly as on the serial
+/// path, so the samples are identical.
+#[cfg(feature = "parallel")]
+fn decode_classic_sub_band_rows_parallel(
+    plan: &J2kOwnedSubBandPlan,
+    output: &mut [f32],
+    sub_band_width: usize,
+    payloads: &mut ClassicPayloadCursor<'_>,
+    compressed_payload: &mut alloc::vec::Vec<u8>,
+    workspaces: &mut ClassicWorkspaces<'_>,
+) -> Result<bool> {
+    use super::referenced::rows;
+
+    let encoded_input = payloads.encoded_input;
+    let checkpoint = payloads.position();
+    let Some(mut entries) = collect_classic_row_jobs(
+        plan,
+        output.len(),
+        sub_band_width,
+        payloads,
+        workspaces.budget,
+    )?
+    else {
+        payloads.rewind(checkpoint);
+        return Ok(false);
+    };
+    entries.sort_unstable_by_key(|entry| (entry.job.output_y, entry.job.output_x));
+    let entry_capacity = entries.capacity();
+    let Some(rows) = rows::carve_rows::<_, _, ClassicRowTask<'_>>(
+        &entries,
+        output,
+        sub_band_width,
+        entry_capacity,
+        workspaces.budget,
+    )?
+    else {
+        payloads.rewind(checkpoint);
+        return Ok(false);
+    };
+    let irreversible_midpoint = plan.irreversible_midpoint;
+    let main = ClassicRowTask {
+        workspace: &mut *workspaces.main,
+        payload: compressed_payload,
+    };
+    let tasks = workspaces.tasks.iter_mut().map(|task| ClassicRowTask {
+        workspace: &mut task.decode,
+        payload: &mut task.payload,
+    });
+    rows::decode_rows(
+        rows,
+        entry_capacity,
+        main,
+        tasks,
+        workspaces.budget,
+        |entry, output, task| {
+            let ClassicRowTask { workspace, payload } = task;
+            let job = entry.job;
+            let code_block = J2kCodeBlockDecodeJob {
+                data: entry.data.join(encoded_input, payload)?,
+                segments: &job.segments,
+                width: job.width,
+                height: job.height,
+                output_stride: job.output_stride,
+                missing_bit_planes: job.missing_bit_planes,
+                number_of_coding_passes: job.number_of_coding_passes,
+                total_bitplanes: job.total_bitplanes,
+                roi_shift: job.roi_shift,
+                sub_band_type: job.sub_band_type,
+                style: job.style,
+                strict: job.strict,
+                dequantization_step: job.dequantization_step,
+            };
+            if irreversible_midpoint {
+                decode_j2k_code_block_scalar_with_workspace_midpoint(code_block, output, workspace)
+            } else {
+                decode_j2k_code_block_scalar_with_workspace(code_block, output, workspace)
+            }
+        },
+    )?;
+    Ok(true)
+}
+
+/// Validate every job's output range and borrow its payload fragments, or
+/// `None` when a job's output stride is not the sub-band width.
+#[cfg(feature = "parallel")]
+fn collect_classic_row_jobs<'p, 'i>(
+    plan: &'p J2kOwnedSubBandPlan,
+    output_len: usize,
+    sub_band_width: usize,
+    payloads: &mut ClassicPayloadCursor<'i>,
+    budget: DirectWorkspaceBudget,
+) -> Result<Option<alloc::vec::Vec<ClassicRowJob<'p, 'i>>>> {
+    let mut entries = alloc::vec::Vec::new();
+    try_reserve_decode_elements(&mut entries, plan.jobs.len())?;
+    budget.validate_workspace(parallel_classic_decode_transient_bytes(
+        entries.capacity(),
+        0,
+        0,
+    )?)?;
+    for job in &plan.jobs {
+        if !job.data.is_empty() {
+            bail!(DecodingError::CodeBlockDecodeFailure);
+        }
+        let range = checked_sub_band_job_output_range(&SubBandJobOutputRange {
+            output_x: job.output_x,
+            output_y: job.output_y,
+            output_stride: job.output_stride,
+            width: job.width,
+            height: job.height,
+            sub_band_width,
+            plan_width: plan.width,
+            plan_height: plan.height,
+            output_len,
+        })?;
+        if job.output_stride != sub_band_width {
+            return Ok(None);
+        }
+        entries.push(ClassicRowJob {
+            job,
+            data: payloads.next_fragments()?,
+            start: range.start,
+            end: range.end,
+        });
+    }
+    Ok(Some(entries))
+}
+
 pub(super) fn validate_payload_ranges(
     encoded_input: &[u8],
     payloads: &[crate::J2kClassicCodeBlockPayload],
@@ -346,6 +588,45 @@ pub(super) fn validate_payload_ranges(
     Ok(())
 }
 
+/// One code block's compressed payload as ordered input fragments; a
+/// multi-layer codestream splits it over one fragment per contributing
+/// layer.
+#[derive(Clone, Copy)]
+struct ClassicFragments<'plan> {
+    ranges: &'plan [crate::J2kCodestreamRange],
+    combined_length: usize,
+}
+
+impl<'plan> ClassicFragments<'plan> {
+    /// The payload bytes: the input slice itself for one fragment, else the
+    /// fragments joined in `combined`.
+    fn join<'scratch>(
+        self,
+        encoded_input: &'plan [u8],
+        combined: &'scratch mut alloc::vec::Vec<u8>,
+    ) -> Result<&'scratch [u8]>
+    where
+        'plan: 'scratch,
+    {
+        if let [range] = self.ranges {
+            if range.length != self.combined_length {
+                bail!(DecodingError::CodeBlockDecodeFailure);
+            }
+            return payload_slice(encoded_input, *range);
+        }
+
+        combined.clear();
+        try_reserve_decode_elements(combined, self.combined_length)?;
+        for range in self.ranges {
+            combined.extend_from_slice(payload_slice(encoded_input, *range)?);
+        }
+        if combined.len() != self.combined_length {
+            bail!(DecodingError::CodeBlockDecodeFailure);
+        }
+        Ok(combined)
+    }
+}
+
 pub(super) struct ClassicPayloadCursor<'plan> {
     encoded_input: &'plan [u8],
     payloads: &'plan [crate::J2kClassicCodeBlockPayload],
@@ -368,9 +649,17 @@ impl<'plan> ClassicPayloadCursor<'plan> {
     }
 
     fn next_data<'scratch>(
-        &'scratch mut self,
+        &mut self,
         combined: &'scratch mut alloc::vec::Vec<u8>,
-    ) -> Result<&'scratch [u8]> {
+    ) -> Result<&'scratch [u8]>
+    where
+        'plan: 'scratch,
+    {
+        self.next_fragments()?.join(self.encoded_input, combined)
+    }
+
+    /// The next payload's input fragments.
+    fn next_fragments(&mut self) -> Result<ClassicFragments<'plan>> {
         let payload = self
             .payloads
             .get(self.next)
@@ -382,27 +671,25 @@ impl<'plan> ClassicPayloadCursor<'plan> {
         let end_range = payload
             .end_range()
             .ok_or(DecodingError::CodeBlockDecodeFailure)?;
-        let fragments = self
+        let ranges = self
             .ranges
             .get(payload.first_range..end_range)
             .ok_or(DecodingError::CodeBlockDecodeFailure)?;
+        Ok(ClassicFragments {
+            ranges,
+            combined_length: payload.combined_length,
+        })
+    }
 
-        if let [range] = fragments {
-            if range.length != payload.combined_length {
-                bail!(DecodingError::CodeBlockDecodeFailure);
-            }
-            return payload_slice(self.encoded_input, *range);
-        }
+    /// Position for [`Self::rewind`] when a parallel attempt falls back.
+    #[cfg(feature = "parallel")]
+    const fn position(&self) -> usize {
+        self.next
+    }
 
-        combined.clear();
-        try_reserve_decode_elements(combined, payload.combined_length)?;
-        for range in fragments {
-            combined.extend_from_slice(payload_slice(self.encoded_input, *range)?);
-        }
-        if combined.len() != payload.combined_length {
-            bail!(DecodingError::CodeBlockDecodeFailure);
-        }
-        Ok(combined)
+    #[cfg(feature = "parallel")]
+    fn rewind(&mut self, position: usize) {
+        self.next = position;
     }
 
     pub(super) fn ensure_exhausted(&self) -> Result<()> {
@@ -486,3 +773,6 @@ pub(super) fn decoded_components<'scratch>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

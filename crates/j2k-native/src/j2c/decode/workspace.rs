@@ -4,29 +4,72 @@
 
 use super::{DecompositionStorage, OutputRegion, TileDecodeContext};
 #[cfg(feature = "parallel")]
-use crate::HtCodeBlockDecodeWorkspace;
+use crate::{HtCodeBlockDecodeWorkspace, J2kCodeBlockDecodeWorkspace};
 #[cfg(feature = "parallel")]
 use alloc::vec::Vec;
 
+/// A worker's slot in a retained bank of code-block decode workspaces.
 #[cfg(feature = "parallel")]
-pub(in crate::j2c::decode) struct HtTaskWorkspace {
-    pub(in crate::j2c::decode) workspace: HtCodeBlockDecodeWorkspace,
+pub(in crate::j2c::decode) struct TaskWorkspace<W> {
+    pub(in crate::j2c::decode) workspace: W,
     // Componentwise maxima make orthogonal edge shapes reusable without growth.
     pub(in crate::j2c::decode) prepared_width: u32,
     pub(in crate::j2c::decode) prepared_height: u32,
 }
 
 #[cfg(feature = "parallel")]
-pub(in crate::j2c::decode) fn ht_task_workspace_bytes(
-    slots: &Vec<HtTaskWorkspace>,
+pub(in crate::j2c::decode) type HtTaskWorkspace = TaskWorkspace<HtCodeBlockDecodeWorkspace>;
+
+/// A code-block decode workspace that a retained bank keeps per worker.
+#[cfg(feature = "parallel")]
+pub(in crate::j2c::decode) trait TaskScratch: Default + Send {
+    /// The bytes budgeted for blocks of up to `width` x `height`.
+    fn planned_bytes(width: u32, height: u32) -> crate::Result<usize>;
+    fn prepare_for(&mut self, width: u32, height: u32) -> crate::Result<()>;
+    fn owned_bytes(&self) -> crate::Result<usize>;
+}
+
+#[cfg(feature = "parallel")]
+impl TaskScratch for HtCodeBlockDecodeWorkspace {
+    fn planned_bytes(width: u32, height: u32) -> crate::Result<usize> {
+        crate::j2c::ht_block_decode::ht_decode_workspace_bytes(width, height)
+    }
+
+    fn prepare_for(&mut self, width: u32, height: u32) -> crate::Result<()> {
+        self.reserve(width, height)
+    }
+
+    fn owned_bytes(&self) -> crate::Result<usize> {
+        self.allocated_bytes()
+    }
+}
+
+#[cfg(feature = "parallel")]
+impl TaskScratch for J2kCodeBlockDecodeWorkspace {
+    fn planned_bytes(width: u32, height: u32) -> crate::Result<usize> {
+        crate::j2c::bitplane::classic_decode_workspace_bytes(width, height)
+    }
+
+    fn prepare_for(&mut self, width: u32, height: u32) -> crate::Result<()> {
+        self.prepare(width, height)
+    }
+
+    fn owned_bytes(&self) -> crate::Result<usize> {
+        self.allocated_bytes()
+    }
+}
+
+#[cfg(feature = "parallel")]
+pub(in crate::j2c::decode) fn task_workspace_bytes<W: TaskScratch>(
+    slots: &Vec<TaskWorkspace<W>>,
 ) -> crate::Result<usize> {
     let mut bytes = slots
         .capacity()
-        .checked_mul(core::mem::size_of::<HtTaskWorkspace>())
+        .checked_mul(core::mem::size_of::<TaskWorkspace<W>>())
         .ok_or(crate::ValidationError::ImageTooLarge)?;
     for slot in slots {
         bytes = bytes
-            .checked_add(slot.workspace.allocated_bytes()?)
+            .checked_add(slot.workspace.owned_bytes()?)
             .ok_or(crate::ValidationError::ImageTooLarge)?;
     }
     Ok(bytes)
@@ -35,7 +78,7 @@ pub(in crate::j2c::decode) fn ht_task_workspace_bytes(
 /// CPU parallelism policy for native JPEG 2000 decode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CpuDecodeParallelism {
-    /// Allow a single tile decode to use internal code-block parallelism.
+    /// Allow concurrent tile decode and internal code-block parallelism.
     #[default]
     Auto,
     /// Keep code-block decode serial for callers that already parallelize tiles.
@@ -139,6 +182,11 @@ pub struct DecoderContext<'a> {
     #[cfg(test)]
     pub(crate) direct_plan_code_blocks: usize,
     pub(super) cpu_decode_parallelism: CpuDecodeParallelism,
+    /// Whether region decodes may use the row-streamed region IDWT. On by
+    /// default; it applies only to region decodes without a hook, of images
+    /// without palette, component-definition or sYCC/CIELab post-processing.
+    /// Tests turn it off to compare against the whole-window IDWT.
+    pub(crate) line_region_idwt: bool,
     workspace_stats: DecoderWorkspaceStats,
 }
 
@@ -150,6 +198,7 @@ impl Default for DecoderContext<'_> {
             #[cfg(test)]
             direct_plan_code_blocks: 0,
             cpu_decode_parallelism: CpuDecodeParallelism::Auto,
+            line_region_idwt: true,
             workspace_stats: DecoderWorkspaceStats::default(),
         }
     }
@@ -158,13 +207,15 @@ impl Default for DecoderContext<'_> {
 impl DecoderContext<'_> {
     /// Create a borrowing decoder context from a lifetime-free reusable workspace.
     #[must_use]
-    pub fn from_workspace(workspace: DecoderWorkspace) -> Self {
+    pub fn from_workspace(mut workspace: DecoderWorkspace) -> Self {
+        workspace.tile_decode_context.shared_pool = false;
         Self {
             tile_decode_context: workspace.tile_decode_context,
             storage: DecompositionStorage::default(),
             #[cfg(test)]
             direct_plan_code_blocks: 0,
             cpu_decode_parallelism: workspace.cpu_decode_parallelism,
+            line_region_idwt: true,
             workspace_stats: workspace.stats,
         }
     }
@@ -173,6 +224,7 @@ impl DecoderContext<'_> {
     #[must_use]
     pub fn into_workspace(mut self) -> DecoderWorkspace {
         self.storage.release_all_allocations();
+        self.tile_decode_context.shared_pool = false;
         DecoderWorkspace {
             tile_decode_context: self.tile_decode_context,
             cpu_decode_parallelism: self.cpu_decode_parallelism,
@@ -227,6 +279,17 @@ impl DecoderContext<'_> {
         self.workspace_stats.retained_idwt_bytes = retained_idwt_bytes;
     }
 
+    #[cfg(feature = "std")]
+    pub(crate) fn retained_decode_bytes(&self) -> crate::Result<usize> {
+        let channels = self.tile_decode_context.retained_channel_bytes()?;
+        let scratch = self.tile_decode_context.retained_scratch_bytes()?;
+        self.storage
+            .retained_capacity_bytes()?
+            .checked_add(channels)
+            .and_then(|bytes| bytes.checked_add(scratch))
+            .ok_or(crate::ValidationError::ImageTooLarge.into())
+    }
+
     pub(crate) fn release_reusable_allocations(&mut self) {
         self.tile_decode_context.release_all_allocations();
         self.storage.release_all_allocations();
@@ -240,6 +303,10 @@ impl DecoderContext<'_> {
         self.tile_decode_context.round_irreversible_output = enabled;
     }
 
+    pub(crate) fn set_defer_mct(&mut self, enabled: bool) {
+        self.tile_decode_context.defer_mct = enabled;
+    }
+
     /// Return the native CPU decode parallelism policy.
     #[must_use]
     pub fn cpu_decode_parallelism(&self) -> CpuDecodeParallelism {
@@ -249,5 +316,30 @@ impl DecoderContext<'_> {
     /// Set the native CPU decode parallelism policy.
     pub fn set_cpu_decode_parallelism(&mut self, parallelism: CpuDecodeParallelism) {
         self.cpu_decode_parallelism = parallelism;
+    }
+
+    /// Mark this context's decodes as sharing their worker pool with other
+    /// images that decode on it at the same time, as the images of a batch do
+    /// that plans as many at once as its pool has threads.
+    /// Pool threads with no band of one image to decode take another image's
+    /// bands, so on a pool of fewer than 12 threads each image's band rings
+    /// hold two bands at every level and its bands stay whole; larger pools
+    /// keep the usual rings. Off by default; recovering the context's
+    /// workspace turns it off.
+    #[doc(hidden)]
+    pub fn set_shared_pool(&mut self, shared: bool) {
+        self.tile_decode_context.shared_pool = shared;
+    }
+
+    /// Turn the row-streamed region IDWT on or off; it is on by default and
+    /// lowers region-decode memory without changing output.
+    #[cfg(test)]
+    pub(crate) fn set_line_region_idwt(&mut self, enabled: bool) {
+        self.line_region_idwt = enabled;
+    }
+
+    /// Allow the current call to use the row-streamed region IDWT.
+    pub(crate) fn permit_line_region_idwt(&mut self, permitted: bool) {
+        self.tile_decode_context.line_region_idwt_permitted = permitted;
     }
 }

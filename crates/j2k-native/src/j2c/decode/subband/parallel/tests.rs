@@ -9,6 +9,7 @@ use super::{
 use crate::error::{DecodeError, ValidationError};
 use crate::j2c::build::{SubBand, SubBandType};
 use crate::j2c::decode::subband::pending::PendingHtBlock;
+use crate::j2c::decode::subband::BlockPlacement;
 use crate::j2c::decode::DecodeAllocationBudget;
 use crate::j2c::ht_block_decode::CombinedCodeBlockData;
 use crate::j2c::rect::IntRect;
@@ -26,8 +27,7 @@ fn ht_pending(dimensions: &[(u32, u32)]) -> Vec<PendingHtBlock> {
                 cleanup_length: 0,
                 refinement_length: 0,
             },
-            output_x: 0,
-            output_y: 0,
+            placement: BlockPlacement::whole(0, 0, width, height),
             width,
             height,
             missing_bit_planes: 0,
@@ -114,7 +114,7 @@ fn ht_capacity_retry_uses_actual_capacity_and_an_unpoisoned_budget() {
         assert_eq!(growths, 1);
         assert_eq!(workspaces.len(), 1);
         assert_eq!(
-            super::ht_task_workspace_bytes(&workspaces).unwrap(),
+            super::task_workspace_bytes(&workspaces).unwrap(),
             structural
         );
         assert_eq!(budget.live_bytes(), structural);
@@ -196,14 +196,14 @@ fn ht_mixed_shapes_grow_componentwise_then_reuse_warm_reservations() {
             )
             .unwrap();
             assert_eq!(growths != 0, expect_growth);
-            let bytes_before_decode = super::ht_task_workspace_bytes(&workspaces).unwrap();
+            let bytes_before_decode = super::task_workspace_bytes(&workspaces).unwrap();
             for slot in &mut workspaces {
                 for &(width, height) in &dimensions {
                     slot.workspace.prepare(width, height).unwrap();
                 }
             }
             assert_eq!(
-                super::ht_task_workspace_bytes(&workspaces).unwrap(),
+                super::task_workspace_bytes(&workspaces).unwrap(),
                 bytes_before_decode
             );
         }
@@ -277,10 +277,7 @@ fn ht_failed_growth_rolls_back_then_retry_evicts_and_rebuilds_exactly() {
         assert!(workspaces
             .iter()
             .all(|slot| { (slot.prepared_width, slot.prepared_height) == (16, 64) }));
-        assert_eq!(
-            super::ht_task_workspace_bytes(&workspaces).unwrap(),
-            fresh_cap
-        );
+        assert_eq!(super::task_workspace_bytes(&workspaces).unwrap(), fresh_cap);
         assert_eq!(structural, fresh_cap);
         assert_eq!(retry_budget.live_bytes(), fresh_cap);
     });
@@ -326,7 +323,7 @@ fn ht_entropy_error_leaves_workspace_bank_reusable_for_valid_blocks() {
             malformed_result.is_err(),
             "truncated cleanup payload must fail after workspace activation"
         );
-        let retained = super::ht_task_workspace_bytes(&workspaces).unwrap();
+        let retained = super::task_workspace_bytes(&workspaces).unwrap();
         let retained_coefficients = coefficient_slab.capacity() * size_of::<f32>();
         assert_eq!(retained + retained_coefficients, structural);
         let retained_initialized_coefficients = coefficient_slab.len();
@@ -349,10 +346,7 @@ fn ht_entropy_error_leaves_workspace_bank_reusable_for_valid_blocks() {
         .expect("zero-pass blocks decode after the entropy error");
 
         assert_eq!(workspace_growths, 0);
-        assert_eq!(
-            super::ht_task_workspace_bytes(&workspaces).unwrap(),
-            retained
-        );
+        assert_eq!(super::task_workspace_bytes(&workspaces).unwrap(), retained);
         assert!(decoded
             .iter()
             .all(|block| block.coefficients.iter().all(|&value| value == 0.0)));
@@ -374,7 +368,12 @@ fn coefficient_total_rejects_overflow_before_output_allocation() {
         storage_rect: IntRect::from_xywh(0, 0, u32::MAX, u32::MAX),
     };
     let error = validate_pending_blocks(
-        [(0, 0, u32::MAX, u32::MAX), (0, 0, u32::MAX, u32::MAX)].into_iter(),
+        [(
+            BlockPlacement::whole(0, 0, u32::MAX, u32::MAX),
+            u32::MAX,
+            u32::MAX,
+        ); 2]
+            .into_iter(),
         &sub_band,
     )
     .expect_err("aggregate coefficient count must reject overflow");
@@ -387,7 +386,7 @@ fn coefficient_total_rejects_overflow_before_output_allocation() {
 #[test]
 fn descriptor_preflight_rejects_a_late_invalid_block_before_touching_retained_slab() {
     let mut pending = ht_pending(&[(2, 2), (2, 2)]);
-    pending[1].output_x = 4;
+    pending[1].placement.target_x = 4;
     let sub_band = test_sub_band(5, 3);
     let mut coefficients = vec![7.0; 16];
     let retained_capacity = coefficients.capacity();
@@ -454,14 +453,9 @@ fn descriptor_reservation_releases_an_oversized_retained_slab_under_a_tight_cap(
         &mut decoded,
         &mut coefficients,
         pending.len(),
-        pending.iter().map(|pending| {
-            (
-                pending.output_x,
-                pending.output_y,
-                pending.width,
-                pending.height,
-            )
-        }),
+        pending
+            .iter()
+            .map(|pending| (pending.placement, pending.width, pending.height)),
     )
     .unwrap();
 
@@ -537,8 +531,7 @@ fn classic_workspace_cap_can_release_an_oversized_coefficient_slab() {
         .map(|index| super::PendingClassicBlock {
             combined_data: Vec::new(),
             segments: Vec::new(),
-            output_x: index * 32,
-            output_y: 0,
+            placement: BlockPlacement::whole(index * 32, 0, 32, 32),
             width: 32,
             height: 32,
             missing_bit_planes: 0,
@@ -546,7 +539,7 @@ fn classic_workspace_cap_can_release_an_oversized_coefficient_slab() {
         })
         .collect::<Vec<_>>();
     let sub_band = test_sub_band(128, 32);
-    let parameters = super::ClassicParallelParameters {
+    let parameters = super::ClassicJobParameters {
         sub_band_type: crate::J2kSubBandType::LowLow,
         style: crate::J2kCodeBlockStyle {
             selective_arithmetic_coding_bypass: false,
@@ -600,4 +593,56 @@ fn classic_workspace_cap_can_release_an_oversized_coefficient_slab() {
         .iter()
         .all(|block| block.coefficients.iter().all(|&v| v == 0.0)));
     assert!(budget.live_bytes() <= cap);
+}
+
+#[test]
+fn classic_mixed_blocks_fit_a_worker_sized_workspace_budget() {
+    for (threads, count) in [(1, 32), (2, 32), (6, 3), (6, 0)] {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let dimensions = [(64, 16), (16, 64)];
+            let pending: Vec<_> = (0..count)
+                .map(|index| {
+                    let (width, height) = dimensions[index % 2];
+                    super::PendingClassicBlock {
+                        combined_data: Vec::new(),
+                        segments: Vec::new(),
+                        placement: BlockPlacement::whole(0, 0, width, height),
+                        width,
+                        height,
+                        missing_bit_planes: 0,
+                        number_of_coding_passes: 0,
+                    }
+                })
+                .collect();
+            let mut reference = crate::J2kCodeBlockDecodeWorkspace::default();
+            reference.prepare(64, 64).unwrap();
+            let cap = count.min(threads)
+                * (reference.allocated_bytes().unwrap()
+                    + size_of::<crate::J2kCodeBlockDecodeWorkspace>());
+            let mut budget = DecodeAllocationBudget::from_live_bytes_with_cap(0, cap).unwrap();
+            let mut workspaces = super::try_preallocate_classic_workspaces(&pending, &mut budget)
+                .expect("all blocks fit using a worker-sized bank");
+            let mut actual =
+                workspaces.capacity() * size_of::<crate::J2kCodeBlockDecodeWorkspace>();
+            for (index, workspace) in workspaces.iter_mut().enumerate() {
+                let before = workspace.allocated_bytes().unwrap();
+                if count > threads {
+                    for (width, height) in dimensions {
+                        workspace.prepare(width, height).unwrap();
+                    }
+                } else {
+                    let block = &pending[index];
+                    workspace.prepare(block.width, block.height).unwrap();
+                }
+                assert_eq!(workspace.allocated_bytes().unwrap(), before);
+                actual += before;
+            }
+            assert_eq!(budget.live_bytes(), actual);
+            assert!(actual <= cap);
+        });
+    }
 }

@@ -9,7 +9,7 @@ use super::{
     idwt_required_input_windows, idwt_required_output_margin, DirectBandSlice, DirectTier1Mode,
     Error, J2kDirectBandId, J2kDirectIdwtStep, J2kDirectStoreStep, J2kRequiredBandRegion,
     PreparedDirectGrayscalePlan, PreparedDirectGrayscaleStep, PreparedDirectIdwt,
-    PreparedHtSubBand, Rect,
+    PreparedHtPayloadSource, PreparedHtSubBand, Rect,
 };
 
 #[cfg(target_os = "macos")]
@@ -133,6 +133,17 @@ fn allocate_roi_band_maps(steps: &[PreparedDirectGrayscaleStep]) -> Result<RoiBa
     })
 }
 
+/// Narrows a plan whose stores already cover only its output region, such as
+/// a referenced region plan, so its coefficient and IDWT windows hold only
+/// what those stores read instead of whole sub-bands.
+#[cfg(target_os = "macos")]
+pub(crate) fn prune_prepared_direct_grayscale_plan_to_stores(
+    plan: &mut PreparedDirectGrayscalePlan,
+) -> Result<(), Error> {
+    plan.clear_cpu_tier1_cache()?;
+    prune_prepared_direct_grayscale_plan_to_store_windows(plan)
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn prune_prepared_direct_grayscale_plan_to_store_windows(
     plan: &mut PreparedDirectGrayscalePlan,
@@ -186,23 +197,46 @@ pub(super) fn prune_prepared_direct_grayscale_plan_to_store_windows(
         match step {
             PreparedDirectGrayscaleStep::ClassicSubBand(sub_band) => {
                 let before = sub_band.jobs.len();
-                retain_classic_jobs_for_required_region(
-                    &mut sub_band.jobs,
-                    required_region(&required, sub_band.band_id),
-                );
-                if sub_band.jobs.len() != before {
-                    sub_band.zero_fill = true;
+                let region = required_region(&required, sub_band.band_id);
+                retain_classic_jobs_for_required_region(&mut sub_band.jobs, region);
+                let (layout, stride_origin) =
+                    (sub_band.window(), (sub_band.origin, sub_band.width));
+                let covered = if region.is_some_and(|r| r != layout) {
+                    let size = (&mut sub_band.width, &mut sub_band.height);
+                    let jobs = &mut sub_band.jobs;
+                    store_over_job_bounds(jobs, region, &mut sub_band.origin, size)?
+                } else {
+                    false
+                };
+                let jobs_changed = sub_band.jobs.len() != before;
+                if jobs_changed || sub_band.window() != layout {
+                    let empty = |job: &J2kClassicCleanupBatchJob| {
+                        job.coded_len == 0 || job.number_of_coding_passes == 0
+                    };
+                    sub_band.zero_fill = !covered || sub_band.jobs.iter().any(empty);
+                }
+                // Moving the origin or the stride moves the jobs' outputs.
+                let moved = (sub_band.origin, sub_band.width) != stride_origin;
+                if jobs_changed || (moved && !sub_band.jobs.is_empty()) {
                     sub_band.tier1_inputs.reset();
                 }
             }
             PreparedDirectGrayscaleStep::HtSubBand(sub_band) => {
                 let before = sub_band.jobs.len();
-                retain_ht_jobs_for_required_region(
-                    &mut sub_band.jobs,
-                    required_region(&required, sub_band.band_id),
-                );
+                let layout = sub_band.window();
+                let region = required_region(&required, sub_band.band_id);
+                retain_ht_sub_band_jobs_for_required_region(sub_band, region)?;
+                if region.is_some_and(|r| r != sub_band.window()) {
+                    let size = (&mut sub_band.width, &mut sub_band.height);
+                    store_over_job_bounds(&mut sub_band.jobs, region, &mut sub_band.origin, size)?;
+                }
                 if sub_band.jobs.len() != before {
                     compact_ht_sub_band_coded_data(sub_band, plan.tier1_prepare_mode)?;
+                }
+                if sub_band.jobs.len() != before || sub_band.window() != layout {
+                    // The runtime keys prepared HT inputs by owner and vector
+                    // identity, so rebasing in place needs a fresh identity.
+                    sub_band.execution_owner = std::sync::Arc::new(super::PreparedHtExecutionOwner);
                 }
             }
             PreparedDirectGrayscaleStep::Idwt(_) | PreparedDirectGrayscaleStep::Store(_) => {}
@@ -229,11 +263,29 @@ pub(super) fn apply_prepared_direct_idwt_output_windows(
         }
     }
 
-    for step in &mut plan.steps {
-        let PreparedDirectGrayscaleStep::Store(store) = step else {
-            continue;
+    for step_idx in 0..plan.steps.len() {
+        let mut store = match &plan.steps[step_idx] {
+            PreparedDirectGrayscaleStep::Store(store) => *store,
+            _ => continue,
         };
-        let Some(window) = required_region(windows, store.input_band_id) else {
+        // With no wavelet levels the store reads a coefficient sub-band
+        // directly, so its input window is absent from the IDWT output map.
+        let window = required_region(windows, store.input_band_id).or_else(|| {
+            plan.steps.iter().find_map(|step| match step {
+                PreparedDirectGrayscaleStep::ClassicSubBand(band)
+                    if band.band_id == store.input_band_id =>
+                {
+                    Some(band.window())
+                }
+                PreparedDirectGrayscaleStep::HtSubBand(band)
+                    if band.band_id == store.input_band_id =>
+                {
+                    Some(band.window())
+                }
+                _ => None,
+            })
+        });
+        let Some(window) = window else {
             continue;
         };
 
@@ -257,6 +309,7 @@ pub(super) fn apply_prepared_direct_idwt_output_windows(
             x1: store.input_rect.x0.saturating_add(window.x1),
             y1: store.input_rect.y0.saturating_add(window.y1),
         };
+        plan.steps[step_idx] = PreparedDirectGrayscaleStep::Store(store);
     }
 
     Ok(())
@@ -434,12 +487,17 @@ pub(super) trait RequiredRegionJob {
     fn output_stride(&self) -> u32;
     fn width(&self) -> u32;
     fn height(&self) -> u32;
+    fn set_output(&mut self, offset: u32, stride: u32);
 }
 
 #[cfg(target_os = "macos")]
 impl RequiredRegionJob for J2kClassicCleanupBatchJob {
     fn output_offset(&self) -> u32 {
         self.output_offset
+    }
+
+    fn set_output(&mut self, offset: u32, stride: u32) {
+        (self.output_offset, self.output_stride) = (offset, stride);
     }
 
     fn output_stride(&self) -> u32 {
@@ -459,6 +517,10 @@ impl RequiredRegionJob for J2kClassicCleanupBatchJob {
 impl RequiredRegionJob for J2kHtCleanupBatchJob {
     fn output_offset(&self) -> u32 {
         self.output_offset
+    }
+
+    fn set_output(&mut self, offset: u32, stride: u32) {
+        (self.output_offset, self.output_stride) = (offset, stride);
     }
 
     fn output_stride(&self) -> u32 {
@@ -483,11 +545,75 @@ pub(super) fn retain_jobs_for_required_region<J: RequiredRegionJob>(
         jobs.clear();
         return;
     };
-    jobs.retain(|job| {
-        let output_x = job.output_offset() % job.output_stride();
-        let output_y = job.output_offset() / job.output_stride();
-        required.intersects(output_x, output_y, job.width(), job.height())
-    });
+    jobs.retain(|job| job_intersects_required_region(job, required));
+}
+
+fn job_intersects_required_region<J: RequiredRegionJob>(
+    job: &J,
+    required: BandRequiredRegion,
+) -> bool {
+    let output_x = job.output_offset() % job.output_stride();
+    let output_y = job.output_offset() / job.output_stride();
+    required.intersects(output_x, output_y, job.width(), job.height())
+}
+
+/// Stores a cropped sub-band's coefficients over the bounding box of its
+/// remaining code blocks and its `required` region instead of over the whole
+/// sub-band: moves `origin` and the stored size to the box and rebases the
+/// jobs' outputs to it. Returns whether the jobs cover the box.
+#[cfg(target_os = "macos")]
+pub(super) fn store_over_job_bounds<J: RequiredRegionJob>(
+    jobs: &mut [J],
+    required: Option<BandRequiredRegion>,
+    origin: &mut (u32, u32),
+    (width, height): (&mut u32, &mut u32),
+) -> Result<bool, Error> {
+    let overflow = || Error::MetalKernel {
+        message: "J2K MetalDirect cropped sub-band layout overflows u32".to_string(),
+    };
+    let block = |job: &J| -> Result<Option<BandRequiredRegion>, Error> {
+        let stride = job.output_stride();
+        if stride == 0 {
+            return Err(overflow());
+        }
+        let x0 = origin
+            .0
+            .checked_add(job.output_offset() % stride)
+            .ok_or_else(overflow)?;
+        let y0 = origin
+            .1
+            .checked_add(job.output_offset() / stride)
+            .ok_or_else(overflow)?;
+        let x1 = x0.checked_add(job.width()).ok_or_else(overflow)?;
+        let y1 = y0.checked_add(job.height()).ok_or_else(overflow)?;
+        Ok(BandRequiredRegion::new(x0, y0, x1, y1))
+    };
+    let mut bounds = required;
+    for job in jobs.iter() {
+        if let Some(rect) = block(job)? {
+            bounds = Some(bounds.map_or(rect, |current| current.union(rect)));
+        }
+    }
+    let Some(bounds) = bounds else {
+        return Ok(false);
+    };
+    let mut covered = 0u64;
+    for job in jobs.iter_mut() {
+        let Some(rect) = block(&*job)? else {
+            job.set_output(0, bounds.width());
+            continue;
+        };
+        let offset = (rect.y0 - bounds.y0)
+            .checked_mul(bounds.width())
+            .and_then(|row| row.checked_add(rect.x0 - bounds.x0))
+            .ok_or_else(overflow)?;
+        job.set_output(offset, bounds.width());
+        covered = covered
+            .checked_add(u64::from(rect.width()) * u64::from(rect.height()))
+            .ok_or_else(overflow)?;
+    }
+    (*origin, *width, *height) = ((bounds.x0, bounds.y0), bounds.width(), bounds.height());
+    Ok(covered == u64::from(bounds.width()) * u64::from(bounds.height()))
 }
 
 #[cfg(target_os = "macos")]
@@ -506,19 +632,63 @@ pub(super) fn retain_ht_jobs_for_required_region(
     retain_jobs_for_required_region(jobs, required);
 }
 
+/// Retains the sub-band's jobs that intersect `required`, and with referenced
+/// payloads the payload range of each retained job, which shares its index.
+#[cfg(target_os = "macos")]
+fn retain_ht_sub_band_jobs_for_required_region(
+    sub_band: &mut PreparedHtSubBand,
+    required: Option<BandRequiredRegion>,
+) -> Result<(), Error> {
+    let PreparedHtPayloadSource::Referenced { ranges, .. } = &mut sub_band.payload_source else {
+        retain_ht_jobs_for_required_region(&mut sub_band.jobs, required);
+        return Ok(());
+    };
+    if ranges.len() != sub_band.jobs.len() {
+        return Err(Error::MetalStateInvariant {
+            state: "HTJ2K MetalDirect cropped referenced plan",
+            reason: "payload range count does not match the sub-band's jobs",
+        });
+    }
+    let Some(required) = required else {
+        sub_band.jobs.clear();
+        ranges.clear();
+        return Ok(());
+    };
+    let mut kept = 0;
+    for index in 0..sub_band.jobs.len() {
+        if job_intersects_required_region(&sub_band.jobs[index], required) {
+            sub_band.jobs.swap(kept, index);
+            ranges.swap(kept, index);
+            kept += 1;
+        }
+    }
+    sub_band.jobs.truncate(kept);
+    ranges.truncate(kept);
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn compact_ht_sub_band_coded_data(
     sub_band: &mut PreparedHtSubBand,
     _tier1_prepare_mode: DirectTier1Mode,
 ) -> Result<(), Error> {
-    let coded_data =
-        sub_band
-            .payload_source
-            .contiguous_mut()
-            .ok_or(Error::MetalStateInvariant {
-                state: "HTJ2K MetalDirect cropped plan",
-                reason: "post-prepare ROI compaction requires a legacy contiguous payload plan",
-            })?;
+    let coded_data = match &mut sub_band.payload_source {
+        PreparedHtPayloadSource::Contiguous(coded_data) => coded_data,
+        // Referenced payloads stay in the retained input: renumber the
+        // remaining jobs' offsets into the logical arena they describe.
+        PreparedHtPayloadSource::Referenced { .. } => {
+            let mut logical = 0u32;
+            for job in &mut sub_band.jobs {
+                job.coded_offset = logical;
+                logical = logical
+                    .checked_add(job.coded_len)
+                    .ok_or_else(|| Error::MetalKernel {
+                        message: "HTJ2K MetalDirect cropped coded payload exceeds u32".to_string(),
+                    })?;
+            }
+            return Ok(());
+        }
+    };
     let compacted_len = crate::batch_allocation::checked_count_sum(
         sub_band.jobs.iter().map(|job| job.coded_len as usize),
         "HTJ2K MetalDirect cropped coded payload",

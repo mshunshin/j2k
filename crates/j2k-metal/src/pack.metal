@@ -9,6 +9,7 @@ struct J2kPackParams {
     float max_values[4];
     float u8_scales[4];
     float u16_scales[4];
+    uint signed_mask;
 };
 
 struct J2kMctRgb8PackParams {
@@ -84,6 +85,37 @@ inline ushort pack_to_u16(float sample, float max_value, float scale) {
     return ushort(min(floor(clamped * scale + 0.5f), 65535.0f));
 }
 
+inline short j2k_pack_native_i16(float value, float positive_max) {
+    const float negative_min = -positive_max - 1.0f;
+    return short(rint(clamp(value, negative_min, positive_max)));
+}
+
+// Match native signed-byte storage followed by the requested Gray16 widening.
+// Sub-eight-bit negative bytes exceed the declared unsigned range and saturate.
+inline ushort j2k_pack_signed_narrow_u16(float value, float positive_max) {
+    const short sample = j2k_pack_native_i16(value, positive_max);
+    const uint stored = uint(uchar(char(sample)));
+    const uint maximum = uint(positive_max) * 2u + 1u;
+    return ushort(min((stored * 65535u + maximum / 2u) / maximum, 65535u));
+}
+
+// As the CPU decoder: a signed sample of more than eight bits keeps its
+// two's-complement 16-bit pattern, one of at most eight bits is widened from
+// its two's-complement byte.
+inline ushort pack_sample_to_u16(float sample, float max_value, float scale, bool is_signed) {
+    if (!is_signed) {
+        return pack_to_u16(sample, max_value, scale);
+    }
+    const float positive_max = floor(max_value * 0.5f);
+    return max_value > 255.0f ? ushort(j2k_pack_native_i16(sample, positive_max))
+                              : j2k_pack_signed_narrow_u16(sample, positive_max);
+}
+
+inline ushort pack_channel_to_u16(float sample, constant J2kPackParams &params, uint channel) {
+    return pack_sample_to_u16(sample, params.max_values[channel], params.u16_scales[channel],
+                              ((params.signed_mask >> channel) & 1u) != 0u);
+}
+
 kernel void j2k_pack_gray8(
     device const float *plane0 [[buffer(0)]],
     device const float *plane1 [[buffer(1)]],
@@ -122,22 +154,15 @@ kernel void j2k_pack_rgb8(
     out[out_idx + 2] = scale_to_u8(plane2[idx], params.max_values[2], params.u8_scales[2]);
 }
 
-kernel void j2k_pack_mct_rgb8(
-    device const float *plane0 [[buffer(0)]],
-    device const float *plane1 [[buffer(1)]],
-    device const float *plane2 [[buffer(2)]],
-    device uchar *out [[buffer(3)]],
-    constant J2kMctRgb8PackParams &params [[buffer(4)]],
-    uint2 gid [[thread_position_in_grid]]
+// One pixel of `j2k_pack_mct_rgb8`, shared with the fused last-level kernels.
+inline void j2k_store_mct_rgb8_pixel(
+    float y0,
+    float y1,
+    float y2,
+    constant J2kMctRgb8PackParams &params,
+    device uchar *out,
+    uint out_idx
 ) {
-    if (gid.x >= params.width || gid.y >= params.height) {
-        return;
-    }
-
-    const uint idx = gid.y * params.width + gid.x;
-    const float y0 = plane0[idx];
-    const float y1 = plane1[idx];
-    const float y2 = plane2[idx];
     float rgb0;
     float rgb1;
     float rgb2;
@@ -154,10 +179,27 @@ kernel void j2k_pack_mct_rgb8(
         rgb2 = j2k_shift_centered_sample(centered[2], params.addends[2], true);
     }
 
-    const uint out_idx = gid.y * params.out_stride + gid.x * 3u;
     out[out_idx] = scale_to_u8(rgb0, params.max_values[0], params.u8_scales[0]);
     out[out_idx + 1] = scale_to_u8(rgb1, params.max_values[1], params.u8_scales[1]);
     out[out_idx + 2] = scale_to_u8(rgb2, params.max_values[2], params.u8_scales[2]);
+}
+
+kernel void j2k_pack_mct_rgb8(
+    device const float *plane0 [[buffer(0)]],
+    device const float *plane1 [[buffer(1)]],
+    device const float *plane2 [[buffer(2)]],
+    device uchar *out [[buffer(3)]],
+    constant J2kMctRgb8PackParams &params [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+
+    const uint idx = gid.y * params.width + gid.x;
+    j2k_store_mct_rgb8_pixel(
+        plane0[idx], plane1[idx], plane2[idx], params, out, gid.y * params.out_stride + gid.x * 3u
+    );
 }
 
 kernel void j2k_pack_mct_rgb8_batched(
@@ -256,7 +298,7 @@ kernel void j2k_pack_gray16(
 
     const uint idx = gid.y * params.width + gid.x;
     const uint out_idx = (gid.y * params.out_stride) / 2u + gid.x;
-    out[out_idx] = pack_to_u16(plane0[idx], params.max_values[0], params.u16_scales[0]);
+    out[out_idx] = pack_channel_to_u16(plane0[idx], params, 0u);
 }
 
 kernel void j2k_pack_rgb16(
@@ -274,9 +316,9 @@ kernel void j2k_pack_rgb16(
 
     const uint idx = gid.y * params.width + gid.x;
     const uint out_idx = (gid.y * params.out_stride) / 2u + gid.x * 3u;
-    out[out_idx] = pack_to_u16(plane0[idx], params.max_values[0], params.u16_scales[0]);
-    out[out_idx + 1] = pack_to_u16(plane1[idx], params.max_values[1], params.u16_scales[1]);
-    out[out_idx + 2] = pack_to_u16(plane2[idx], params.max_values[2], params.u16_scales[2]);
+    out[out_idx] = pack_channel_to_u16(plane0[idx], params, 0u);
+    out[out_idx + 1] = pack_channel_to_u16(plane1[idx], params, 1u);
+    out[out_idx + 2] = pack_channel_to_u16(plane2[idx], params, 2u);
 }
 
 struct J2kRepeatedGrayPackParams {
@@ -287,6 +329,7 @@ struct J2kRepeatedGrayPackParams {
     float max_value;
     float u8_scale;
     float u16_scale;
+    uint is_signed;
 };
 
 kernel void j2k_pack_u8_repeated_gray(
@@ -320,5 +363,5 @@ kernel void j2k_pack_u16_repeated_gray(
     const uint out_base = (gid.z * params.out_stride * params.height) / 2u;
     const uint plane_idx = plane_base + gid.y * params.width + gid.x;
     const uint out_idx = out_base + gid.y * (params.out_stride / 2u) + gid.x;
-    out[out_idx] = pack_to_u16(plane0[plane_idx], params.max_value, params.u16_scale);
+    out[out_idx] = pack_sample_to_u16(plane0[plane_idx], params.max_value, params.u16_scale, params.is_signed != 0u);
 }

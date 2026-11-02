@@ -195,6 +195,32 @@ impl<'a> ComponentPlane<'a> {
     }
 }
 
+/// Receives a region decode's samples as they are finished, instead of as
+/// whole component planes.
+///
+/// Each call gives one rectangle of the region, at `(x, y)` in region
+/// coordinates, as one plane per component whose dimensions are the
+/// rectangle's. The samples are those the component planes would hold:
+/// rounded for integer output, with the inverse multi-component transform
+/// and level shift applied. Rectangles never overlap, and together they cover
+/// the region once. A decode that fails may already have delivered some.
+#[doc(hidden)]
+pub trait ComponentRowSink {
+    /// Receive the samples of one rectangle of the region.
+    fn write_rows(&mut self, x: u32, y: u32, planes: &[ComponentPlane<'_>]);
+
+    /// The sink's destination for a `width` x `height` region of three 8-bit
+    /// components, when it is interleaved RGB8 rows of `3 * width` bytes back
+    /// to back that the sink would fill from such planes by rounding and
+    /// saturating each sample. A decode may then pack its rows straight into
+    /// this buffer instead of calling [`Self::write_rows`]. The default,
+    /// `None`, always uses `write_rows`.
+    fn rgb8_region(&mut self, width: u32, height: u32) -> Option<&mut [u8]> {
+        let _ = (width, height);
+        None
+    }
+}
+
 /// Borrowed decoded component planes for an image.
 pub struct DecodedComponents<'a> {
     pub(crate) dimensions: (u32, u32),

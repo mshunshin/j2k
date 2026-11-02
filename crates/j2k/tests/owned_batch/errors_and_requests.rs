@@ -19,10 +19,11 @@ use super::fixtures::{
 
 #[test]
 fn shared_batch_decoder_interface_prepares_and_decodes_owned_inputs() {
-    let options = BatchDecodeOptions {
-        layout: BatchLayout::Nhwc,
-        workers: NonZeroUsize::new(1),
-        ..BatchDecodeOptions::default()
+    let options = {
+        let mut options = BatchDecodeOptions::default();
+        options.layout = BatchLayout::Nhwc;
+        options.workers = NonZeroUsize::new(1);
+        options
     };
     let input = EncodedImage::full(Arc::from(htj2k_gray8_fixture(3, 2)));
     let mut decoder = CpuBatchDecoder::new(options);
@@ -132,9 +133,10 @@ fn cpu_batch_preserves_signed_i16_samples_in_nchw_layout() {
         EncodedImage::full(Arc::<[u8]>::from(signed_gray16_fixture(&first, 2, 2))),
         EncodedImage::full(Arc::<[u8]>::from(signed_gray16_fixture(&second, 2, 2))),
     ];
-    let options = BatchDecodeOptions {
-        layout: BatchLayout::Nchw,
-        ..BatchDecodeOptions::default()
+    let options = {
+        let mut options = BatchDecodeOptions::default();
+        options.layout = BatchLayout::Nchw;
+        options
     };
     let mut session = CpuBatchDecoder::new(options);
     let result = session.decode(inputs).expect("decode signed batch");
@@ -331,7 +333,7 @@ fn tile_ladder_overrides_fail_at_prepare_for_classic_and_htj2k() {
 }
 
 #[test]
-fn prepare_reports_nonrepresentable_subsampled_mixed_and_high_precision_inputs() {
+fn prepare_accepts_subsampled_and_reports_mixed_and_high_precision_inputs() {
     let mut subsampled = rgb8_fixture();
     let siz_marker = subsampled
         .windows(2)
@@ -356,22 +358,22 @@ fn prepare_reports_nonrepresentable_subsampled_mixed_and_high_precision_inputs()
     )
     .expect("prepare rejected profiles");
 
-    assert!(prepared.groups().is_empty());
-    assert_eq!(prepared.errors().len(), 3);
+    assert_eq!(prepared.groups().len(), 1);
+    assert_eq!(prepared.groups()[0].source_indices(), [0]);
+    assert_eq!(prepared.groups()[0].info().dimensions, (4, 4));
     let reasons = prepared
         .errors()
         .iter()
         .map(|error| match error.source {
-            BatchItemError::NonRepresentableBatchOutput { reason } => reason,
+            BatchItemError::NonRepresentableBatchOutput { reason } => (error.index, reason),
             _ => panic!("expected representability error"),
         })
         .collect::<Vec<_>>();
     assert_eq!(
         reasons,
         [
-            NonRepresentableReason::ComponentSubsampling,
-            NonRepresentableReason::MixedPrecision,
-            NonRepresentableReason::PrecisionAboveSixteen,
+            (1, NonRepresentableReason::MixedPrecision),
+            (2, NonRepresentableReason::PrecisionAboveSixteen),
         ]
     );
 }

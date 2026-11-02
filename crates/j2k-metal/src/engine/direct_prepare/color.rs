@@ -9,14 +9,13 @@ use super::{
     J2kReferencedHtj2kPlan, NativeGrayscalePlan, PreparedDirectColorPlan,
     PreparedDirectGrayscalePlan, PreparedDirectGrayscaleStep, ReferencedClassicPayloadCursor,
 };
-use crate::engine::direct_plan_types::with_color_store_rounding;
+use crate::engine::direct_plan_types::{with_color_store_rounding, UNIT_COLOR_SAMPLING};
 use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn prepare_referenced_classic_color_plan(
     referenced: &J2kReferencedClassicPlan,
     input: &[u8],
-    signed: bool,
 ) -> Result<PreparedDirectColorPlan, Error> {
     let prepared = prepare_referenced_classic_color_tiles(
         referenced,
@@ -32,9 +31,10 @@ pub(crate) fn prepare_referenced_classic_color_plan(
             prepared.bit_depths[2],
         ],
         alpha_bit_depth: None,
-        signed,
+        signed: prepared.signed,
         mct: prepared.mct,
         transform: prepared.transform,
+        color_sampling: UNIT_COLOR_SAMPLING,
         component_plans: with_color_store_rounding(prepared.component_plans, prepared.mct),
     })
 }
@@ -43,7 +43,6 @@ pub(crate) fn prepare_referenced_classic_color_plan(
 pub(crate) fn prepare_referenced_classic_rgba_plan(
     referenced: &J2kReferencedClassicPlan,
     input: &[u8],
-    signed: bool,
 ) -> Result<PreparedDirectColorPlan, Error> {
     let prepared = prepare_referenced_classic_color_tiles(
         referenced,
@@ -59,9 +58,10 @@ pub(crate) fn prepare_referenced_classic_rgba_plan(
             prepared.bit_depths[2],
         ],
         alpha_bit_depth: Some(prepared.bit_depths[3]),
-        signed,
+        signed: prepared.signed,
         mct: prepared.mct,
         transform: prepared.transform,
+        color_sampling: UNIT_COLOR_SAMPLING,
         component_plans: with_color_store_rounding(prepared.component_plans, prepared.mct),
     })
 }
@@ -136,6 +136,7 @@ struct ReferencedColorGeometry<'a> {
 
 #[cfg(target_os = "macos")]
 struct PreparedReferencedColorTiles {
+    signed: bool,
     dimensions: (u32, u32),
     bit_depths: [u8; 4],
     mct: bool,
@@ -214,14 +215,10 @@ fn finish_referenced_color_tiles(
     let mut budget = crate::batch_allocation::BatchMetadataBudget::new(context);
     let mut component_plans = budget.try_vec(component_steps.len(), context)?;
     for (component, steps) in first.component_plans.iter().zip(component_steps) {
-        component_plans.push(finish_referenced_component_plan(
-            component.dimensions,
-            component.bit_depth,
-            steps,
-            context,
-        )?);
+        component_plans.push(finish_referenced_component_plan(component, steps, context)?);
     }
     Ok(PreparedReferencedColorTiles {
+        signed: crate::engine::direct_plan_types::color_signedness(first.component_plans)?,
         dimensions: first.dimensions,
         bit_depths: first.bit_depths,
         mct: first.mct,
@@ -234,7 +231,6 @@ fn finish_referenced_color_tiles(
 pub(crate) fn prepare_referenced_htj2k_color_plan(
     referenced: &J2kReferencedHtj2kPlan,
     input: &Arc<[u8]>,
-    signed: bool,
 ) -> Result<PreparedDirectColorPlan, Error> {
     let prepared = prepare_referenced_htj2k_color_tiles(
         referenced,
@@ -250,9 +246,10 @@ pub(crate) fn prepare_referenced_htj2k_color_plan(
             prepared.bit_depths[2],
         ],
         alpha_bit_depth: None,
-        signed,
+        signed: prepared.signed,
         mct: prepared.mct,
         transform: prepared.transform,
+        color_sampling: UNIT_COLOR_SAMPLING,
         component_plans: with_color_store_rounding(prepared.component_plans, prepared.mct),
     })
 }
@@ -261,7 +258,6 @@ pub(crate) fn prepare_referenced_htj2k_color_plan(
 pub(crate) fn prepare_referenced_htj2k_rgba_plan(
     referenced: &J2kReferencedHtj2kPlan,
     input: &Arc<[u8]>,
-    signed: bool,
 ) -> Result<PreparedDirectColorPlan, Error> {
     let prepared = prepare_referenced_htj2k_color_tiles(
         referenced,
@@ -277,9 +273,10 @@ pub(crate) fn prepare_referenced_htj2k_rgba_plan(
             prepared.bit_depths[2],
         ],
         alpha_bit_depth: Some(prepared.bit_depths[3]),
-        signed,
+        signed: prepared.signed,
         mct: prepared.mct,
         transform: prepared.transform,
+        color_sampling: UNIT_COLOR_SAMPLING,
         component_plans: with_color_store_rounding(prepared.component_plans, prepared.mct),
     })
 }

@@ -128,6 +128,12 @@ impl<'a, T> CoefficientBlockView<'a, T> {
         Some(&self.values[start..start + self.width])
     }
 
+    /// The samples as one row-major slice when the rows have no gaps.
+    pub(crate) fn contiguous(self) -> Option<&'a [T]> {
+        (self.row_stride == self.width || self.height <= 1)
+            .then(|| &self.values[self.offset..self.offset + self.width * self.height])
+    }
+
     pub(crate) fn rows(self) -> impl ExactSizeIterator<Item = &'a [T]> {
         (0..self.height).map(move |y| {
             let start = self.offset + y * self.row_stride;
@@ -139,16 +145,6 @@ impl<'a, T> CoefficientBlockView<'a, T> {
 impl<T: Copy> CoefficientBlockView<'_, T> {
     pub(crate) fn get(self, x: usize, y: usize) -> Option<T> {
         self.row(y).and_then(|row| row.get(x)).copied()
-    }
-
-    /// Load a coefficient using the validated row-major block index.
-    ///
-    /// Callers must pass an index below `width * height`, matching ordinary
-    /// slice indexing used by contiguous coefficient sources.
-    pub(crate) fn value_at_linear_index(self, index: usize) -> T {
-        let y = index / self.width;
-        let x = index % self.width;
-        self.values[self.offset + y * self.row_stride + x]
     }
 }
 

@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CUDA JPEG2000 Rust - J2K</title>
   <meta name="description" content="CUDA JPEG2000 Rust support in J2K: NVIDIA CUDA backends for supported JPEG 2000 / HTJ2K decode, encode-stage, and transcode paths.">
-  <link rel="canonical" href="https://frames-sg.github.io/j2k/cuda-jpeg2000-rust/">
+  <link rel="canonical" href="https://frames-sg.com/j2k/cuda-jpeg2000-rust/">
   <meta property="og:title" content="CUDA JPEG2000 Rust">
   <meta property="og:description" content="CUDA JPEG2000 Rust support in J2K: NVIDIA CUDA backends for supported JPEG 2000 / HTJ2K decode, encode-stage, and transcode paths.">
-  <meta property="og:url" content="https://frames-sg.github.io/j2k/cuda-jpeg2000-rust/">
+  <meta property="og:url" content="https://frames-sg.com/j2k/cuda-jpeg2000-rust/">
   <meta property="og:type" content="article">
   <meta property="og:image" content="https://frames-sg.github.io/j2k/assets/og-card.png">
   <meta property="og:image:width" content="1200">
@@ -29,7 +29,7 @@
     "isPartOf": { "@type": "SoftwareSourceCode", "name": "J2K", "codeRepository": "https://github.com/frames-sg/j2k", "programmingLanguage": "Rust" }
   }
   </script>
-  <link rel="stylesheet" href="../assets/site.css?v=20260814">
+  <link rel="stylesheet" href="../assets/site.css?v=20261021">
 </head>
 <body>
   <header class="site-header">
@@ -43,6 +43,13 @@
       </nav>
     </div>
   </header>
+  <aside class="site-move" aria-label="Primary Frames website">
+    <div class="wrap site-move-inner">
+      <span class="site-move-label">Primary site</span>
+      <p class="site-move-copy">J2K has a new home on <strong>frames-sg.com</strong>.</p>
+      <a class="site-move-link" href="https://frames-sg.com/j2k/cuda-jpeg2000-rust/">Open the current CUDA JPEG 2000 page <span aria-hidden="true">↗</span></a>
+    </div>
+  </aside>
   <main>
     <section class="hero">
       <div class="wrap hero-grid">
@@ -68,7 +75,7 @@
         </article>
         <article class="card">
           <h2>JPEG input</h2>
-          <p><code>j2k-jpeg-cuda</code> provides CUDA device-output integration for supported JPEG decode surfaces.</p>
+          <p><code>j2k-jpeg-cuda</code> provides CUDA device-output integration for supported JPEG decode surfaces, plus baseline and lossless JPEG encode from CUDA buffers.</p>
           <pre class="code">cargo add j2k-jpeg-cuda --features cuda-runtime</pre>
         </article>
         <article class="card">
@@ -83,7 +90,7 @@
         <h2>Testing</h2>
         <p>CUDA performance numbers come from self-hosted NVIDIA benchmark runs; hosted CI does not measure GPU performance.</p>
         <p><code>cuda-runtime</code> exposes CUDA Driver API dispatch, but product CUDA Oxide PTX is built only on supported Linux cuda-oxide hosts. Set <code>J2K_REQUIRE_CUDA_OXIDE_BUILD=1</code> on CUDA validation and benchmark hosts so placeholder PTX fails the build; runtime errors for placeholder kernels state that CUDA Oxide PTX was not built.</p>
-        <p>The CUDA backends support the same formats as the main crate: JPEG 2000 Part 1, JP2 files, HTJ2K Part 15, and JPH files. Unsupported shapes return an error for explicit CUDA requests and stay on the CPU under <code>Auto</code>.</p>
+        <p>The CUDA backends support the same formats as the main crate: JPEG 2000 Part 1, JP2 files, HTJ2K Part 15, and JPH files. Unsupported shapes return an error for explicit CUDA requests and stay on the CPU under <code>Auto</code>. Device decodes of signed grayscale and color sources follow the CPU's sample conversion.</p>
         <p class="note">Benchmark results are in <a href="https://github.com/frames-sg/j2k/blob/main/docs/benchmark-evidence.md">docs/benchmark-evidence.md</a>. Published speed comparisons need an external benchmark bundle with <code>publication_eligible=true</code>; results on generated fixtures alone are not published.</p>
       </div>
     </section>

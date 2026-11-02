@@ -32,13 +32,26 @@ Part 1 and Part 15).
 | bounded-row-decode | Done | `j2k-native::PreparedRegionDecoder`, `j2k::J2kDecoder` row facade | Scoped parsed-tile ownership, reusable decoder context, bounded packed-row scratch | `prepared_region_decoder_parses_tile_graph_once_across_regions`; `prepared_region_decoder_reuses_one_htj2k_tile_graph`; `decode_rows_u8_matches_full_rgb8_decode`; `decode_rows_u16_matches_full_gray16_decode`; `decode_rows_u16_matches_full_decode_for_signed_samples`; `decode_rows_u16_preserves_exact_high_bit_fallback`; `decode_rows_u8_matches_full_gray8_decode_for_htj2k`; one-row-at-a-time RGBA8/RGBA16 parity | CPU classic and HTJ2K row parity | Through the exact `f32` component-plane ceiling, one bounded row operation parses the tile graph once and reuses it across stripes for classic JPEG 2000 and HTJ2K. Parsed metadata remains in every stripe's aggregate allocation baseline; component, Tier-1, and IDWT owners remain reusable without retaining graphs across unrelated images. Above 24-bit precision, row decode preserves the existing exact-integer full-decode/crop fallback until the prepared session can borrow integer sidecar planes. |
 | jpx_part2_deferred | Out of scope | N/A | N/A | N/A | N/A | JPX/Part 2 is explicitly Out of scope for the Part 1 plus Part 15 support claim unless required for standard JP2/JPH still-image correctness. |
 
+Multi-tile encoding supports absolute tile origins, including odd wavelet phases
+and clipped code-block/precinct boundaries, with the existing smallest-edge
+policy for decomposition depth. Header inspection accepts dimensions beyond
+60,000 pixels; decode resource budgets still apply. See the
+[geometry and implementation scope](architecture.md#encode-geometry-and-implementation-scope).
+
 ## Owned batch decoding
 
 The owned-batch decoder accepts full, region, reduced, and region-plus-reduced
 requests and groups Gray, RGB, or RGBA output by shape without padding. Output
-is `U8`, `U16`, or `I16` samples in NCHW or NHWC layout. Other component
-counts, mixed component metadata, subsampled planes, and precision above 16
-bits use the component-plane APIs. Explicit GPU requests return an error for
+is `U8`, `U16`, or `I16` samples in NCHW or NHWC layout. When components
+use different sampling factors, the subsampled ones are replicated onto the
+image grid, as the single-image decoders do. On the CPU, a region request runs a
+copy of the prepared plan sized to the region when that copy holds at most
+half the coefficients, or when the whole-level plan holds 16 Mi or more;
+otherwise it keeps whole levels. The prepared geometry GPU backends read
+always keeps whole levels. Images whose components all
+share one subsampling decode to that smaller grid and are not batched. Other
+component counts, mixed component metadata, and precision above 16 bits use
+the component-plane APIs. Explicit GPU requests return an error for
 inputs their plans cannot describe; they do not fall back to the CPU.
 Preparation failures are reported per input. A GPU decode error tied to a
 specific job names that job's source; a command-buffer failure fails the whole

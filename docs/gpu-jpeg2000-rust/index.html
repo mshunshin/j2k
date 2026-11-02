@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>GPU-Accelerated JPEG 2000 in Rust - J2K</title>
   <meta name="description" content="GPU-accelerated JPEG 2000 in Rust with J2K: a CPU correctness baseline plus CUDA and Apple Metal backends for supported JPEG 2000 / HTJ2K paths.">
-  <link rel="canonical" href="https://frames-sg.github.io/j2k/gpu-jpeg2000-rust/">
+  <link rel="canonical" href="https://frames-sg.com/j2k/gpu-jpeg2000-rust/">
   <meta property="og:title" content="GPU-Accelerated JPEG 2000 in Rust">
   <meta property="og:description" content="J2K keeps a CPU correctness baseline while exposing CUDA and Apple Metal backends for supported JPEG 2000 / HTJ2K paths.">
-  <meta property="og:url" content="https://frames-sg.github.io/j2k/gpu-jpeg2000-rust/">
+  <meta property="og:url" content="https://frames-sg.com/j2k/gpu-jpeg2000-rust/">
   <meta property="og:type" content="article">
   <meta property="og:image" content="https://frames-sg.github.io/j2k/assets/og-card.png">
   <meta property="og:image:width" content="1200">
@@ -29,7 +29,7 @@
     "isPartOf": { "@type": "SoftwareSourceCode", "name": "J2K", "codeRepository": "https://github.com/frames-sg/j2k", "programmingLanguage": "Rust" }
   }
   </script>
-  <link rel="stylesheet" href="../assets/site.css?v=20260814">
+  <link rel="stylesheet" href="../assets/site.css?v=20261021">
 </head>
 <body>
   <header class="site-header">
@@ -43,6 +43,13 @@
       </nav>
     </div>
   </header>
+  <aside class="site-move" aria-label="Primary Frames website">
+    <div class="wrap site-move-inner">
+      <span class="site-move-label">Primary site</span>
+      <p class="site-move-copy">J2K has a new home on <strong>frames-sg.com</strong>.</p>
+      <a class="site-move-link" href="https://frames-sg.com/j2k/gpu-jpeg2000-rust/">Open the current GPU JPEG 2000 page <span aria-hidden="true">↗</span></a>
+    </div>
+  </aside>
   <main>
     <section class="hero">
       <div class="wrap hero-grid">
@@ -79,7 +86,7 @@
       <div class="wrap copy">
         <h2>Backend selection</h2>
         <p><code>BackendRequest::Auto</code> uses the CPU for shapes the GPU does not support or was not measured to speed up. Explicit CUDA or Metal requests return an error for unsupported shapes.</p>
-        <p>The GPU backends support the same formats as the CPU path: JPEG 2000 Part 1 codestreams, JP2 files, HTJ2K Part 15 codestreams, and JPH files. They speed up selected shapes within those formats; not every stage or shape runs on the GPU.</p>
+        <p>The GPU backends support the same formats as the CPU path: JPEG 2000 Part 1 codestreams, JP2 files, HTJ2K Part 15 codestreams, and JPH files. They speed up selected shapes within those formats; not every stage or shape runs on the GPU. CUDA and Metal decodes of signed grayscale and color sources follow the CPU's sample conversion.</p>
         <p class="note">Use <a href="https://github.com/frames-sg/j2k/blob/main/docs/public-support.md">docs/public-support.md</a> for codec support. Benchmark results are in <a href="https://github.com/frames-sg/j2k/blob/main/docs/benchmark-evidence.md">docs/benchmark-evidence.md</a>; published comparisons need an external benchmark bundle with <code>publication_eligible=true</code>.</p>
       </div>
     </section>

@@ -155,12 +155,43 @@ pub trait J2kEncodeStageAccelerator {
         Ok(None)
     }
 
+    /// Optionally run reversible DWT at an absolute tile-component origin.
+    ///
+    /// The default delegates to the existing hook only when every level has
+    /// the same phase as a zero-origin transform. Otherwise it declines the
+    /// stage, so an older accelerator cannot silently transform the wrong phase.
+    fn encode_forward_dwt53_at_origin(
+        &mut self,
+        job: J2kForwardDwt53Job<'_>,
+        origin: (u32, u32),
+    ) -> J2kEncodeStageResult<Option<J2kForwardDwt53Output>> {
+        if zero_origin_dwt_phase(origin, job.num_levels) {
+            self.encode_forward_dwt53(job)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Optionally run a forward irreversible 9/7 DWT.
     fn encode_forward_dwt97(
         &mut self,
         _job: J2kForwardDwt97Job<'_>,
     ) -> J2kEncodeStageResult<Option<J2kForwardDwt97Output>> {
         Ok(None)
+    }
+
+    /// Optionally run irreversible DWT at an absolute tile-component origin.
+    /// The default preserves the zero-origin hook's phase contract, as for 5/3.
+    fn encode_forward_dwt97_at_origin(
+        &mut self,
+        job: J2kForwardDwt97Job<'_>,
+        origin: (u32, u32),
+    ) -> J2kEncodeStageResult<Option<J2kForwardDwt97Output>> {
+        if zero_origin_dwt_phase(origin, job.num_levels) {
+            self.encode_forward_dwt97(job)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Optionally quantize one subband.
@@ -246,6 +277,15 @@ pub trait J2kEncodeStageAccelerator {
         false
     }
 
+    /// Whether native encode may skip the remaining per-stage hooks for the
+    /// current encode. Native encode asks after `begin_encode` and after the
+    /// whole-tile hooks have declined; `true` lets it skip those hooks and the
+    /// inputs only they read, and fuse CPU stages. Return `false`, the default,
+    /// unless every remaining hook would decline.
+    fn declines_every_stage(&self) -> bool {
+        false
+    }
+
     /// Optionally packetize prepared packet contributions.
     fn encode_packetization(
         &mut self,
@@ -264,6 +304,16 @@ impl J2kEncodeStageAccelerator for CpuOnlyJ2kEncodeStageAccelerator {
     fn prefer_parallel_cpu_tile_encode(&self) -> bool {
         true
     }
+
+    fn declines_every_stage(&self) -> bool {
+        true
+    }
+}
+
+fn zero_origin_dwt_phase(origin: (u32, u32), levels: u8) -> bool {
+    1_u64.checked_shl(u32::from(levels)).is_some_and(|scale| {
+        u64::from(origin.0).is_multiple_of(scale) && u64::from(origin.1).is_multiple_of(scale)
+    })
 }
 
 #[cfg(test)]

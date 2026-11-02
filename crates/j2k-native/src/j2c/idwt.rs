@@ -1,29 +1,77 @@
 //! Performing the inverse discrete wavelet transform, as specified in Annex F.
 
+use alloc::vec::Vec;
+
+use crate::{try_zero_fill_decode_elements, Result};
+
 mod banded;
 mod direct;
 mod filter_common;
 mod horizontal;
 mod interleave;
 mod interleave_i64;
+mod lines;
 mod model;
 mod orchestrate;
 mod roi;
 mod vertical;
 
-pub(crate) use banded::{banded_scratch_elements_for_execution, planned_band_scratch_elements};
+pub(crate) use banded::{banded_scratch_elements_for_execution, pack_last_level, LastLevel};
+pub(in crate::j2c) use banded::{lift_rows, scale_samples};
 pub(crate) use direct::apply_codestream_single_decomposition_idwt_job;
 pub(crate) use direct::apply_single_decomposition_idwt_job;
 #[cfg(test)]
 pub(crate) use horizontal::test_irreversible_filter_97i;
-pub(crate) use model::{idwt_buffer_size, IDWTOutput};
-pub(crate) use orchestrate::apply;
-pub(crate) use roi::roi_idwt_peak_elements;
+pub(crate) use lines::{LineReconstruction, SubBandRows};
+#[cfg(all(test, feature = "parallel"))]
+pub(crate) use model::idwt_buffer_size;
+pub(crate) use model::{IDWTOutput, IdwtPlacement};
+pub(crate) use orchestrate::{apply, planned_workspace_elements};
+#[cfg(feature = "parallel")]
+pub(crate) use roi::streamed_batch_rows;
+pub(crate) use roi::{last_level_fits_channels, roi_idwt_peak_elements, ComponentLines, LinePlan};
 
 // Decoded high-pass sub-bands include JPEG 2000's orientation gain. OpenJPEG's
 // synthesis constant is therefore halved at this internal codestream boundary.
 const OPENJPEG_NORMALIZED_HIGH_PASS_F32: f32 =
     j2k_codec_math::dwt::IDWT97_OPENJPEG_TWO_INV_KAPPA_F32 * 0.5;
+
+#[cfg(test)]
+std::thread_local! {
+    static ZERO_INITIALIZED_SAMPLES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_zero_initialized_samples() {
+    ZERO_INITIALIZED_SAMPLES.set(0);
+}
+
+/// IDWT level and band-scratch samples zero-initialized on this thread since
+/// the last reset.
+#[cfg(test)]
+pub(crate) fn zero_initialized_samples() -> usize {
+    ZERO_INITIALIZED_SAMPLES.get()
+}
+
+/// Make the first `len` samples of an IDWT level or band-scratch buffer
+/// addressable; callers use `buffer[..len]`.
+///
+/// The buffer never shrinks. Every level and band writes all `len` samples
+/// before reading any of them, so samples a previous level or component left
+/// behind need no zeroing; only newly grown samples are initialized.
+fn try_grow_level_buffer(buffer: &mut Vec<f32>, len: usize) -> Result<()> {
+    if buffer.len() >= len {
+        return Ok(());
+    }
+    #[cfg(test)]
+    ZERO_INITIALIZED_SAMPLES.set(ZERO_INITIALIZED_SAMPLES.get() + len - buffer.len());
+    if buffer.capacity() < len {
+        // Nothing left behind is read, so a buffer that must grow is replaced
+        // by a zeroed one rather than copied into a larger allocation.
+        buffer.clear();
+    }
+    try_zero_fill_decode_elements(buffer, len)
+}
 
 #[cfg(test)]
 mod tests;

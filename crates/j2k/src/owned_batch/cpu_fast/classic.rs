@@ -5,7 +5,7 @@
 use j2k_core::BatchInfrastructureError;
 use j2k_native::{J2kClassicCodeBlockPayload, J2kCodestreamRange};
 
-use super::super::{BatchCodecRoute, PreparedBatchGroup, PreparedClassicPlan};
+use super::super::{BatchCodecRoute, PreparedBatchGroupRef, PreparedClassicPlan};
 use super::plan::{
     append_input_range, classic_group_requirements, empty_range, reserve_reused, visit_classic_jobs,
 };
@@ -14,7 +14,7 @@ use super::{CpuFlattenedPayloadJob, CpuGroupFastWorkspace, CpuPayloadBucket};
 impl CpuGroupFastWorkspace {
     pub(super) fn prepare_classic(
         &mut self,
-        group: &PreparedBatchGroup,
+        group: PreparedBatchGroupRef<'_>,
     ) -> Result<(), BatchInfrastructureError> {
         let (payload_count, payload_bytes) = classic_group_requirements(group)?;
         self.prepare_storage::<(J2kClassicCodeBlockPayload, J2kCodestreamRange)>(
@@ -41,7 +41,7 @@ impl CpuGroupFastWorkspace {
             },
         );
         self.classic_ranges.resize(payload_count, empty_range());
-        self.assign_image_spans(group, |image| {
+        self.assign_image_spans(group.images, |image| {
             Ok(image
                 .classic_plan()
                 .map_or(0, PreparedClassicPlan::payload_count))
@@ -52,7 +52,7 @@ impl CpuGroupFastWorkspace {
                 .classic_plan()
                 .ok_or(BatchInfrastructureError::MissingResult { index: image_slot })?;
             let span = self.image_spans[image_slot];
-            visit_classic_jobs(plan.native_plan(), |payload_index, block_index| {
+            visit_classic_jobs(plan.cpu_plan(), |payload_index, block_index| {
                 self.jobs.push(CpuFlattenedPayloadJob {
                     source_index: group.source_indices[image_slot],
                     image_slot,
@@ -74,7 +74,7 @@ impl CpuGroupFastWorkspace {
                 .ok_or(BatchInfrastructureError::MissingResult {
                     index: job.source_index,
                 })?;
-            let payload = plan.native_plan().payloads().get(job.payload_index).ok_or(
+            let payload = plan.cpu_plan().payloads().get(job.payload_index).ok_or(
                 BatchInfrastructureError::MissingResult {
                     index: job.source_index,
                 },
@@ -84,15 +84,15 @@ impl CpuGroupFastWorkspace {
                     .end_range()
                     .ok_or(BatchInfrastructureError::ResultIndexOutOfBounds {
                         index: payload.first_range,
-                        job_count: plan.native_plan().ranges().len(),
+                        job_count: plan.cpu_plan().ranges().len(),
                     })?;
             let fragments = plan
-                .native_plan()
+                .cpu_plan()
                 .ranges()
                 .get(payload.first_range..end_range)
                 .ok_or(BatchInfrastructureError::ResultIndexOutOfBounds {
                     index: end_range,
-                    job_count: plan.native_plan().ranges().len(),
+                    job_count: plan.cpu_plan().ranges().len(),
                 })?;
             let start = self.compressed_arena.len();
             for range in fragments {

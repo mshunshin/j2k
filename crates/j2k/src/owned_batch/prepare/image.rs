@@ -6,9 +6,9 @@ use super::super::{
     extract_j2k_codestream_payload, parse_image_info, Arc, BatchAlpha, BatchCodecRoute, BatchColor,
     BatchDecodeOptions, BatchErrorStage, BatchExecutionShape, BatchGroupInfo, BatchItemError,
     BatchLayout, BatchWaveletTransform, BatchWorker, Colorspace, CompressedTransferSyntax,
-    DeviceDecodePlan, EncodedImage, J2kCodestreamRange, J2kError, J2kSupportInfo, NativeSampleType,
-    NonRepresentableReason, PreparationDepth, PrepareImageResult, PreparedClassicPlan,
-    PreparedCodecPlan, PreparedHtj2kPlan, PreparedImage, PreparedImageInner,
+    CpuExecution, DeviceDecodePlan, EncodedImage, J2kCodestreamRange, J2kError, J2kSupportInfo,
+    NativeSampleType, NonRepresentableReason, PreparationDepth, PrepareImageResult,
+    PreparedClassicPlan, PreparedCodecPlan, PreparedHtj2kPlan, PreparedImage, PreparedImageInner,
 };
 
 pub(super) fn prepare_image(
@@ -54,6 +54,11 @@ pub(super) fn prepare_image(
             .map_or(PreparedCodecPlan::MetadataOnly, PreparedCodecPlan::Htj2k),
     };
     reconcile_codec_plan_metadata(&mut info, &codec_plan)?;
+    let cpu_execution = choose_cpu_execution(
+        &codec_plan,
+        &info,
+        native_image.region_decode_streams_rows(),
+    );
     let preparation_depth = codec_plan.preparation_depth();
     let execution_shape = batch_execution_shape(&support, plan, preparation_depth);
     let image = PreparedImage {
@@ -67,9 +72,112 @@ pub(super) fn prepare_image(
             plan,
             codestream_range,
             codec_plan,
+            cpu_execution,
         }),
     };
     Ok((image, info, execution_shape))
+}
+
+/// Choose the CPU execution from the planned working memory, before any
+/// decode work, with the same accounting the offset plan's execution
+/// enforces.
+///
+/// A Gray8 or RGB8 image whose planned execution exceeds
+/// [`STREAM_ABOVE_PLANNED_BYTES`] streams its rows when the region decode
+/// can stream them (`region_streams_rows`): the offset plan holds
+/// whole-image f32 planes and coefficients (about 14 times the 8-bit
+/// output), which every image in flight kept until its decode ended, while
+/// the streamed route holds a band of rows. While its plan fits the
+/// per-decode bound, the image keeps it for decoding alone in a Gray8 group
+/// ([`CpuExecution::StreamedRowsOrPlan`]). Other outputs keep their offset
+/// plan unless its serial execution exceeds the per-decode bound, which
+/// rejects them, as it does images whose region decode would hand over
+/// whole component planes instead of rows. The claim of an offset plan is
+/// its parallel peak.
+pub(super) fn choose_cpu_execution(
+    codec_plan: &PreparedCodecPlan,
+    info: &BatchGroupInfo,
+    region_streams_rows: bool,
+) -> CpuExecution {
+    let planned = |parallel| match codec_plan {
+        PreparedCodecPlan::Classic(plan) => {
+            j2k_native::referenced_classic_plan_execution_bytes(plan.cpu_plan(), parallel)
+        }
+        PreparedCodecPlan::Htj2k(plan) => {
+            j2k_native::referenced_htj2k_plan_execution_bytes(plan.cpu_plan(), parallel)
+        }
+        PreparedCodecPlan::MetadataOnly => Ok(0),
+    };
+    if matches!(codec_plan, PreparedCodecPlan::MetadataOnly) {
+        return CpuExecution::ComponentPlanes;
+    }
+    let streams_rows = region_streams_rows && has_streamed_output(info);
+    let exceeds_bound = if streams_rows {
+        CpuExecution::StreamedRows
+    } else {
+        CpuExecution::ExceedsDecodeBound
+    };
+    match (planned(false), planned(true)) {
+        (
+            Err(j2k_native::DecodeError::Validation(j2k_native::ValidationError::ImageTooLarge)),
+            _,
+        ) => exceeds_bound,
+        (Ok(serial), _) if serial > planned_decode_bound() => exceeds_bound,
+        (Ok(_), Ok(bytes)) if !streams_rows || bytes <= stream_above_planned_bytes() => {
+            CpuExecution::OffsetPlan { bytes }
+        }
+        (Ok(_), Ok(bytes)) => CpuExecution::StreamedRowsOrPlan { bytes },
+        // An 8-bit plan that fits only serially streams.
+        (Ok(_), _) if streams_rows => CpuExecution::StreamedRows,
+        // Any other plan that fits only serially, or a malformed plan, keeps
+        // the worst-case claim and reports any error from execution.
+        _ => CpuExecution::OffsetPlan {
+            bytes: crate::batch::allocation::GENERIC_WORKER_CLAIM_BYTES,
+        },
+    }
+}
+
+/// Gray8 and RGB8 outputs have a streamed route: the region decode hands
+/// over finished rows of 8-bit components where the image lets it (see
+/// `j2k_native::Image::region_decode_streams_rows`). Other outputs keep the
+/// bound.
+fn has_streamed_output(info: &BatchGroupInfo) -> bool {
+    info.sample_type == NativeSampleType::U8
+        && matches!(info.color, BatchColor::Gray | BatchColor::Rgb)
+}
+
+/// Planned offset-plan execution above which Gray8/RGB8 images stream
+/// their rows (see [`choose_cpu_execution`]). Smaller images keep their
+/// parse-free plan, whose working memory is negligible at that size.
+pub(super) const STREAM_ABOVE_PLANNED_BYTES: usize = 4 << 20;
+
+#[cfg(test)]
+std::thread_local! {
+    /// Test-only lower bound for [`choose_cpu_execution`] on this thread.
+    pub(super) static PLANNED_DECODE_BOUND: core::cell::Cell<Option<usize>> =
+        const { core::cell::Cell::new(None) };
+    /// Test-only streaming threshold for [`choose_cpu_execution`] on this
+    /// thread.
+    pub(super) static STREAM_ABOVE_OVERRIDE: core::cell::Cell<Option<usize>> =
+        const { core::cell::Cell::new(None) };
+}
+
+fn stream_above_planned_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = STREAM_ABOVE_OVERRIDE.with(core::cell::Cell::get) {
+        return bytes;
+    }
+    STREAM_ABOVE_PLANNED_BYTES
+}
+
+/// The per-decode bound planned executions are held to. Native planning
+/// already fails above the default, so this only lowers it in tests.
+fn planned_decode_bound() -> usize {
+    #[cfg(test)]
+    if let Some(bound) = PLANNED_DECODE_BOUND.with(core::cell::Cell::get) {
+        return bound;
+    }
+    j2k_native::DEFAULT_MAX_DECODE_BYTES
 }
 
 pub(super) fn batch_execution_shape(
@@ -114,7 +222,12 @@ fn prepare_classic_offset_plan(
     }
     let output = plan.output_rect();
     match worker.build_prepared_classic_plan(image, (output.x, output.y, output.w, output.h)) {
-        Ok(plan) => Ok(Some(PreparedClassicPlan::from_native(plan))),
+        Ok(plan) => PreparedClassicPlan::from_native(plan)
+            .map(Some)
+            .map_err(|source| BatchItemError::Codec {
+                stage: BatchErrorStage::Prepare,
+                source: Arc::new(J2kError::from_native_decode_error(source)),
+            }),
         Err(
             source @ j2k_native::DecodeError::Decoding(
                 j2k_native::DecodingError::DirectPlanUnsupported(_)
@@ -144,7 +257,12 @@ fn prepare_htj2k_offset_plan(
     }
     let output = plan.output_rect();
     match worker.build_prepared_htj2k_plan(image, (output.x, output.y, output.w, output.h)) {
-        Ok(plan) => Ok(Some(PreparedHtj2kPlan::from_native(plan))),
+        Ok(plan) => PreparedHtj2kPlan::from_native(plan)
+            .map(Some)
+            .map_err(|source| BatchItemError::Codec {
+                stage: BatchErrorStage::Prepare,
+                source: Arc::new(J2kError::from_native_decode_error(source)),
+            }),
         Err(source)
             if matches!(
                 source.classify(),
@@ -184,7 +302,13 @@ pub(super) fn batch_group_info(
     {
         return Err(nonrepresentable(NonRepresentableReason::MixedSignedness));
     }
-    if support.has_component_subsampling() {
+    // When components use different sampling, decode replicates the
+    // subsampled ones onto the reference grid, as single-image decode does.
+    // Offset plans reject them, so they retain metadata only and never share
+    // an execution group with unit-sampled images. When every component
+    // shares one non-unit sampling, native decode instead produces the smaller
+    // component grid, which the reference-grid geometry here cannot describe.
+    if has_uniform_component_subsampling(support) {
         return Err(nonrepresentable(
             NonRepresentableReason::ComponentSubsampling,
         ));
@@ -337,6 +461,18 @@ fn identity_rgba_alpha(definitions: &[crate::J2kChannelDefinition]) -> Option<Ba
         && alpha.channel_index == 3
         && alpha.association == crate::J2kChannelAssociation::WholeImage)
         .then_some(alpha_interpretation)
+}
+
+fn has_uniform_component_subsampling(support: &J2kSupportInfo) -> bool {
+    let Some(first) = support.components.first() else {
+        return false;
+    };
+    let sampling = (first.x_rsiz, first.y_rsiz);
+    sampling != (1, 1)
+        && support
+            .components
+            .iter()
+            .all(|component| (component.x_rsiz, component.y_rsiz) == sampling)
 }
 
 fn nonrepresentable(reason: NonRepresentableReason) -> BatchItemError {

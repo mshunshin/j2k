@@ -85,6 +85,11 @@ impl MelEncoder {
         clippy::cast_possible_truncation,
         reason = "MEL exponents are at most five, so the packed run and count fit u8"
     )]
+    #[expect(
+        clippy::inline_always,
+        reason = "runs once per quad in the cleanup hot path"
+    )]
+    #[inline(always)]
     pub(super) fn encode(&mut self, bit: bool) -> Result<(), &'static str> {
         if bit {
             let t = MEL_EXP[self.k];
@@ -147,16 +152,20 @@ impl VlcEncoder {
         clippy::cast_possible_truncation,
         reason = "the mask is bounded by the available byte bits before packing into the VLC reservoir"
     )]
+    #[expect(
+        clippy::inline_always,
+        reason = "runs once per quad pair in the cleanup hot path"
+    )]
+    #[inline(always)]
     pub(super) fn encode(
         &mut self,
-        codeword: u32,
+        mut codeword: u64,
         mut codeword_len: u8,
     ) -> Result<(), &'static str> {
         if codeword_len == 0 {
             return Ok(());
         }
-        let mut codeword = u64::from(codeword);
-        if codeword_len < u32::BITS as u8 {
+        if codeword_len < u64::BITS as u8 {
             codeword &= (1u64 << codeword_len) - 1;
         }
         loop {
@@ -242,14 +251,13 @@ impl MagSgnEncoder {
     #[inline(always)]
     pub(super) fn encode(
         &mut self,
-        codeword: u32,
+        mut codeword: u64,
         mut codeword_len: u32,
     ) -> Result<(), &'static str> {
         if codeword_len == 0 {
             return Ok(());
         }
-        let mut codeword = u64::from(codeword);
-        if codeword_len < u32::BITS {
+        if codeword_len < u64::BITS {
             codeword &= (1u64 << codeword_len) - 1;
         }
         loop {
@@ -358,7 +366,13 @@ impl MagSgnEncoder {
         if end > self.buffer.len() {
             return Err("HTJ2K magnitude/sign encoder buffer is full");
         }
-        self.buffer[self.pos..end].copy_from_slice(&word.to_le_bytes()[..byte_count]);
+        // A whole-word store is one instruction where a short copy is a
+        // memmove call; the bytes past `end` are later overwritten or unused.
+        if let Some(slot) = self.buffer.get_mut(self.pos..self.pos + 8) {
+            slot.copy_from_slice(&word.to_le_bytes());
+        } else {
+            self.buffer[self.pos..end].copy_from_slice(&word.to_le_bytes()[..byte_count]);
+        }
         self.pos = end;
         Ok(())
     }

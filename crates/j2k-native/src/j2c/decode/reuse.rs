@@ -78,7 +78,11 @@ impl DecoderContext<'_> {
         first_result: Result<T>,
         retry: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
-        if retained_scratch_bytes == 0 {
+        // A decode that streams rows gave up its retained scratch before the
+        // first row (`release_retained_before_streaming`), so once rows have
+        // reached the sink a fresh context fails the same way, and a rerun
+        // would only send them again.
+        if retained_scratch_bytes == 0 || self.tile_decode_context.streamed_samples > 0 {
             return first_result;
         }
         match first_result {
@@ -94,6 +98,37 @@ impl DecoderContext<'_> {
         }
     }
 
+    /// A decode that streams rows can't be rerun once a row has reached the
+    /// sink, so before the first row it gives up the retained scratch, and the
+    /// retained component planes it never uses. From then on its budget is a
+    /// fresh context's, and a capacity failure is one a fresh context hits
+    /// too. Returns the structural bytes and baseline without them.
+    pub(super) fn release_retained_before_streaming(
+        &mut self,
+        structural_workspace_bytes: usize,
+        baseline: ReusedDecodeBaseline,
+    ) -> Result<(usize, ReusedDecodeBaseline)> {
+        let retained = baseline
+            .channel_capacity
+            .checked_add(baseline.scratch_capacity)
+            .ok_or(ValidationError::ImageTooLarge)?;
+        self.tile_decode_context.release_channel_allocations();
+        self.tile_decode_context.release_tile_scratch_allocations();
+        let without = |bytes: usize| {
+            bytes
+                .checked_sub(retained)
+                .ok_or(DecodeError::from(ValidationError::ImageTooLarge))
+        };
+        Ok((
+            without(structural_workspace_bytes)?,
+            ReusedDecodeBaseline {
+                parser_live: without(baseline.parser_live)?,
+                channel_capacity: 0,
+                scratch_capacity: 0,
+            },
+        ))
+    }
+
     pub(super) fn discard_reused_channels(&mut self) {
         self.tile_decode_context.release_channel_allocations();
     }
@@ -104,20 +139,38 @@ impl DecoderContext<'_> {
         initial_tile: &Tile<'_>,
         retained_baseline_bytes: usize,
         retained_channel_bytes: usize,
+        store_backend: bool,
+        last_idwt_level_padding: Option<(u32, u32)>,
     ) -> Result<usize> {
         let retained_decode_baseline = self.tile_decode_context.reset(
             header,
             initial_tile,
             retained_baseline_bytes,
             retained_channel_bytes,
+            store_backend,
+            last_idwt_level_padding,
         )?;
         self.storage.reset_for_next_tile();
+        self.tile_decode_context
+            .debug_counters
+            .decode_baseline_bytes = retained_decode_baseline;
         Ok(retained_decode_baseline)
     }
 }
 
 impl TileDecodeContext {
-    pub(super) fn retained_channel_bytes(&self) -> Result<usize> {
+    /// The decode budget the component planes are charged against.
+    pub(super) fn planes_budget(&self) -> usize {
+        #[cfg(test)]
+        return self.planes_budget.unwrap_or(DEFAULT_MAX_DECODE_BYTES);
+        #[cfg(not(test))]
+        {
+            let _ = self;
+            DEFAULT_MAX_DECODE_BYTES
+        }
+    }
+
+    pub(crate) fn retained_channel_bytes(&self) -> Result<usize> {
         retained_channel_bytes_with_cap(&self.channel_data, DEFAULT_MAX_DECODE_BYTES)
     }
 
@@ -125,14 +178,31 @@ impl TileDecodeContext {
         self.channel_data = Vec::new();
     }
 
+    /// Planes reset without zeroing must have been written in full by
+    /// `store`; otherwise samples of a previous image would reach the output.
+    pub(super) fn ensure_unzeroed_planes_overwritten(&self) -> Result<()> {
+        if self.unzeroed_plane_samples != 0
+            && self.stored_plane_samples != self.unzeroed_plane_samples
+        {
+            return Err(DecodingError::IncompletePlaneStore.into());
+        }
+        Ok(())
+    }
+
+    /// With `last_idwt_level_padding`, each component plane also reserves room
+    /// for that many samples, so the region IDWT can write its last level
+    /// straight into the plane.
     fn reset(
         &mut self,
         header: &Header<'_>,
         initial_tile: &Tile<'_>,
         retained_baseline_bytes: usize,
         retained_channel_bytes: usize,
+        store_backend: bool,
+        last_idwt_level_padding: Option<(u32, u32)>,
     ) -> Result<usize> {
         self.debug_counters = super::DecodeDebugCounters::default();
+        self.last_idwt_level_padding = last_idwt_level_padding;
 
         let (output_width, output_height) = self.output_region.map_or(
             (
@@ -141,11 +211,43 @@ impl TileDecodeContext {
             ),
             super::OutputRegion::dimensions,
         );
-        let sample_count = checked_decode_sample_count(output_width, output_height)?;
+        // A decode that streams its rows to a sink keeps no planes.
+        let sample_count = if self.stream_rows {
+            0
+        } else {
+            checked_decode_sample_count(output_width, output_height)?
+        };
+        let capacity_samples = match last_idwt_level_padding {
+            Some((width, height)) => checked_decode_sample_count(width, height)?,
+            None => sample_count,
+        };
         let exact_integer_decode = initial_tile
             .component_infos
             .iter()
             .any(super::ComponentInfo::requires_exact_integer_decode);
+        let store_overwrites_planes = store_overwrites_every_plane_sample(
+            header,
+            self.output_region.is_none(),
+            exact_integer_decode,
+            store_backend,
+        );
+        self.unzeroed_plane_samples = if store_overwrites_planes {
+            sample_count
+                .checked_mul(initial_tile.component_infos.len())
+                .ok_or(ValidationError::ImageTooLarge)?
+        } else {
+            0
+        };
+        self.stored_plane_samples = 0;
+        // A fused RGB8 decode moves the last component's coefficients into
+        // its plane, so a fresh plane allocated now would only be freed
+        // unused: leave it to that move, or to `prepare_deferred_plane`.
+        let defer_last_plane = store_overwrites_planes
+            && self.defer_mct
+            && initial_tile.mct
+            && initial_tile.component_infos.len() == 3
+            && header.size_data.num_x_tiles() == 1
+            && header.size_data.num_y_tiles() == 1;
 
         let actual_retained = self.retained_channel_bytes()?;
         if actual_retained != retained_channel_bytes {
@@ -154,40 +256,89 @@ impl TileDecodeContext {
         let fresh_baseline = retained_baseline_bytes
             .checked_sub(retained_channel_bytes)
             .ok_or_else(allocation_overflow)?;
-        let mut budget = ContextCapacityBudget::from_live_bytes(retained_baseline_bytes)?;
+        let cap = self.planes_budget();
+        let mut budget = ContextCapacityBudget::with_cap(retained_baseline_bytes, cap)?;
         let reused = reset_channel_data(
             &mut self.channel_data,
             &initial_tile.component_infos,
-            sample_count,
+            (sample_count, capacity_samples),
             exact_integer_decode,
+            (store_overwrites_planes, defer_last_plane),
             &mut budget,
         );
-        match reused {
-            Ok(()) => Ok(budget.bytes()),
+        let (deferred, bytes) = match reused {
+            Ok(deferred) => (deferred, budget.bytes()),
             Err(error) if retained_channel_bytes != 0 && is_capacity_error(&error) => {
                 self.release_channel_allocations();
-                let mut fresh_budget = ContextCapacityBudget::from_live_bytes(fresh_baseline)?;
-                reset_channel_data(
+                let mut fresh_budget = ContextCapacityBudget::with_cap(fresh_baseline, cap)?;
+                let deferred = reset_channel_data(
                     &mut self.channel_data,
                     &initial_tile.component_infos,
-                    sample_count,
+                    (sample_count, capacity_samples),
                     exact_integer_decode,
+                    (store_overwrites_planes, defer_last_plane),
                     &mut fresh_budget,
                 )?;
-                Ok(fresh_budget.bytes())
+                (deferred, fresh_budget.bytes())
             }
-            Err(error) => Err(error),
-        }
+            Err(error) => return Err(error),
+        };
+        self.deferred_plane = deferred.then_some(sample_count);
+        Ok(bytes)
+    }
+
+    /// Allocate the last component's plane, zeroed, when `reset` deferred it
+    /// and the decode stores samples into it. Its bytes were charged then.
+    pub(super) fn prepare_deferred_plane(&mut self) -> Result<()> {
+        let Some(samples) = self.deferred_plane.take() else {
+            return Ok(());
+        };
+        let component = self
+            .channel_data
+            .last_mut()
+            .ok_or(DecodingError::CodeBlockDecodeFailure)?;
+        component.container = SimdBuffer::try_zeros_with_capacity(samples, samples)
+            .map_err(|_| DecodingError::HostAllocationFailed)?;
+        Ok(())
     }
 }
 
+/// Whether `store` writes every sample of every image-sized component plane,
+/// so a retained plane needs no zeroing before the decode: a full-image CPU
+/// decode (no output region, no store backend, no exact-integer sidecar) at
+/// full resolution where every component is sampled 1x1. The tiles then
+/// partition the image and each tile stores its whole rectangle. Resolution
+/// reduction with odd image offsets and mixed subsampling leave edge samples
+/// unwritten, so those keep the zero initialization.
+fn store_overwrites_every_plane_sample(
+    header: &Header<'_>,
+    full_image: bool,
+    exact_integer_decode: bool,
+    store_backend: bool,
+) -> bool {
+    full_image
+        && !exact_integer_decode
+        && !store_backend
+        && header.skipped_resolution_levels == 0
+        && header
+            .size_data
+            .component_sizes
+            .iter()
+            .all(|size| size.horizontal_resolution == 1 && size.vertical_resolution == 1)
+}
+
+/// Prepare one plane of `sample_count` samples per component, whose
+/// float allocation holds at least `capacity_samples`. Planes are zeroed
+/// unless `store_overwrites_planes`. With `defer_last_plane`, a last plane
+/// that needs a fresh allocation is only charged; returns whether it was.
 fn reset_channel_data(
     components: &mut Vec<ComponentData>,
     component_infos: &[super::ComponentInfo],
-    sample_count: usize,
+    (sample_count, capacity_samples): (usize, usize),
     exact_integer_decode: bool,
+    (store_overwrites_planes, defer_last_plane): (bool, bool),
     budget: &mut ContextCapacityBudget,
-) -> Result<()> {
+) -> Result<bool> {
     let component_count = component_infos.len();
     if components.capacity() < component_count {
         let released = retained_channel_bytes_with_cap(components, DEFAULT_MAX_DECODE_BYTES)?;
@@ -230,41 +381,62 @@ fn reset_channel_data(
         }
     }
 
-    for (component, info) in components.iter_mut().zip(component_infos) {
-        reset_simd_samples(component, sample_count, budget)?;
+    let mut deferred = false;
+    let last = component_count.saturating_sub(1);
+    for (idx, (component, info)) in components.iter_mut().zip(component_infos).enumerate() {
+        deferred |= reset_simd_samples(
+            component,
+            sample_count,
+            capacity_samples,
+            store_overwrites_planes,
+            defer_last_plane && idx == last,
+            budget,
+        )?;
         if exact_integer_decode {
             reset_integer_samples(component, sample_count, budget)?;
         }
         component.bit_depth = info.size_info.precision;
         component.signed = info.size_info.signed;
     }
-    Ok(())
+    Ok(deferred)
 }
 
+/// Reset one component plane. A retained plane that `store` will overwrite in
+/// full skips zeroing; see [`store_overwrites_every_plane_sample`]. With
+/// `defer`, a plane that needs a fresh allocation is charged but left empty;
+/// returns whether it was.
 fn reset_simd_samples(
     component: &mut ComponentData,
     sample_count: usize,
+    capacity_samples: usize,
+    store_overwrites_planes: bool,
+    defer: bool,
     budget: &mut ContextCapacityBudget,
-) -> Result<()> {
-    let planned_capacity =
-        SimdBuffer::<SIMD_WIDTH>::padded_len(sample_count).ok_or(ValidationError::ImageTooLarge)?;
+) -> Result<bool> {
+    let planned_capacity = SimdBuffer::<SIMD_WIDTH>::padded_len(capacity_samples.max(sample_count))
+        .ok_or(ValidationError::ImageTooLarge)?;
     if component.container.capacity() >= planned_capacity {
-        component
-            .container
-            .try_reset_zeros(sample_count)
-            .map_err(|_| DecodingError::HostAllocationFailed)?;
-        return Ok(());
+        let reset = if store_overwrites_planes {
+            component.container.try_reset_for_overwrite(sample_count)
+        } else {
+            component.container.try_reset_zeros(sample_count)
+        };
+        reset.map_err(|_| DecodingError::HostAllocationFailed)?;
+        return Ok(false);
     }
 
     let released_capacity = component.container.capacity();
     component.container = SimdBuffer::empty();
     budget.release_elements::<f32>(released_capacity)?;
     budget.include_elements::<f32>(planned_capacity)?;
-    let prepared =
-        SimdBuffer::try_zeros(sample_count).map_err(|_| DecodingError::HostAllocationFailed)?;
+    if defer {
+        return Ok(true);
+    }
+    let prepared = SimdBuffer::try_zeros_with_capacity(sample_count, capacity_samples)
+        .map_err(|_| DecodingError::HostAllocationFailed)?;
     budget.include_capacity_overage::<f32>(planned_capacity, prepared.capacity())?;
     component.container = prepared;
-    Ok(())
+    Ok(false)
 }
 
 fn reset_integer_samples(
@@ -332,7 +504,7 @@ fn checked_combined_context_bytes(left: usize, right: usize, cap: usize) -> Resu
     Ok(requested)
 }
 
-pub(in crate::j2c::decode) fn is_capacity_error(error: &DecodeError) -> bool {
+pub(crate) fn is_capacity_error(error: &DecodeError) -> bool {
     matches!(
         error,
         DecodeError::AllocationTooLarge { .. }
@@ -354,10 +526,6 @@ struct ContextCapacityBudget {
 }
 
 impl ContextCapacityBudget {
-    fn from_live_bytes(bytes: usize) -> Result<Self> {
-        Self::with_cap(bytes, DEFAULT_MAX_DECODE_BYTES)
-    }
-
     const fn with_cap(bytes: usize, cap: usize) -> Result<Self> {
         if bytes > cap {
             return Err(DecodeError::AllocationTooLarge {
@@ -430,13 +598,37 @@ mod ownership_tests;
 mod tests {
     use super::{
         checked_combined_context_bytes, reset_integer_samples, reset_simd_samples,
-        ContextCapacityBudget,
+        ContextCapacityBudget, TileDecodeContext,
     };
-    use crate::error::DecodeError;
+    use crate::error::{DecodeError, DecodingError};
     use crate::j2c::ComponentData;
     use crate::math::{SimdBuffer, SIMD_WIDTH};
     use alloc::{vec, vec::Vec};
     use core::mem::size_of;
+
+    #[test]
+    fn planes_left_unzeroed_must_be_stored_in_full() {
+        let mut context = TileDecodeContext::default();
+        context
+            .ensure_unzeroed_planes_overwritten()
+            .expect("zeroed planes need no full store");
+
+        context.unzeroed_plane_samples = 3 * 64;
+        context.stored_plane_samples = 3 * 64 - 1;
+        let error = context
+            .ensure_unzeroed_planes_overwritten()
+            .expect_err("a partly stored plane must fail");
+        assert!(matches!(
+            error,
+            DecodeError::Decoding(DecodingError::IncompletePlaneStore)
+        ));
+        assert!(error.to_string().contains("not fully written"), "{error}");
+
+        context.stored_plane_samples = 3 * 64;
+        context
+            .ensure_unzeroed_planes_overwritten()
+            .expect("fully stored planes");
+    }
 
     #[test]
     fn retained_context_baseline_accepts_exact_cap_and_rejects_one_over() {
@@ -494,6 +686,31 @@ mod tests {
     }
 
     #[test]
+    fn capacity_failure_after_streamed_rows_is_not_retried() {
+        let mut context = super::DecoderContext::default();
+        context
+            .tile_decode_context
+            .idwt_scratch_buffer
+            .try_reserve_exact(8)
+            .expect("reserve deterministic retained scratch");
+        let scratch_bytes = context
+            .tile_decode_context
+            .retained_scratch_bytes()
+            .expect("scratch capacity bytes");
+        context.tile_decode_context.streamed_samples = 1;
+        let first_result = context.prepare_reused_decode_baseline_with_cap(0, scratch_bytes - 1);
+        let result =
+            context.retry_without_retained_scratch_on_capacity(scratch_bytes, first_result, |_| {
+                panic!("a decode that reached the sink must not rerun")
+            });
+        assert!(matches!(
+            result,
+            Err(DecodeError::AllocationTooLarge { .. })
+        ));
+        assert_eq!(context.workspace_stats().scratch_capacity_retries(), 0);
+    }
+
+    #[test]
     fn context_budget_release_replaces_old_owner_without_double_counting() {
         let mut budget = ContextCapacityBudget::with_cap(8, 8).expect("full old owner");
         budget.release_bytes(5).expect("release old capacity");
@@ -530,7 +747,8 @@ mod tests {
         let mut budget = ContextCapacityBudget::with_cap(owner_bytes, owner_bytes)
             .expect("existing owners fit exact test cap");
 
-        reset_simd_samples(&mut component, 3, &mut budget).expect("reuse SIMD owner");
+        reset_simd_samples(&mut component, 3, 3, false, false, &mut budget)
+            .expect("reuse SIMD owner");
         reset_integer_samples(&mut component, 3, &mut budget).expect("reuse integer owner");
 
         assert_eq!(component.container.as_ptr(), sample_ptr);
@@ -548,7 +766,8 @@ mod tests {
             .as_mut()
             .expect("integer owner")
             .fill(29);
-        reset_simd_samples(&mut component, 17, &mut budget).expect("regrow SIMD owner");
+        reset_simd_samples(&mut component, 17, 17, false, false, &mut budget)
+            .expect("regrow SIMD owner");
         reset_integer_samples(&mut component, 17, &mut budget).expect("regrow integer owner");
 
         assert_eq!(component.container.as_ptr(), sample_ptr);

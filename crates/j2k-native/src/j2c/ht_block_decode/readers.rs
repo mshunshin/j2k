@@ -5,11 +5,40 @@ pub(super) struct MelDecoder<'a> {
     pos: usize,
     remaining: usize,
     unstuff: bool,
-    current_byte: u8,
-    bits_left: u8,
+    /// Unread bits, the next one in bit 63.
+    reservoir: u64,
+    bits: u32,
     k: usize,
     num_runs: usize,
     runs: u64,
+}
+
+/// One MEL symbol for each state `k` (a row of 64) and the next six bits:
+/// `consumed | run << 3 | next_k << 9`, with `run` as
+/// [`MelDecoder::get_run`] returns it.
+const MEL_SYMBOLS: [u16; 16 * 64] = mel_symbols();
+
+#[expect(clippy::cast_possible_truncation, reason = "table fields below 64")]
+const fn mel_symbols() -> [u16; 16 * 64] {
+    const MEL_EXP: [u16; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 5];
+    let mut table = [0; 16 * 64];
+    let mut index = 0;
+    while index < 13 * 64 {
+        let (k, bits) = (index / 64, (index % 64) as u16);
+        let eval = MEL_EXP[k];
+        table[index] = if bits & 0x20 != 0 {
+            // A one: 2^eval zero events, and the next state up.
+            let next = if k < 12 { k + 1 } else { 12 };
+            1 | ((((1 << eval) - 1) << 1) << 3) | ((next as u16) << 9)
+        } else {
+            // A zero and `eval` bits: that many zero events, then a one.
+            let zeros = (bits >> (5 - eval)) & ((1 << eval) - 1);
+            let next = k.saturating_sub(1);
+            (1 + eval) | (((zeros << 1) | 1) << 3) | ((next as u16) << 9)
+        };
+        index += 1;
+    }
+    table
 }
 
 impl<'a> MelDecoder<'a> {
@@ -19,16 +48,19 @@ impl<'a> MelDecoder<'a> {
             pos: lcup - scup,
             remaining: scup - 1,
             unstuff: false,
-            current_byte: 0,
-            bits_left: 0,
+            reservoir: 0,
+            bits: 0,
             k: 0,
             num_runs: 0,
             runs: 0,
         }
     }
 
-    fn read_bit(&mut self) -> Option<u32> {
-        if self.bits_left == 0 {
+    /// Top the reservoir up to at least 49 bits, a byte at a time. A byte
+    /// after `0xFF` carries its low seven bits, the last byte has its low
+    /// four bits set, and `0xFF` bytes follow it.
+    fn fill(&mut self) -> Option<()> {
+        while self.bits <= 48 {
             let mut byte = if self.remaining > 0 {
                 let byte = self.data.get(self.pos).copied()?;
                 self.pos += 1;
@@ -37,56 +69,49 @@ impl<'a> MelDecoder<'a> {
             } else {
                 0xFF
             };
-
             if self.remaining == 0 {
                 byte |= 0x0F;
             }
-
-            self.current_byte = byte;
-            self.bits_left = 8 - u8::from(self.unstuff);
+            let count = 8 - u32::from(self.unstuff);
+            let value = u64::from(byte) & ((1 << count) - 1);
+            self.reservoir |= value << (64 - self.bits - count);
+            self.bits += count;
             self.unstuff = byte == 0xFF;
         }
-
-        self.bits_left -= 1;
-        Some(u32::from((self.current_byte >> self.bits_left) & 1))
+        Some(())
     }
 
-    fn read_bits(&mut self, count: usize) -> Option<u32> {
-        let mut value = 0;
-
-        for _ in 0..count {
-            value = (value << 1) | self.read_bit()?;
-        }
-
-        Some(value)
-    }
-
+    /// Queue eight runs. Out of line: the pair loops only pop the queue.
+    #[inline(never)]
     fn decode_more_runs(&mut self) -> Option<()> {
-        const MEL_EXP: [usize; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 5];
-
+        // A symbol takes at most six bits, so one fill covers all eight.
+        self.fill()?;
         while self.num_runs < 8 {
-            let eval = MEL_EXP[self.k];
-            let first = self.read_bit()?;
-            let run = if first == 1 {
-                self.k = (self.k + 1).min(12);
-                ((1usize << eval) - 1) << 1
-            } else {
-                self.k = self.k.saturating_sub(1);
-                (self.read_bits(eval)? as usize) << 1 | 1
-            };
-
-            self.runs |= (run as u64) << (self.num_runs * 7);
+            let next_bits = (self.reservoir >> 58) as usize;
+            let entry = MEL_SYMBOLS[(self.k * 64 + next_bits) & 0x3FF];
+            let consumed = u32::from(entry & 7);
+            self.reservoir <<= consumed;
+            self.bits -= consumed;
+            self.runs |= u64::from((entry >> 3) & 0x3F) << (self.num_runs * 7);
+            self.k = usize::from(entry >> 9);
             self.num_runs += 1;
-
-            if eval == 5 && first == 0 && self.num_runs >= 8 {
-                break;
-            }
         }
 
         Some(())
     }
 
     pub(super) fn get_run(&mut self) -> Option<i32> {
+        self.get_run_with::<true>()
+    }
+
+    /// [`Self::get_run`]. `INLINE` inlines it, refill included, so a loop
+    /// around it makes no call and keeps the decoder in registers.
+    #[expect(clippy::inline_always, reason = "per-pair hot path")]
+    #[inline(always)]
+    pub(super) fn get_run_with<const INLINE: bool>(&mut self) -> Option<i32> {
+        if !INLINE {
+            return self.get_run();
+        }
         if self.num_runs == 0 {
             self.decode_more_runs()?;
         }
@@ -97,6 +122,10 @@ impl<'a> MelDecoder<'a> {
         Some(run)
     }
 }
+
+/// Bit 7 of every byte of a word, where the SWAR stuffing checks keep
+/// their per-byte flags.
+const BYTE_HIGH_BITS: u64 = 0x8080_8080_8080_8080;
 
 /// `Clone` (not `Copy`) keeps the by-value refill hand-offs explicit.
 #[derive(Clone)]
@@ -238,7 +267,7 @@ impl<'a> ReverseBitReader<'a> {
         reason = "nonnegative live cursor; per-quad refill check"
     )]
     #[inline(always)]
-    fn fill(&mut self) {
+    fn fill<const INLINE_REFILL: bool>(&mut self) {
         if self.bits > 0 && self.remaining >= 4 && self.pos >= 3 {
             let last = self.pos as usize;
             if let Some(&[b3, b2, b1, b0]) = self.data.get(last - 3..=last) {
@@ -260,14 +289,28 @@ impl<'a> ReverseBitReader<'a> {
                 }
             }
         }
-        *self = self.clone().fill_bytes();
+        *self = if INLINE_REFILL {
+            self.clone().refill_bytes()
+        } else {
+            self.clone().fill_bytes()
+        };
     }
 
     /// By value for the same reason as [`ForwardBitReader::fill_bytes`].
-    #[expect(clippy::cast_sign_loss, reason = "nonnegative live cursor")]
     #[cold]
     #[inline(never)]
-    fn fill_bytes(mut self) -> Self {
+    fn fill_bytes(self) -> Self {
+        self.refill_bytes()
+    }
+
+    /// The byte loop of [`Self::fill_bytes`], inlined by [`Self::fetch_with`].
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::inline_always,
+        reason = "nonnegative live cursor; callers choose the out-of-line form"
+    )]
+    #[inline(always)]
+    fn refill_bytes(mut self) -> Self {
         while self.bits <= 32 {
             let byte = if self.remaining > 0 {
                 let byte = self.data[self.pos as usize];
@@ -289,15 +332,65 @@ impl<'a> ReverseBitReader<'a> {
         self
     }
 
+    #[expect(clippy::inline_always, reason = "per-quad hot path")]
+    #[inline(always)]
+    pub(super) fn fetch(&mut self) -> u32 {
+        self.fetch_with::<false>()
+    }
+
+    /// [`Self::fetch_with`] for the per-pair loops, without its data-dependent
+    /// refill branch: unless a byte below the cursor is stuffed or fewer than
+    /// eight remain, OR the eight bytes below the cursor in above the
+    /// reservoir's bits and consume the whole bytes that fit, leaving 56 to 63
+    /// bits. Bits above the count then hold the next byte's leading bits, the
+    /// same bits the next top-up ORs in again.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::inline_always,
+        reason = "low reservoir word; nonnegative live cursor; per-pair hot path"
+    )]
+    #[inline(always)]
+    pub(super) fn fetch_topped_up<const INLINE_REFILL: bool>(&mut self) -> u32 {
+        if self.remaining >= 8 && self.pos >= 7 {
+            let last = self.pos as usize;
+            if let Some(&bytes) = self.data.get(last - 7..=last).and_then(<[u8]>::first_chunk) {
+                // `data[last]` is consumed first, so it lands in the low byte.
+                // The per-byte flags are as in `fill`.
+                let word = u64::from_be_bytes(bytes);
+                let above_8f = word
+                    & BYTE_HIGH_BITS
+                    & ((word & 0x7070_7070_7070_7070) + 0x7070_7070_7070_7070);
+                let low_ones =
+                    ((word & 0x7F7F_7F7F_7F7F_7F7F) + 0x0101_0101_0101_0101) & BYTE_HIGH_BITS;
+                let after_above_8f = (above_8f << 8) | (u64::from(self.unstuff) << 7);
+                if after_above_8f & low_ones == 0 {
+                    let bytes = (63 - self.bits) >> 3;
+                    self.tmp |= word << self.bits;
+                    self.bits += 8 * bytes;
+                    self.pos -= bytes as isize;
+                    self.remaining -= bytes as usize;
+                    // Whether the last byte consumed is above 0x8F.
+                    self.unstuff = (after_above_8f >> (8 * bytes + 7)) & 1 != 0;
+                    return self.tmp as u32;
+                }
+            }
+        }
+        self.fetch_with::<INLINE_REFILL>()
+    }
+
+    /// [`Self::fetch`]. `INLINE_REFILL` inlines the byte refill too, so a
+    /// loop around it makes no call and keeps the reader in registers.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::inline_always,
         reason = "low reservoir word; per-quad hot path"
     )]
     #[inline(always)]
-    pub(super) fn fetch(&mut self) -> u32 {
+    pub(super) fn fetch_with<const INLINE_REFILL: bool>(&mut self) -> u32 {
         if self.bits < 32 {
-            self.fill();
+            self.fill::<INLINE_REFILL>();
         }
 
         self.tmp as u32
@@ -313,6 +406,22 @@ impl<'a> ReverseBitReader<'a> {
         debug_assert!(count <= self.bits);
         self.tmp >>= count;
         self.bits -= count;
+        self.tmp as u32
+    }
+
+    /// [`Self::advance`] past a VLC codeword whose decode-table `entry` holds
+    /// its length in bits 0-2 and zeros in bits 3-5, so the reservoir shift
+    /// takes the entry's low six bits directly.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::inline_always,
+        reason = "low reservoir word; per-quad hot path"
+    )]
+    #[inline(always)]
+    pub(super) fn advance_entry(&mut self, entry: u32) -> u32 {
+        debug_assert!(entry & 0x38 == 0 && entry & 0x7 <= self.bits);
+        self.tmp >>= entry & 0x3F;
+        self.bits -= entry & 0x7;
         self.tmp as u32
     }
 }
@@ -400,8 +509,6 @@ pub(super) fn unstuff_magsgn<'a>(
 pub(super) struct FlatBitReader<'a> {
     data: &'a [u8],
     last_window: usize,
-    #[cfg(feature = "simd")]
-    last_window16: usize,
     position: usize,
 }
 
@@ -409,9 +516,6 @@ impl<'a> FlatBitReader<'a> {
     pub(super) fn new(data: &'a [u8]) -> Option<Self> {
         Some(Self {
             last_window: data.len().checked_sub(8 + FLAT_MAGSGN_PADDING)? + FLAT_MAGSGN_PADDING,
-            // At least 24 bytes are present here, so this cannot underflow.
-            #[cfg(feature = "simd")]
-            last_window16: data.len() - 16,
             data,
             position: 0,
         })
@@ -433,9 +537,9 @@ impl<'a> FlatBitReader<'a> {
     }
 
     /// The 16 bytes starting at the byte that holds bit `position`, and that
-    /// bit's offset within the byte. A window past the data is clamped to the
-    /// last 16 bytes, which are padding (all ones) like everything after the
-    /// data, so the bits read are unchanged.
+    /// bit's offset within the byte. A window running past the data reads all
+    /// ones, like the padding that ends the data and everything after it, so
+    /// the bits read are unchanged.
     #[cfg(feature = "simd")]
     #[expect(
         clippy::cast_possible_truncation,
@@ -443,9 +547,13 @@ impl<'a> FlatBitReader<'a> {
         reason = "bit offset below 8; per-quad hot path"
     )]
     #[inline(always)]
-    pub(super) fn window16(&self, position: usize) -> (&[u8], u32) {
-        let byte = (position >> 3).min(self.last_window16);
-        (&self.data[byte..byte + 16], (position & 7) as u32)
+    pub(super) fn window16(&self, position: usize) -> (&[u8; 16], u32) {
+        let window = self
+            .data
+            .get(position >> 3..)
+            .and_then(<[u8]>::first_chunk::<16>)
+            .unwrap_or(&[0xFF; 16]);
+        (window, (position & 7) as u32)
     }
 
     /// The next 32 bits, least significant first.
@@ -480,3 +588,235 @@ pub(super) fn read_u32_pair(values: &[u16], index: usize) -> u32 {
 
 #[cfg(test)]
 mod tests;
+
+/// Largest cleanup suffix (MEL + VLC) in bytes, Clause 7.1.4.
+#[cfg_attr(
+    not(any(test, feature = "simd")),
+    expect(dead_code, reason = "only SIMD HT decoding sizes flat VLC bits")
+)]
+pub(super) const MAX_CLEANUP_SUFFIX: usize = 4079;
+
+/// Padding after the unstuffed VLC bytes: one top-up window past the data,
+/// and the window a clamped top-up reads, both all zeros.
+const FLAT_VLC_PADDING: usize = 16;
+
+/// Bytes of VLC data a `width` x `height` block can consume: a quad pair takes
+/// at most 30 bits (two seven-bit codewords and a 16-bit U-VLC pair), and the
+/// pairs of a quad row cover four columns.
+#[cfg_attr(
+    not(any(test, feature = "simd")),
+    expect(dead_code, reason = "only SIMD HT decoding sizes flat VLC bits")
+)]
+pub(super) fn flat_vlc_consumable(width: u32, height: u32) -> usize {
+    let pairs = (width.div_ceil(4) as usize).saturating_mul(height.div_ceil(2) as usize);
+    pairs
+        .saturating_mul(30)
+        .div_ceil(8)
+        .saturating_add(1)
+        .min(MAX_CLEANUP_SUFFIX)
+}
+
+/// Capacity of the flat VLC buffer of a `width` x `height` block.
+#[cfg_attr(
+    not(any(test, feature = "simd")),
+    expect(dead_code, reason = "only SIMD HT decoding reserves flat VLC bits")
+)]
+pub(super) fn flat_vlc_capacity(width: u32, height: u32) -> usize {
+    flat_vlc_consumable(width, height) + FLAT_VLC_PADDING
+}
+
+/// The VLC bits of a cleanup segment, in the order [`ReverseBitReader`]
+/// consumes them, as a forward byte buffer read least significant bit first
+/// and padded with zeros: the bits of [`ReverseBitReader::new_vlc`] and its
+/// byte loop (a byte after one above 0x8F whose low seven bits are all ones
+/// carries seven bits), then the zeros it reads past the segment. `out` is
+/// reserved for its block ([`flat_vlc_capacity`]); a block cannot read more
+/// than the bytes before the padding, so a longer segment stops there.
+#[cfg_attr(
+    not(any(test, feature = "simd")),
+    expect(dead_code, reason = "only SIMD HT decoding reads flat VLC bits")
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the low byte of the bit accumulator is emitted on purpose"
+)]
+pub(super) fn unstuff_vlc<'a>(
+    data: &[u8],
+    lcup: usize,
+    scup: usize,
+    out: &'a mut alloc::vec::Vec<u8>,
+) -> Option<&'a [u8]> {
+    let consumable = out.capacity().checked_sub(FLAT_VLC_PADDING)?;
+    out.clear();
+    let first = *data.get(lcup.checked_sub(2)?)?;
+    let mut acc = u64::from(first >> 4);
+    let mut bits = 4 - u32::from((acc & 0x7) == 0x7);
+    let mut unstuff = first > 0x8F;
+    let bytes = data.get(lcup.checked_sub(scup)?..lcup - 2)?;
+    let mut index = bytes.len();
+    while index > 0 && out.len() < consumable {
+        if let Some(&chunk) = index
+            .checked_sub(8)
+            .and_then(|start| bytes.get(start..index))
+            .and_then(<[u8]>::first_chunk::<8>)
+        {
+            // Eight bytes with no stuffed one, the last in the low byte, as
+            // in `ReverseBitReader::fill`: all 64 bits are data, appended
+            // after the `bits` pending bits.
+            let word = u64::from_be_bytes(chunk);
+            let above_8f =
+                word & BYTE_HIGH_BITS & ((word & 0x7070_7070_7070_7070) + 0x7070_7070_7070_7070);
+            let low_ones =
+                ((word & 0x7F7F_7F7F_7F7F_7F7F) + 0x0101_0101_0101_0101) & BYTE_HIGH_BITS;
+            let after_above_8f = (above_8f << 8) | (u64::from(unstuff) << 7);
+            if after_above_8f & low_ones == 0 {
+                out.extend_from_slice(&(acc | (word << bits)).to_le_bytes());
+                acc = if bits == 0 { 0 } else { word >> (64 - bits) };
+                unstuff = above_8f >> 63 != 0;
+                index -= 8;
+                continue;
+            }
+        }
+        index -= 1;
+        let byte = bytes[index];
+        let stuffed = unstuff && (byte & 0x7F) == 0x7F;
+        let value = if stuffed { byte & 0x7F } else { byte };
+        acc |= u64::from(value) << bits;
+        bits += 8 - u32::from(stuffed);
+        unstuff = byte > 0x8F;
+        if bits >= 8 {
+            out.push(acc as u8);
+            acc >>= 8;
+            bits -= 8;
+        }
+    }
+    if bits > 0 {
+        out.push(acc as u8);
+    }
+    out.truncate(consumable);
+    out.resize(out.len() + FLAT_VLC_PADDING, 0);
+    Some(out.as_slice())
+}
+
+/// VLC bits read from an [`unstuff_vlc`] buffer through a 64-bit reservoir.
+/// Every top-up is branch-free: it ORs the eight bytes at the cursor in
+/// above the buffered bits and consumes the whole bytes that fit. Bits above
+/// the count hold the next byte's leading bits, the same bits the next
+/// top-up ORs in again.
+#[cfg_attr(
+    not(any(test, feature = "simd")),
+    expect(dead_code, reason = "only SIMD HT decoding reads flat VLC bits")
+)]
+pub(super) struct FlatVlcReader<'a> {
+    data: &'a [u8],
+    /// The last eight-byte window inside the buffer; every window from there
+    /// on reads only padding.
+    last_window: usize,
+    pos: usize,
+    tmp: u64,
+    bits: u32,
+}
+
+#[cfg_attr(
+    not(any(test, feature = "simd")),
+    expect(dead_code, reason = "only SIMD HT decoding reads flat VLC bits")
+)]
+impl<'a> FlatVlcReader<'a> {
+    pub(super) fn new(data: &'a [u8]) -> Option<Self> {
+        let mut reader = Self {
+            last_window: data.len().checked_sub(8)?,
+            data,
+            pos: 0,
+            tmp: 0,
+            bits: 0,
+        };
+        // Start with 56 bits buffered, as every later top-up leaves them.
+        let _ = reader.top_up::<true>();
+        Some(reader)
+    }
+}
+
+/// The VLC bit source of the cleanup pair decoders.
+pub(super) trait VlcBits {
+    /// Top the reservoir up to at least 33 bits and return a word whose low
+    /// seven bits are the next ones; read later bits through the advances.
+    fn top_up<const INLINE_REFILL: bool>(&mut self) -> u32;
+    /// Consume `count` bits and return the new low reservoir word.
+    fn advance(&mut self, count: u32) -> u32;
+    /// Consume the codeword of a VLC decode-table `entry`, whose length is
+    /// in bits 0-2 with zeros in bits 3-5.
+    fn advance_entry(&mut self, entry: u32) -> u32;
+}
+
+impl VlcBits for ReverseBitReader<'_> {
+    #[expect(clippy::inline_always, reason = "per-pair hot path")]
+    #[inline(always)]
+    fn top_up<const INLINE_REFILL: bool>(&mut self) -> u32 {
+        self.fetch_topped_up::<INLINE_REFILL>()
+    }
+
+    #[expect(clippy::inline_always, reason = "per-quad hot path")]
+    #[inline(always)]
+    fn advance(&mut self, count: u32) -> u32 {
+        ReverseBitReader::advance(self, count)
+    }
+
+    #[expect(clippy::inline_always, reason = "per-quad hot path")]
+    #[inline(always)]
+    fn advance_entry(&mut self, entry: u32) -> u32 {
+        ReverseBitReader::advance_entry(self, entry)
+    }
+}
+
+impl VlcBits for FlatVlcReader<'_> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::inline_always,
+        reason = "low reservoir word; per-pair hot path"
+    )]
+    #[inline(always)]
+    fn top_up<const INLINE_REFILL: bool>(&mut self) -> u32 {
+        // Past the data every window is padding, so clamping it is exact.
+        let start = self.pos.min(self.last_window);
+        let word = self
+            .data
+            .get(start..)
+            .and_then(<[u8]>::first_chunk::<8>)
+            .map_or(0, |bytes| u64::from_le_bytes(*bytes));
+        // The word before the top-up: a pair consumes at most 30 bits, so
+        // 26 or more of the 56 a top-up leaves are still buffered, more than
+        // the seven bits of a pair's first lookup, which then does not wait
+        // for the top-up.
+        let peek = self.tmp as u32;
+        self.tmp |= word << self.bits;
+        self.pos += ((63 - self.bits) >> 3) as usize;
+        self.bits |= 0x38;
+        peek
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::inline_always,
+        reason = "low reservoir word; per-quad hot path"
+    )]
+    #[inline(always)]
+    fn advance(&mut self, count: u32) -> u32 {
+        debug_assert!(count <= self.bits);
+        self.tmp >>= count;
+        self.bits -= count;
+        self.tmp as u32
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::inline_always,
+        reason = "low reservoir word; per-quad hot path"
+    )]
+    #[inline(always)]
+    fn advance_entry(&mut self, entry: u32) -> u32 {
+        debug_assert!(entry & 0x38 == 0 && entry & 0x7 <= self.bits);
+        self.tmp >>= entry & 0x3F;
+        self.bits -= entry & 0x7;
+        self.tmp as u32
+    }
+}

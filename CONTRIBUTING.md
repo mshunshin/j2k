@@ -47,6 +47,9 @@ fails until the required quick backend job names have succeeded:
 - `CUDA quick validation` for CUDA or shared GPU changes.
 - `Metal quick validation` for Metal or shared GPU changes.
 
+Successful GPU validation automatically retries failed jobs in the latest PR checks run for that exact head SHA if its GPU evidence job failed.
+This includes fork PRs validated through a maintainer review branch.
+
 A release candidate needs one `target=all`, `mode=full` dispatch for its exact
 commit in which `CUDA full release validation` and `Metal full release
 validation` both succeed. Performance and profiling runs go in the separate
@@ -76,7 +79,15 @@ surface behavior should update:
   codec support changes
 - `cargo xtask semver` for the stable published libraries
 
+A pull request that can change a published crate's API runs the `Public API
+review` job, which runs `cargo xtask stable-api` and `cargo xtask semver` on
+hosted macOS. Update the snapshots and the reviewed API evidence in the same
+pull request, so the change is reviewed before it reaches `main`.
+
 ## Releases
 
 The release process and its required checks are in
 [`xtask/RELEASING.md`](xtask/RELEASING.md).
+
+Publish `j2k-mpsgraph-support` before using it in a registry-only build of the
+JPEG XR consumer. Local Cargo source patches validate development changes only.

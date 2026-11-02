@@ -42,10 +42,11 @@ fn prepared_htj2k_gray_and_rgb_support_native_types_and_requests_exactly() {
                 components, precision, signed, WIDTH, HEIGHT,
             ));
             for layout in [BatchLayout::Nchw, BatchLayout::Nhwc] {
-                let options = BatchDecodeOptions {
-                    workers: NonZeroUsize::new(1),
-                    layout,
-                    ..BatchDecodeOptions::default()
+                let options = {
+                    let mut options = BatchDecodeOptions::default();
+                    options.workers = NonZeroUsize::new(1);
+                    options.layout = layout;
+                    options
                 };
                 let mut decoder = CpuBatchDecoder::new(options);
                 let prepared = decoder
@@ -85,7 +86,9 @@ fn prepared_htj2k_gray_and_rgb_support_native_types_and_requests_exactly() {
                 let stats = decoder.workspace_stats();
                 assert_eq!(stats.preparation_calls(), requests.len() as u64);
                 assert_eq!(stats.prepared_plan_decode_calls(), requests.len() as u64);
-                assert_eq!(stats.flattened_group_plans(), requests.len() as u64);
+                // Each request is a group of one image, which decodes its
+                // plan with inner parallelism and flattens no payloads.
+                assert_eq!(stats.flattened_group_plans(), 0);
                 assert_eq!(stats.output_group_allocations(), requests.len() as u64);
                 assert_eq!(stats.output_compaction_copied_samples(), 0);
             }

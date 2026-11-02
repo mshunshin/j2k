@@ -24,7 +24,6 @@ use super::decode_dispatch::{
 };
 use super::direct_roi::{
     idwt_input_windows_from_slices, prepared_idwt_output_len, prepared_idwt_params,
-    BandRequiredRegion,
 };
 use super::{
     commit_and_wait_metal, emit_direct_hybrid_stage_timings,
@@ -36,7 +35,7 @@ use super::{
     encode_stacked_direct_gray_batch, j2k_scalar_pack_params, lookup_direct_band_slice,
     lookup_direct_band_slice_entry, metal_profile_stages_enabled, new_command_buffer,
     new_compute_command_encoder, prepared_direct_color_plan_supports_runtime,
-    recycle_scratch_buffers, retire_direct_status_checks,
+    push_member_band_slices, recycle_scratch_buffers, retire_direct_status_checks,
     supports_stacked_direct_component_plane_batch, take_f32_scratch_buffer,
     try_encode_stacked_mct_rgb8_direct_color_batch, wait_for_completion_metal, with_runtime,
     with_runtime_for_device, Buffer, CommandBuffer, CommandBufferRef,
@@ -56,7 +55,9 @@ mod destination_index_validation;
 mod grayscale_batch;
 mod sampled_color;
 mod single;
-pub(crate) use sampled_color::decode_component_grid_color_batch;
+pub(crate) use sampled_color::{
+    decode_component_grid_color_batch, prepare_component_grid_color_plan,
+};
 
 pub(in crate::engine) use self::allocation::extend_preallocated_retained_buffers;
 use self::allocation::{
@@ -72,9 +73,11 @@ pub(crate) use self::color_destination::{
     submit_prepared_direct_color_plan_batches_into_groups, ColorGroupSubmission,
 };
 pub(in crate::engine) use self::component_plane::{
-    checked_coefficient_len, encode_prepared_direct_component_plane_in_command_buffer,
-    encode_prepared_direct_component_plane_in_encoder, upload_cpu_decoded_coefficients,
-    DirectComponentPlaneRequest,
+    checked_coefficient_len, encode_merged_final_level_ht_groups,
+    encode_prepared_direct_component_plane_before_final_level,
+    encode_prepared_direct_component_plane_in_command_buffer,
+    encode_prepared_direct_component_plane_in_encoder, final_identity_stored_level,
+    upload_cpu_decoded_coefficients, DirectComponentPlaneRequest, FinalLevelInputs,
 };
 pub(crate) use self::destination::{
     submit_prepared_direct_grayscale_plan_batch_into_group, DirectDestinationConsumerOrdering,

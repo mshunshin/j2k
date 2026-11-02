@@ -32,6 +32,7 @@ use j2k_native::{DecodeSettings, Image};
 // Gating helper — mirrors the pattern in htj2k_cuda_kernels.rs (line 24–26).
 // ---------------------------------------------------------------------------
 
+use j2k_test_support::cuda_oxide_ptx_missing_is_skip;
 #[cfg(feature = "cuda-runtime")]
 use j2k_test_support::cuda_runtime_gate;
 
@@ -450,6 +451,59 @@ const MATRIX_LEVELS: &[u8] = &[0, 1, 3];
 
 #[cfg(feature = "cuda-runtime")]
 #[test]
+fn cuda_independent_encoders_match_native_concurrently_when_required() {
+    use j2k_core::BackendKind;
+    use j2k_cuda::CudaLosslessEncoder;
+    use std::sync::Barrier;
+
+    if !cuda_runtime_gate(module_path!()) {
+        return;
+    }
+    let cell = ParityCell {
+        w: 4096,
+        h: 2048,
+        comps: 3,
+        depth: 8,
+        signed: false,
+        levels: 5,
+    };
+    let pixels = synthesize_pixels(&cell);
+    let samples = J2kLosslessSamples::new(&pixels, cell.w, cell.h, 3, 8, false)
+        .expect("valid concurrent encode samples");
+    let options = cell_encode_options(&cell);
+    let expected = encode_j2k_lossless(
+        samples,
+        &options.with_backend(EncodeBackendPreference::CpuOnly),
+    )
+    .expect("native reference");
+    let options = options.with_backend(EncodeBackendPreference::RequireDevice);
+    let barrier = Barrier::new(4);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut encoder = CudaLosslessEncoder::new();
+                    barrier.wait();
+                    let result = encoder.encode(samples, &options);
+                    // Joined results retain all contexts until every worker finishes.
+                    (encoder, result)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("encoder worker"))
+            .collect::<Vec<_>>()
+    });
+    for (_encoder, result) in results {
+        let result = result.expect("concurrent device encode");
+        assert_eq!(result.actual_backend(), BackendKind::Cuda);
+        assert_eq!(result.encoded().codestream, expected.codestream);
+    }
+}
+
+#[cfg(feature = "cuda-runtime")]
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "facade matrix is one release parity contract across component and sample modes"
@@ -735,9 +789,9 @@ fn lossless_facade_in_scope_input_never_hits_ok_none_fallback() {
             );
         }
         Err(err) => {
-            // Strict encode error is expected when CUDA is unavailable.
+            // Strict encode error is expected when CUDA or its kernels are unavailable.
             assert!(
-                err.is_unsupported(),
+                err.is_unsupported() || cuda_oxide_ptx_missing_is_skip(&err, module_path!()),
                 "rejection for an in-scope input must be a typed unsupported error, not an internal panic or silent fallback: {err}"
             );
         }

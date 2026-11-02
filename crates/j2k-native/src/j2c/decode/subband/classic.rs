@@ -7,24 +7,84 @@ use super::{
     classic_decode_job_parameters, code_block_required_by_index, collect_pending_classic_blocks,
     count_classic_code_blocks, decode_j2k_code_block_scalar_with_workspace,
     decode_j2k_code_block_scalar_with_workspace_midpoint,
-    should_decode_classic_sub_band_in_parallel, ComponentInfo, CpuDecodeParallelism,
-    DecodeAllocationBudget, DecodingError, DecompositionStorage, Header, HtCodeBlockDecoder,
-    J2kCodeBlockBatchJob, J2kCodeBlockDecodeJob, J2kCodeBlockDecodeWorkspace, J2kSubBandDecodeJob,
-    Result, SubBand, TileDecodeContext, Vec, MAX_BITPLANE_COUNT,
+    should_decode_classic_sub_band_in_parallel, stored_placement, tier1_code_blocks, ComponentInfo,
+    CpuDecodeParallelism, DecodeAllocationBudget, DecodingError, DecompositionStorage, Header,
+    HtCodeBlockDecoder, J2kCodeBlockBatchJob, J2kCodeBlockDecodeJob, J2kCodeBlockDecodeWorkspace,
+    J2kSubBandDecodeJob, Result, SubBand, TileDecodeContext, Vec, MAX_BITPLANE_COUNT,
 };
 use crate::backend::{j2k_code_block_reconstruction, j2k_sub_band_reconstruction};
 use crate::j2c::build::CodeBlockCoding;
 
+use crate::{J2kCodeBlockSegment, J2kCodeBlockStyle, J2kSubBandType};
+
 #[cfg(feature = "parallel")]
 use super::{
     copy_decoded_classic_blocks_to_sub_band, decode_classic_sub_band_blocks_parallel,
-    release_coefficient_slab, ClassicParallelParameters,
+    release_coefficient_slab,
 };
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "the codec float domain intentionally receives bounded integer samples at this rounding boundary"
-)]
+/// A sub-band's share of each classic code-block decode job.
+#[derive(Clone, Copy)]
+pub(super) struct ClassicJobParameters {
+    pub(super) sub_band_type: J2kSubBandType,
+    pub(super) style: J2kCodeBlockStyle,
+    pub(super) strict: bool,
+    pub(super) total_bitplanes: u8,
+    pub(super) roi_shift: u8,
+    pub(super) dequantization_step: f32,
+    pub(super) irreversible_midpoint: bool,
+}
+
+impl ClassicJobParameters {
+    /// The decode job for one code block of the sub-band, whose payload
+    /// `data` splits into `segments`, with rows `output_stride` samples apart.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the block's own job fields are passed explicitly, as the job names them"
+    )]
+    pub(super) fn job<'a>(
+        self,
+        data: &'a [u8],
+        segments: &'a [J2kCodeBlockSegment],
+        width: u32,
+        height: u32,
+        output_stride: usize,
+        missing_bit_planes: u8,
+        number_of_coding_passes: u8,
+    ) -> J2kCodeBlockDecodeJob<'a> {
+        J2kCodeBlockDecodeJob {
+            data,
+            segments,
+            width,
+            height,
+            output_stride,
+            missing_bit_planes,
+            number_of_coding_passes,
+            total_bitplanes: self.total_bitplanes,
+            roi_shift: self.roi_shift,
+            sub_band_type: self.sub_band_type,
+            style: self.style,
+            strict: self.strict,
+            dequantization_step: self.dequantization_step,
+        }
+    }
+
+    /// Decode `job` with the CPU decoder, reconstructing at the midpoint when
+    /// the sub-band asks for it.
+    pub(super) fn decode(
+        self,
+        job: J2kCodeBlockDecodeJob<'_>,
+        output: &mut [f32],
+        workspace: &mut J2kCodeBlockDecodeWorkspace,
+    ) -> Result<()> {
+        if self.irreversible_midpoint {
+            decode_j2k_code_block_scalar_with_workspace_midpoint(job, output, workspace)
+        } else {
+            decode_j2k_code_block_scalar_with_workspace(job, output, workspace)
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the Tier-1 boundary keeps geometry, state buffers, and validated options explicit"
@@ -60,8 +120,17 @@ pub(super) fn decode_sub_band_classic_blocks(
         );
     }
 
-    let (job_sub_band_type, job_style) =
+    let (sub_band_type, style) =
         classic_decode_job_parameters(sub_band.sub_band_type, component_info);
+    let parameters = ClassicJobParameters {
+        sub_band_type,
+        style,
+        strict: header.strict,
+        total_bitplanes: num_bitplanes,
+        roi_shift: component_info.roi_shift,
+        dequantization_step,
+        irreversible_midpoint,
+    };
     if let Some(decoder) = decoder.as_deref_mut() {
         let mut budget = DecodeAllocationBudget::for_storage(storage)?;
         let pending_blocks = collect_pending_classic_blocks(
@@ -74,24 +143,22 @@ pub(super) fn decode_sub_band_classic_blocks(
         let mut batch_jobs = Vec::new();
         budget.reserve_new(&mut batch_jobs, pending_blocks.len())?;
         for pending in &pending_blocks {
+            // A hooked decode stores whole code-blocks.
+            let (output_x, output_y) = pending
+                .placement
+                .whole_target(pending.width, pending.height)?;
             batch_jobs.push(J2kCodeBlockBatchJob {
-                output_x: pending.output_x,
-                output_y: pending.output_y,
-                code_block: J2kCodeBlockDecodeJob {
-                    data: &pending.combined_data,
-                    segments: &pending.segments,
-                    width: pending.width,
-                    height: pending.height,
-                    output_stride: sub_band.storage_rect.width() as usize,
-                    missing_bit_planes: pending.missing_bit_planes,
-                    number_of_coding_passes: pending.number_of_coding_passes,
-                    total_bitplanes: num_bitplanes,
-                    roi_shift: component_info.roi_shift,
-                    sub_band_type: job_sub_band_type,
-                    style: job_style,
-                    strict: header.strict,
-                    dequantization_step,
-                },
+                output_x,
+                output_y,
+                code_block: parameters.job(
+                    &pending.combined_data,
+                    &pending.segments,
+                    pending.width,
+                    pending.height,
+                    sub_band.storage_rect.width() as usize,
+                    pending.missing_bit_planes,
+                    pending.number_of_coding_passes,
+                ),
             });
         }
 
@@ -153,17 +220,17 @@ pub(super) fn decode_sub_band_classic_blocks(
             )? {
                 continue;
             }
-            let decode = if irreversible_midpoint {
-                decode_j2k_code_block_scalar_with_workspace_midpoint
-            } else {
-                decode_j2k_code_block_scalar_with_workspace
-            };
-            decode(job.code_block, output_slice, &mut scalar_workspace)?;
+            parameters.decode(job.code_block, output_slice, &mut scalar_workspace)?;
         }
         return Ok(());
     }
 
-    let code_block_count = count_classic_code_blocks(sub_band_idx, sub_band, storage)?;
+    // Only Auto can choose parallel decoding; serial decodes need no count.
+    let code_block_count = if cpu_decode_parallelism == CpuDecodeParallelism::Auto {
+        count_classic_code_blocks(sub_band_idx, sub_band, storage)?
+    } else {
+        0
+    };
     if should_decode_classic_sub_band_in_parallel(cpu_decode_parallelism, code_block_count) {
         #[cfg(feature = "parallel")]
         {
@@ -208,15 +275,7 @@ pub(super) fn decode_sub_band_classic_blocks(
             let decoded_blocks = decode_classic_sub_band_blocks_parallel(
                 &pending_blocks,
                 sub_band,
-                ClassicParallelParameters {
-                    sub_band_type: job_sub_band_type,
-                    style: job_style,
-                    strict: header.strict,
-                    total_bitplanes: num_bitplanes,
-                    roi_shift: component_info.roi_shift,
-                    dequantization_step,
-                    irreversible_midpoint,
-                },
+                parameters,
                 &mut tile_ctx.parallel_coefficients,
                 &mut storage.structural_workspace_bytes,
                 #[cfg(test)]
@@ -240,11 +299,10 @@ pub(super) fn decode_sub_band_classic_blocks(
         .clone()
         .map(|idx| &storage.precincts[idx])
     {
-        for code_block in precinct
-            .code_blocks
-            .clone()
-            .map(|idx| &storage.code_blocks[idx])
-        {
+        for code_block in tier1_code_blocks(
+            &storage.code_blocks[precinct.code_blocks.clone()],
+            storage.tier1_band,
+        ) {
             if code_block.coding != Some(CodeBlockCoding::Classic) {
                 continue;
             }
@@ -253,11 +311,8 @@ pub(super) fn decode_sub_band_classic_blocks(
                 continue;
             }
             tile_ctx.debug_counters.decoded_code_blocks += 1;
-            let x_offset = code_block.rect.x0 - sub_band.storage_rect.x0;
-            let y_offset = code_block.rect.y0 - sub_band.storage_rect.y0;
+            let placement = stored_placement(code_block, sub_band);
             let output_stride = sub_band.storage_rect.width() as usize;
-            let mut base_idx =
-                (y_offset * sub_band.storage_rect.width()) as usize + x_offset as usize;
 
             bitplane::decode(
                 code_block,
@@ -273,21 +328,19 @@ pub(super) fn decode_sub_band_classic_blocks(
                 code_block.number_of_coding_passes,
                 component_info.roi_shift,
             );
-            for coefficients in tile_ctx.bit_plane_decode_context.coefficient_rows() {
-                let out_row = &mut base_store[base_idx..];
-                if irreversible_midpoint {
-                    midpoint.dequantize_row(coefficients, out_row, dequantization_step);
-                } else {
-                    for (output, coefficient) in out_row.iter_mut().zip(coefficients) {
-                        *output = apply_roi_maxshift_inverse_i64(
-                            midpoint.reconstruct_reversible(*coefficient),
-                            component_info.roi_shift,
-                        ) as f32
-                            * dequantization_step;
-                    }
-                }
-                base_idx += output_stride;
-            }
+            placement.store_rows(
+                tile_ctx.bit_plane_decode_context.coefficient_rows(),
+                base_store,
+                output_stride,
+                |coefficients, out_row| {
+                    midpoint.reconstruct_row(
+                        coefficients,
+                        out_row,
+                        dequantization_step,
+                        irreversible_midpoint,
+                    );
+                },
+            )?;
         }
     }
     Ok(())
@@ -320,11 +373,8 @@ fn decode_sub_band_classic_blocks_i64(
                 continue;
             }
             tile_ctx.debug_counters.decoded_code_blocks += 1;
-            let x_offset = code_block.rect.x0 - sub_band.storage_rect.x0;
-            let y_offset = code_block.rect.y0 - sub_band.storage_rect.y0;
+            let placement = stored_placement(code_block, sub_band);
             let output_stride = sub_band.storage_rect.width() as usize;
-            let mut base_idx =
-                (y_offset * sub_band.storage_rect.width()) as usize + x_offset as usize;
 
             bitplane::decode(
                 code_block,
@@ -340,16 +390,21 @@ fn decode_sub_band_classic_blocks_i64(
                 code_block.number_of_coding_passes,
                 component_info.roi_shift,
             );
-            for coefficients in tile_ctx.bit_plane_decode_context.coefficient_rows() {
-                let out_row = &mut base_store[base_idx..];
-                for (output, coefficient) in out_row.iter_mut().zip(coefficients.iter().copied()) {
-                    *output = apply_roi_maxshift_inverse_i64(
-                        midpoint.reconstruct_reversible(coefficient),
-                        component_info.roi_shift,
-                    );
-                }
-                base_idx += output_stride;
-            }
+            placement.store_rows(
+                tile_ctx.bit_plane_decode_context.coefficient_rows(),
+                base_store,
+                output_stride,
+                |coefficients, out_row| {
+                    for (output, coefficient) in
+                        out_row.iter_mut().zip(coefficients.iter().copied())
+                    {
+                        *output = apply_roi_maxshift_inverse_i64(
+                            midpoint.reconstruct_reversible(coefficient),
+                            component_info.roi_shift,
+                        );
+                    }
+                },
+            )?;
         }
     }
     Ok(())

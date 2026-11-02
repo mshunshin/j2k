@@ -6,11 +6,14 @@ release tooling; see [`xtask/RELEASING.md`](../xtask/RELEASING.md#public-api-sna
 
 ## Breaking releases
 
-The currently published stable contract is the `0.12.x` line. The `0.12.0`
-release changes three rustdoc-hidden CUDA engine signatures and requires
-consumers to retain pooled surfaces until their GPU work completes. See the
-[review](../xtask/release-evidence/public-api/public-api-review-0.12.0.yml)
-and [changelog](../CHANGELOG.md) for migration instructions.
+The currently published stable contract is the `0.13.x` line. The `0.13.0`
+release adds the required `signed` field to `J2kDirectGrayscalePlan`, makes
+the batch and Burn types non-exhaustive, and makes JPEG decode strict by
+default. See the
+[review](../xtask/release-evidence/public-api/public-api-review-0.13.0.yml)
+and [changelog](../CHANGELOG.md) for migration instructions. The `0.12.0`
+release changed three rustdoc-hidden CUDA engine signatures and requires
+consumers to retain pooled surfaces until their GPU work completes.
 
 - `0.7.0` removed parts of the `0.6.2` API; it is not source compatible with
   `0.6.x`.
@@ -32,7 +35,26 @@ and [changelog](../CHANGELOG.md) for migration instructions.
 `0.8.0` could only be compared against `v0.7.5`, and `0.9.0` only against
 `v0.8.1`. `0.10.0` was compared directly with `v0.9.0` under a one-time
 exception for the crate split, which is now disabled. The current semver
-baseline is `v0.11.3`.
+baseline is `v0.13.1`. Development for `0.13.2` is reviewed in the
+[0.13.2 API review](../xtask/release-evidence/public-api/public-api-review-0.13.2.yml).
+It adds resource-limit error variants to existing non-exhaustive enums and
+two rustdoc-hidden batch execution-size helpers. No existing API item is
+removed or changed. Resource-limit failures now have their own error class,
+and `CpuBatchDecoder` preparation checks planned execution memory before decoding;
+the review records these error-behavior corrections.
+The `0.13.1` release is reviewed in the
+[0.13.1 API review](../xtask/release-evidence/public-api/public-api-review-0.13.1.yml);
+it changes no ordinary API item and only adds rustdoc-hidden `j2k-native`
+items. The `0.13.0` release was compared with `v0.12.0` in the
+[0.13.0 API review](../xtask/release-evidence/public-api/public-api-review-0.13.0.yml).
+The review includes source migrations for exhaustive native encode option
+literals, JPEG enum matches, and the hidden quantization helper arguments.
+`J2kDirectGrayscalePlan` adds the required `signed` field, set from the source
+component signedness. `BatchDecodeOptions`, `j2k_jpeg::ColorTransform` and the
+Burn tensor and error enums become non-exhaustive, the JPEG decode outcomes add
+`recovered`, Burn batch results move behind accessors, and JPEG decode is strict
+by default. `BatchLayout` moves to `j2k-core` and is still re-exported by `j2k`,
+and the `cuda-oxide-j2k-ml` feature of `j2k-cuda-j2k-engine` is removed.
 
 ## Stability tiers
 
@@ -49,14 +71,14 @@ or item privacy over `#[doc(hidden)]` for internals.
   compatibility promise.
 - `experimental`: `j2k-native`, `j2k-cuda`, `j2k-metal`, `j2k-jpeg-cuda`,
   `j2k-jpeg-metal`, `j2k-transcode`, `j2k-transcode-cuda`,
-  `j2k-transcode-metal`, and `j2k-ml`. Patch releases keep their APIs. A pre-1.0
-  minor release may change them, with every break listed in the review file and
-  migration notes. What they support at runtime also depends on features,
-  hardware, and `docs/public-support.md`.
+  `j2k-transcode-metal`, `j2k-ml`, and `j2k-mpsgraph`. Patch releases keep their
+  APIs. A pre-1.0 minor release may change them, with every break listed in the
+  review file and migration notes. What they support at runtime also depends on
+  features, hardware, and `docs/public-support.md`.
 - `implementation`: `j2k-codec-math`, `j2k-profile`, `j2k-types`,
   `j2k-cuda-build-support`, `j2k-cuda-runtime`, `j2k-cuda-j2k-engine`,
-  `j2k-cuda-jpeg-engine`, `j2k-cuda-transcode-engine`, and
-  `j2k-metal-support`. These are published so the other J2K crates can use
+  `j2k-cuda-jpeg-engine`, `j2k-cuda-transcode-engine`, `j2k-metal-support`, and
+  `j2k-mpsgraph-support`. These are published so the other J2K crates can use
   them; they are not meant as general extension APIs. They are documented,
   snapshotted, and patch-checked like the others, and a pre-1.0 minor release
   may change them under the same review rules.

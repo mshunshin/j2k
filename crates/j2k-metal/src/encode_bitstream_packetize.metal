@@ -809,7 +809,13 @@ inline bool j2k_packet_prepare_tree(
     thread uint *level_heights,
     thread uint &levels
 ) {
-    if (num_cbs_x == 0u || num_cbs_y == 0u || num_cbs_x * num_cbs_y != block_count) {
+    // An edge precinct can contain an empty band alongside nonempty bands.
+    // T.800 B.10 writes no tag-tree bits for that band's zero code-blocks.
+    if (num_cbs_x == 0u || num_cbs_y == 0u) {
+        levels = 0u;
+        return block_count == 0u;
+    }
+    if (num_cbs_x * num_cbs_y != block_count) {
         return false;
     }
     const uint node_count =
@@ -824,9 +830,12 @@ inline bool j2k_packet_prepare_tree(
     }
     for (uint idx = 0u; idx < block_count; ++idx) {
         const J2kPacketBlock block = blocks[block_offset + idx];
+        // A block that is never included contributes zero to the zero-bitplane
+        // tree, as the CPU packetizer seeds it, so headers match byte for byte.
+        const bool included = block.num_coding_passes > 0u;
         value[idx] = zero_bitplanes
-            ? block.num_zero_bitplanes
-            : (block.num_coding_passes > 0u ? inclusion_layer : 0x7FFFFFFFu);
+            ? (included ? block.num_zero_bitplanes : 0u)
+            : (included ? inclusion_layer : 0x7FFFFFFFu);
     }
     for (uint level = 1u; level < levels; ++level) {
         const uint prev_w = level_widths[level - 1u];
@@ -877,7 +886,13 @@ inline bool j2k_packet_prepare_tree_resident_classic(
     thread uint *level_heights,
     thread uint &levels
 ) {
-    if (num_cbs_x == 0u || num_cbs_y == 0u || num_cbs_x * num_cbs_y != block_count) {
+    // An edge precinct can contain an empty band alongside nonempty bands.
+    // T.800 B.10 writes no tag-tree bits for that band's zero code-blocks.
+    if (num_cbs_x == 0u || num_cbs_y == 0u) {
+        levels = 0u;
+        return block_count == 0u;
+    }
+    if (num_cbs_x * num_cbs_y != block_count) {
         return false;
     }
     const uint node_count =
@@ -898,9 +913,12 @@ inline bool j2k_packet_prepare_tree_resident_classic(
             tier1_job_count,
             block_offset + idx
         );
+        // A block that is never included contributes zero to the zero-bitplane
+        // tree, as the CPU packetizer seeds it, so headers match byte for byte.
+        const bool included = block.num_coding_passes > 0u;
         value[idx] = zero_bitplanes
-            ? block.num_zero_bitplanes
-            : (block.num_coding_passes > 0u ? inclusion_layer : 0x7FFFFFFFu);
+            ? (included ? block.num_zero_bitplanes : 0u)
+            : (included ? inclusion_layer : 0x7FFFFFFFu);
     }
     for (uint level = 1u; level < levels; ++level) {
         const uint prev_w = level_widths[level - 1u];

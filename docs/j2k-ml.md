@@ -1,8 +1,9 @@
 # Burn batch decoding with `j2k-ml`
 
 For the Rust-written PyTorch/NumPy extension, native wavelet output, and direct
-CUDA-to-PyTorch decoding, see [`j2k-python`](../crates/j2k-python/README.md).
-The Burn adapters described here retain their staged GPU upload behavior.
+CUDA/MPS output for PyTorch, see [`j2k-python`](../crates/j2k-python/README.md).
+`j2k-ml` provides both staged CUDA upload and synchronous decode directly into
+Burn-owned CUDA storage.
 
 `j2k-ml` is a Burn 0.21 integration maintained by the J2K project. It is not
 an official Tracel or Burn crate and follows the workspace semver policy. The
@@ -11,10 +12,11 @@ packaged crate outside the workspace before each release.
 
 ## What `j2k-ml` does and does not do
 
-`j2k-ml` is a thin adapter, not a second codec. Parsing, JPEG 2000 and HTJ2K
-decoding, preparation, grouping, memory reuse, and GPU execution are done by
-`j2k`, `j2k-native`, `j2k-cuda`, and `j2k-metal`. `j2k-ml` turns CPU groups
-into Burn tensors directly, or copies GPU output through host memory and
+`j2k-ml` is a thin adapter, not a second codec. Parsing, JPEG, JPEG 2000 and
+HTJ2K decoding, preparation, grouping, memory reuse, and GPU execution are done
+by `j2k`, `j2k-native`, `j2k-jpeg`, `j2k-cuda`, and `j2k-metal`. `j2k-ml`
+turns CPU groups into Burn tensors, decodes CUDA groups directly into
+Burn-owned allocations, or copies completed GPU output through host memory and
 uploads it as an ordinary Burn tensor.
 
 Dataset assembly, DICOM parsing, labels, sampling, resizing, padding,
@@ -38,8 +40,15 @@ after decode:
 cargo run -p j2k-ml --example training_batcher --features cpu
 ```
 
-The GPU examples decode on the GPU, copy the pixels to the host, and return
-ordinary Burn integer tensors:
+The CUDA direct-destination example returns an ordinary Burn integer tensor
+without a decoded-pixel host readback or an intermediate device copy:
+
+```bash
+cargo run -p j2k-ml --example cuda_direct --features cuda
+```
+
+The staged GPU examples decode on the GPU, copy the pixels to the host, and
+return ordinary Burn integer tensors:
 
 ```bash
 cargo run -p j2k-ml --example cuda_upload --features cuda
@@ -47,9 +56,26 @@ cargo run -p j2k-ml --example metal_upload --features metal
 ```
 
 The CPU decoder works with any Burn backend through `TensorData`; on a GPU
-backend this includes a host-to-device upload. With the `cuda` and `metal`
-features, decoding runs on that GPU, and the decoded pixels are copied back
-and uploaded the same way.
+backend this includes a host-to-device upload. `CudaDirectBurnDecoder` writes
+into a Burn CUDA allocation and publishes it only after synchronous codec
+completion and status validation. `CudaUploadBurnDecoder` and
+`MetalUploadBurnDecoder` retain the decoded-pixel readback and upload path.
+
+## Mixed codec inputs
+
+`CpuBurnDecoder::decode_batch` accepts `&[ImageInput<'_>]` and returns the
+common `BurnBatchDecode`. Results and groups have private fields: borrow with
+`groups()`, `errors()`, `group_errors()` and group accessors, or consume with
+`into_groups()` and `into_tensor()`. `ImageDecodeError` and
+`ImageDecodeWarning` identify their codec family. Detailed J2K metadata is
+available through `j2k_info()`. Each row has source indices, warnings and a
+recovered flag. Session strictness is authoritative for both codecs.
+
+JPEG tensor output remains RGB uint8 by default, with grayscale expanded to three identical channels. Grayscale JPEG 2000 and HTJ2K remain one channel. Output metadata describes the returned tensor. A later explicit `channels="native"` option may preserve grayscale JPEG as one channel without changing existing defaults. Source component counts, when exposed, are per input row and remain aligned with source_indices.
+
+Group order is unspecified, with source_indices authoritative. A supported
+lenient recovery returns one row and no error for that input; cosmetic warnings
+leave recovery false. The J2K lenient path currently performs no entropy salvage.
 
 ## Batch behavior
 
@@ -92,11 +118,18 @@ alpha interpretation remains available in `BatchGroupInfo`.
 
 Batch sessions decode strictly by default. Lenient decoding is opt-in and
 reports a warning only when one of its JP2/JPH metadata recoveries was used.
-An explicit CUDA or Metal route never falls back to CPU decoding, but its
-decoded pixels are copied through host memory. Unsupported inputs and transfer
-failures return errors.
+An explicit CUDA or Metal route never falls back to CPU decoding. The staged
+GPU routes copy decoded pixels through host memory; the direct CUDA route does
+not. Unsupported inputs and transfer failures return errors.
 
 ## Persistent routes
+
+For mixed inputs, call `CpuBurnDecoder::decode_batch(&[ImageInput])`. It
+retains the JPEG and JPEG 2000 CPU sessions, applies the same session strictness
+to both, and keeps JPEG color hints. Results use common metadata accessors and
+codec-tagged indexed errors. JPEG currently supports full-image CPU decode only;
+JPEG 2000 keeps the prepared, region and reduced-resolution paths. A GPU Burn
+destination receives an ordinary upload for CPU-decoded JPEG samples.
 
 `CpuBurnDecoder<B>` retains a `j2k::CpuBatchDecoder` and its codec workspaces.
 The codec decodes directly into one contiguous native Rust allocation per
@@ -114,14 +147,29 @@ checks pass, the adapter copies each group's pixels to the host in one copy and
 creates the Burn tensor with `Tensor::from_data`, which uploads it to the
 device.
 
+`CudaDirectBurnDecoder` retains the codec session and target Burn device, then
+allocates each dense destination through CubeCL. It waits for that stream-ordered allocation,
+validates that its pointer belongs to the selected device's retained primary
+context, and calls the codec's external-destination path. The codec writes the
+pixels into that allocation and completes its status checks before the adapter
+registers the same allocation as a fused `burn_cuda::Cuda` tensor. This is a
+direct decode destination, not import of a codec-owned allocation: Burn owns
+the allocation for its whole lifetime. The path is synchronous because Burn
+0.21 does not expose the CUDA stream handle needed for safe asynchronous
+cross-runtime ordering.
+
 `MetalUploadBurnDecoder::system_default` retains a Metal codec session and
 uses Burn's default wgpu device. When a Metal group completes, the adapter
 copies its pixels to the host and creates the Burn tensor the same way.
 
-Both adapters keep the codec's submission guards, and sessions can be reused
-safely after a drop. `submit` only overlaps the decoding; `wait` covers
-completion, the copy to the host, and the Burn upload. Pixels are not handed to
-Burn in GPU memory.
+The staged adapters keep the codec's submission guards, and sessions can be
+reused safely after a drop. `submit` only overlaps the decoding; `wait` covers
+completion, the copy to the host, and the Burn upload. RGB and RGBA groups
+larger than 32 images decode in 32-image chunks, and `submit` waits for every
+chunk except the last so that decode scratch stays bounded. Their pixels are not
+handed to Burn in GPU memory. The direct CUDA decoder does not expose a
+submitted value; `decode` and `decode_prepared` return only after the Burn-owned
+destinations are safe to consume.
 
 ## GPU adapter support
 
@@ -143,10 +191,12 @@ four requests, both layouts, resident and external destinations, multi-tile
 regressions, asynchronous drop and session reuse, and a 2,000-operation soak.
 Its Burn targets test the same dtypes, requests, and layouts through staged
 tensor uploads, plus prepared regrouping, group isolation, drop-safe reuse,
-and a 1,000-batch soak. Reversible output is bit-exact; irreversible 9/7 output
-is within one integer LSB of the CPU output. These tests check correctness,
-not speed. An explicit CUDA request fails, rather than decoding on the CPU, if
-the runtime or plan checks fail.
+and a 1,000-batch soak. A focused direct-destination test verifies exact Burn
+tensor values and confirms that codec D2H traffic contains status validation
+only, with no decoded-pixel readback. Reversible output is bit-exact;
+irreversible 9/7 output is within one integer LSB of the CPU output. These tests
+check correctness, not speed. An explicit CUDA request fails, rather than
+decoding on the CPU, if the runtime or plan checks fail.
 
 Focused Metal hardware cases collectively exercise classic and HT inputs,
 `U8`/`U16`/`I16`, Gray/RGB/RGBA, all four requests, both layouts, resident
@@ -160,8 +210,14 @@ CUDA and Metal external destinations support both NCHW and NHWC. A resident
 image-surface view is exposed only for NHWC because `Surface` denotes
 interleaved pixels; CUDA also exposes an explicit dense resident owner for
 NCHW, while Metal NCHW callers use the dense external-destination API. Both
-prepared offset plans include every tile involved. Nonzero ROI maxshift (from
-an RGN marker) is not supported on either GPU.
+prepared offset plans include every tile involved. CUDA and Metal support ROI
+maxshift from RGN markers in their supported classic and HT plans. The coded
+bitplane count, including the ROI shift, must not exceed 31; classic blocks must
+fit within 64×64, and HT blocks must satisfy each backend's geometry and pass
+limits. CUDA tests cover reversible classic Gray8/RGB8 with shift 7 in both
+layouts for full and region-plus-reduced requests. Metal tests include full
+classic signed Gray4 with shift 7 and HT RGB8 with component shifts 3/0/0. These
+cases do not establish support for every ROI, precision, and request combination.
 
 The GPU sessions keep successful groups when another group fails. Classic and
 HT jobs keep track of their source image through batching, and HT jobs also
@@ -192,7 +248,8 @@ the selected runner requires ([issue
 #31](https://github.com/sarah-quinones/gemm/issues/31)). Upstream has a gating
 fix under review ([pull request
 #43](https://github.com/sarah-quinones/gemm/pull/43)). This only affects tests;
-the `j2k-ml` library and its release dependencies do not pick a CPU backend. The CPU benchmark group IDs are
+the `j2k-ml` library and its release dependencies do not pick a CPU backend.
+The CPU benchmark group IDs are
 `j2k_owned_batch_codec_cpu/input_{distinct|repeated}` and
 `j2k_owned_batch_burn_cpu/input_{distinct|repeated}`. Record which host backend
 was used; results from different backends are not comparable.
@@ -203,10 +260,17 @@ Burn-materialized output separately, includes one-shot and prepared reuse, and
 covers HT-dominant unsigned and signed Gray12/Gray16 plus RGB8/RGB16 and
 RGBA8/RGBA16 workloads at batch sizes 1/8/32/64 with full, ROI, reduced, and
 ROI-and-reduced requests. The CUDA and Metal harnesses cover the same request
-and output matrix. Their GPU rows measure GPU decoding, the copy back to the
-host, and the Burn upload. The
+and output matrix. Their staged GPU rows measure GPU decoding, the copy back to
+the host, and the Burn upload. The
 `staged_cpu_upload_pixels` row measures CPU codec decode followed by Burn
 upload on the same backend.
+CUDA also reports `one_shot_normalized_pixels` in separate
+`j2k_owned_batch_burn_staged_cuda` and
+`j2k_owned_batch_burn_direct_cuda` groups. These rows include preparation,
+codec execution, the route's transfer contract, integer-to-float
+normalization, and final Burn consumer synchronization. The direct row uses a
+Burn-owned dense NCHW destination under the harness defaults; the decoder API
+also supports NHWC. This is not the codec surface API.
 Run the hardware matrices with `cargo xtask j2k-ml-bench-cuda` and
 `cargo xtask j2k-ml-bench-metal`. Decode rows report decoded spatial pixels per second;
 divide by the decoded pixels per image for images per second or by 1,000,000

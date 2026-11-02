@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>GPU-Accelerated J2K Codec — Pure Rust JPEG 2000 &amp; HTJ2K</title>
   <meta name="description" content="J2K provides safe public Rust APIs for JPEG 2000 Part 1 / HTJ2K Part 15, with audited unsafe implementation boundaries, JP2/JPH wrappers, and optional CUDA and Apple Metal backends.">
-  <link rel="canonical" href="https://frames-sg.github.io/j2k/">
+  <link rel="canonical" href="https://frames-sg.com/j2k/">
   <meta property="og:title" content="GPU-Accelerated J2K Codec — Pure Rust JPEG 2000 &amp; HTJ2K">
   <meta property="og:description" content="Safe public Rust JPEG 2000 Part 1 and HTJ2K Part 15 APIs with audited unsafe implementation boundaries and optional CUDA and Apple Metal backends.">
-  <meta property="og:url" content="https://frames-sg.github.io/j2k/">
+  <meta property="og:url" content="https://frames-sg.com/j2k/">
   <meta property="og:type" content="website">
   <meta property="og:image" content="https://frames-sg.github.io/j2k/assets/og-card.png">
   <meta property="og:image:width" content="1200">
@@ -19,7 +19,7 @@
   <meta name="twitter:image" content="https://frames-sg.github.io/j2k/assets/og-card.png">
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
-  <link rel="stylesheet" href="assets/site.css?v=20260814">
+  <link rel="stylesheet" href="assets/site.css?v=20261021">
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
@@ -53,6 +53,14 @@
       </nav>
     </div>
   </header>
+
+  <aside class="site-move" aria-label="Primary Frames website">
+    <div class="wrap site-move-inner">
+      <span class="site-move-label">Primary site</span>
+      <p class="site-move-copy">J2K has a new home on <strong>frames-sg.com</strong>.</p>
+      <a class="site-move-link" href="https://frames-sg.com/j2k/">Open the current J2K overview <span aria-hidden="true">↗</span></a>
+    </div>
+  </aside>
 
   <main id="content">
     <section class="hero docs-hero home-hero">
@@ -92,8 +100,8 @@
               <path class="trace trace-f" d="M300 244 L510 302 L510 356"/>
             </svg>
             <div class="route-core">
-              <span class="core-kicker">Safe public API</span>
-              <strong>j2k</strong>
+              <span class="core-kicker">Rust codec workspace</span>
+              <strong>J2K</strong>
               <span>decode · encode · recode · transcode</span>
             </div>
             <div class="route-backends">
@@ -158,7 +166,7 @@
         <figure class="pipeline">
           <div class="pipeline-frame">
             <div class="frame-label">System map / static topology</div>
-            <img class="diagram" src="assets/j2k-gpu-pipeline.svg?v=4" alt="J2K pipeline: JPEG 2000, HTJ2K, and JPEG inputs flow through the j2k crate, which routes to CPU baseline, CUDA, and Metal backends.">
+            <img class="diagram" src="assets/j2k-gpu-pipeline.svg?v=4" alt="J2K workspace pipeline: j2k handles JPEG 2000 and HTJ2K, j2k-jpeg handles ordinary JPEG, and j2k-transcode converts JPEG to HTJ2K, with CPU, CUDA, and Metal backends.">
           </div>
           <figcaption><code>Auto</code> returns CPU output when no GPU path is available, supported, or measured faster for the shape. Explicit CUDA and Metal requests never fall back.</figcaption>
         </figure>
@@ -237,6 +245,9 @@
               <tr><td><code>j2k-cuda</code></td><td>NVIDIA CUDA backend for supported JPEG 2000 and HTJ2K paths.</td><td><span class="table-tag">Backend</span></td></tr>
               <tr><td><code>j2k-metal</code></td><td>Apple Metal backend for supported macOS GPU paths.</td><td><span class="table-tag">Backend</span></td></tr>
               <tr><td><code>j2k-transcode</code></td><td>JPEG-to-HTJ2K coefficient-domain transcode primitives and shared transcode contracts.</td><td><span class="table-tag">Core</span></td></tr>
+              <tr><td><code>j2k-jpeg</code></td><td>JPEG decode, strict about pixel integrity by default, and encode, plus dense RGB8 batch decode.</td><td><span class="table-tag">Public</span></td></tr>
+              <tr><td><code>j2k-ml</code></td><td>Burn tensors from JPEG 2000 batches, or mixed JPEG and JPEG 2000 batches on the CPU.</td><td><span class="table-tag">Integration</span></td></tr>
+              <tr><td><code>j2k-python</code></td><td>PyTorch/NumPy extension, built as the <code>j2k</code> wheel, with CPU output and optional CUDA or Apple Silicon MPS output.</td><td><span class="table-tag">Integration</span></td></tr>
               <tr><td><code>j2k-cli</code></td><td>Command-line inspection and JPEG-to-HTJ2K transcode smoke tests.</td><td><span class="table-tag">Tool</span></td></tr>
             </tbody>
           </table>

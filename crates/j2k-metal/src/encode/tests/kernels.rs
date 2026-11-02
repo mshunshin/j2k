@@ -4,6 +4,70 @@ use super::*;
 
 #[cfg(target_os = "macos")]
 #[test]
+fn metal_multi_tile_origins_match_source_and_cpu_reconstruction() {
+    if !should_run_metal_runtime() {
+        return;
+    }
+    let (width, height) = (130, 99);
+    let pixels = j2k_test_support::patterned_rgb8(width, height);
+    for (reversible, use_ht_block_coding) in [(true, false), (true, true), (false, true)] {
+        let options = j2k_native::EncodeOptions {
+            reversible,
+            use_ht_block_coding,
+            num_decomposition_levels: 3,
+            tile_size: Some((39, 35)),
+            code_block_width_exp: 1,
+            code_block_height_exp: 1,
+            precinct_exponents: vec![(3, 3), (4, 4), (4, 4), (4, 4)],
+            progression_order: j2k_native::EncodeProgressionOrder::Pcrl,
+            ..j2k_native::EncodeOptions::default()
+        };
+        let mut accelerator = MetalEncodeStageAccelerator::default();
+        let bytes = j2k_native::encode_with_accelerator(
+            &pixels,
+            width,
+            height,
+            3,
+            8,
+            false,
+            &options,
+            &mut accelerator,
+        )
+        .expect("Metal encode with absolute tile origins");
+        let decoded = Image::new(&bytes, &DecodeSettings::strict())
+            .and_then(|image| image.decode())
+            .expect("decode Metal tiled output");
+        if reversible {
+            assert!(
+                decoded == pixels,
+                "lossless Metal pixels, HT={use_ht_block_coding}"
+            );
+            assert!(accelerator.forward_dwt53_dispatches() > 0);
+        } else {
+            let cpu = j2k_native::encode(&pixels, width, height, 3, 8, false, &options)
+                .expect("CPU encode");
+            let expected = Image::new(&cpu, &DecodeSettings::strict())
+                .and_then(|image| image.decode())
+                .expect("CPU reconstruction");
+            assert_eq!(decoded.len(), expected.len());
+            for (index, (&actual, &reference)) in decoded.iter().zip(&expected).enumerate() {
+                assert!(
+                    actual.abs_diff(reference) <= 1,
+                    "9/7 sample {index}: Metal={actual}, CPU={reference}"
+                );
+            }
+            assert!(accelerator.forward_dwt97_dispatches() > 0);
+        }
+        if use_ht_block_coding {
+            assert!(accelerator.ht_code_block_dispatches() > 0);
+        } else {
+            assert!(accelerator.tier1_code_block_dispatches() > 0);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 #[expect(
     clippy::cast_sign_loss,
     reason = "bounded synthetic pixel expression is nonnegative"
@@ -480,6 +544,60 @@ fn metal_htj2k_quality_layers_use_native_candidates_and_match_scalar_output() {
         .expect("bounded HTJ2K codestream decodes strictly");
     assert!(accelerator.quantize_subband_dispatches() > 0);
     assert!(accelerator.ht_code_block_dispatches() > 0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_all_stage_lossy_encodes_match_cpu_bytes_with_empty_code_blocks() {
+    if !should_run_metal_runtime() {
+        return;
+    }
+
+    // The left half is textured and the right half flat, so detail bands hold
+    // empty code-blocks beside coded ones in the same tag trees.
+    let (width, height) = (256_u32, 256_u32);
+    let pixels: Vec<u8> = (0..width * height * 3)
+        .map(|idx| {
+            let x = (idx / 3) % width;
+            let texture = if x < width / 2 {
+                (idx * 37 + idx / 7) & 0x07
+            } else {
+                0
+            };
+            u8::try_from((x / 4 + texture) & 0xFF).expect("masked pixel")
+        })
+        .collect();
+    let samples =
+        J2kLossySamples::new(&pixels, width, height, 3, 8, false).expect("valid RGB samples");
+    for (mode, qfactor) in [
+        (J2kBlockCodingMode::HighThroughput, Some(60)),
+        (J2kBlockCodingMode::HighThroughput, None),
+        (J2kBlockCodingMode::Classic, None),
+    ] {
+        let options = J2kLossyEncodeOptions::default()
+            .with_block_coding_mode(mode)
+            .with_max_decomposition_levels(Some(2))
+            .with_qfactor(qfactor)
+            .with_validation(J2kEncodeValidation::External);
+        let cpu = j2k::encode_j2k_lossy(
+            samples,
+            &options
+                .clone()
+                .with_backend(EncodeBackendPreference::CpuOnly),
+        )
+        .expect("CPU lossy encode");
+        let mut accelerator = MetalEncodeStageAccelerator::default();
+        let metal = encode_j2k_lossy_with_accelerator(
+            samples,
+            &options.with_backend(EncodeBackendPreference::RequireDevice),
+            BackendKind::Metal,
+            &mut accelerator,
+        )
+        .expect("Metal all-stage lossy encode");
+
+        assert_eq!(metal.backend, BackendKind::Metal, "{mode:?} {qfactor:?}");
+        assert_eq!(metal.codestream, cpu.codestream, "{mode:?} {qfactor:?}");
+    }
 }
 
 #[cfg(target_os = "macos")]
