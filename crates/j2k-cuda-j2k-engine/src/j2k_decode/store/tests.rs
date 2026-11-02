@@ -19,7 +19,7 @@ use crate::{
 };
 
 macro_rules! zero_gray_store_job {
-    ($job:ident) => {
+    ($job:ident $(, $field:ident: $value:expr)*) => {
         $job {
             input_width: 0,
             source_x: 0,
@@ -32,12 +32,13 @@ macro_rules! zero_gray_store_job {
             output_y: 0,
             addend: 0.0,
             bit_depth: 8,
+            $($field: $value,)*
         }
     };
 }
 
 macro_rules! zero_rgb_store_job {
-    ($job:ident) => {
+    ($job:ident $(, $field:ident: $value:expr)*) => {
         $job {
             input_width0: 0,
             input_width1: 0,
@@ -61,6 +62,7 @@ macro_rules! zero_rgb_store_job {
             bit_depth1: 8,
             bit_depth2: 8,
             rgba: 0,
+            $($field: $value,)*
         }
     };
 }
@@ -239,9 +241,9 @@ fn safe_store_apis_reject_foreign_context_buffers_and_keep_empty_batches_valid()
     let foreign_context = CudaContext::system_default().expect("foreign CUDA context");
     let foreign_buffer = foreign_context.allocate(0).expect("foreign empty buffer");
     let gray8_job = zero_gray_store_job!(CudaJ2kStoreGray8Job);
-    let gray16_job = zero_gray_store_job!(CudaJ2kStoreGray16Job);
+    let gray16_job = zero_gray_store_job!(CudaJ2kStoreGray16Job, signed: 0);
     let rgb8_job = zero_rgb_store_job!(CudaJ2kStoreRgb8Job);
-    let rgb16_job = zero_rgb_store_job!(CudaJ2kStoreRgb16Job);
+    let rgb16_job = zero_rgb_store_job!(CudaJ2kStoreRgb16Job, signed: 0);
     let inverse_mct_job = CudaJ2kInverseMctJob {
         len: 0,
         irreversible97: 0,
@@ -463,4 +465,139 @@ fn partial_contiguous_rgb_batch_zeroes_unwritten_pixels_when_required() {
         .copy_to_host(&mut bytes)
         .expect("download partial contiguous RGB store");
     assert_eq!(bytes, [0, 0, 0, 10, 10, 10]);
+}
+
+// Exercise the same scalar source compiled into the device store, even on hosts
+// without CUDA. Device launch and ABI coverage remain in the runtime tests.
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "device kernels require inlined scalar casts; native packing clamps to the tested integer domains"
+)]
+#[path = "../../cuda_oxide_j2k_decode_store/simt/src/sample.rs"]
+mod device_sample;
+
+#[test]
+fn requested_format_precision_thresholds_preserve_native_store_contract() {
+    for (bits, maximum) in [(7, 127_u16), (8, 255), (9, 511), (12, 4095), (16, 65535)] {
+        assert_eq!(
+            device_sample::sample_as_u8(f32::from(maximum), bits),
+            255,
+            "{bits}-bit U8"
+        );
+        let expected = if bits <= 8 { 65535 } else { maximum };
+        assert_eq!(device_sample::opaque_alpha_u16(bits), expected);
+        assert_eq!(
+            device_sample::sample_as_u16(f32::from(maximum), bits, false),
+            expected,
+            "{bits}-bit U16"
+        );
+        assert_eq!(
+            device_sample::sample_as_native_u16(f32::from(maximum), bits),
+            maximum
+        );
+    }
+    assert_eq!(device_sample::sample_as_native_u8(127.0, 7), 127);
+    assert_eq!(device_sample::sample_as_u8(256.0, 9), 128);
+}
+
+#[test]
+fn signed_requested_u16_samples_match_cpu_storage() {
+    // As the CPU decoder: two's complement above eight bits; at most eight
+    // bits, the two's-complement byte widened by the declared precision.
+    for (bits, sample, expected) in [
+        (4, -8.0, 65535),
+        (4, -1.0, 65535),
+        (4, 7.0, 30583),
+        (8, -128.0, 0x8080),
+        (8, -1.0, 65535),
+        (8, 127.0, 0x7f7f),
+        (12, -2048.0, 0xf800),
+        (12, -1.0, 0xffff),
+        (12, 2047.0, 2047),
+        (12, 4000.0, 2047),
+        (16, -32768.0, 0x8000),
+        (16, 32767.0, 32767),
+    ] {
+        assert_eq!(
+            device_sample::sample_as_u16(sample, bits, true),
+            expected,
+            "{bits}-bit signed {sample}"
+        );
+    }
+}
+
+#[test]
+fn native_signed_samples_and_centered_rounding_have_exact_boundaries() {
+    for bits in [7, 8, 9, 12, 16] {
+        let magnitude = 1_i32 << (bits - 1);
+        for value in [-magnitude, -1, 0, magnitude - 1] {
+            let value = i16::try_from(value).unwrap();
+            assert_eq!(
+                device_sample::sample_as_native_i16(f32::from(value), bits),
+                value
+            );
+        }
+    }
+    for value in [0.5_f32.next_down(), 0.5, 0.5_f32.next_up(), -1.5] {
+        assert_eq!(
+            device_sample::round_integer_output_then_add(value, 32768.0),
+            value.round_ties_even() + 32768.0
+        );
+    }
+    for value in [
+        8_388_608.0_f32.next_down(),
+        8_388_608.0,
+        8_388_609.0,
+        f32::MAX,
+        f32::INFINITY,
+    ] {
+        for signed in [value, -value] {
+            assert_eq!(
+                device_sample::round_ties_even_f32(signed),
+                signed.round_ties_even()
+            );
+        }
+    }
+    assert!(device_sample::round_ties_even_f32(f32::NAN).is_nan());
+}
+
+#[test]
+fn requested_gray_precision_thresholds_execute_on_cuda_when_required() {
+    if !j2k_test_support::cuda_runtime_gate(module_path!()) {
+        return;
+    }
+    let context = CudaContext::system_default().expect("CUDA context");
+    let engine = crate::J2kCudaEngine::new(&context);
+    for (bits, maximum) in [(7, 127_u16), (8, 255), (9, 511), (16, 65535)] {
+        let input = context.upload_f32(&[0.0, f32::from(maximum)]).unwrap();
+        let mut u8_job = zero_gray_store_job!(CudaJ2kStoreGray8Job);
+        u8_job.input_width = 2;
+        u8_job.copy_width = 2;
+        u8_job.copy_height = 1;
+        u8_job.output_width = 2;
+        u8_job.output_height = 1;
+        u8_job.bit_depth = bits;
+        let output = engine.j2k_store_gray8_device(&input, u8_job).unwrap();
+        let mut actual = [0; 2];
+        output.buffer().copy_to_host(&mut actual).unwrap();
+        assert_eq!(actual, [0, 255]);
+        let mut u16_job = zero_gray_store_job!(CudaJ2kStoreGray16Job, signed: 0);
+        u16_job.input_width = 2;
+        u16_job.copy_width = 2;
+        u16_job.copy_height = 1;
+        u16_job.output_width = 2;
+        u16_job.output_height = 1;
+        u16_job.bit_depth = bits;
+        let output = engine.j2k_store_gray16_device(&input, u16_job).unwrap();
+        let mut actual = [0; 4];
+        output.buffer().copy_to_host(&mut actual).unwrap();
+        let maximum = if bits <= 8 { 65535 } else { maximum };
+        assert_eq!(
+            actual,
+            [0, 0, maximum.to_le_bytes()[0], maximum.to_le_bytes()[1]]
+        );
+    }
 }

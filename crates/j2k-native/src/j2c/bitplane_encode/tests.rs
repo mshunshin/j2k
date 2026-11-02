@@ -7,15 +7,17 @@ use super::super::build::SubBandType;
 use super::super::codestream::CodeBlockStyle;
 use super::super::coefficient_view::CoefficientBlockView;
 use super::distortion::segment_distortion_delta;
+use super::flag_passes::try_encode_column_passes;
 use super::passes::{
     clear_coded_in_current_pass, mark_coded_in_current_pass, CODED_IN_CURRENT_PASS, NEGATIVE,
     SIGNIFICANT,
 };
 use super::preparation::prepare_padded_coefficients;
 use super::{
-    encode_code_block, encode_code_block_i64, encode_code_block_segments_with_style,
-    encode_code_block_segments_with_style_i64, encode_code_block_view,
-    pack_classic_selective_bypass_tier1_tokens, ClassicTier1TokenSegment, EncodedCodeBlock,
+    classic_worker_allocation, coded_bitplanes, encode_code_block, encode_code_block_i64,
+    encode_code_block_segments_with_style, encode_code_block_segments_with_style_i64,
+    encode_code_block_view, pack_classic_selective_bypass_tier1_tokens, try_encode_code_block,
+    try_encode_neighbor_byte_passes, ClassicTier1TokenSegment, CodedBlock, EncodedCodeBlock,
 };
 
 fn assert_encoded_blocks_equal(actual: &EncodedCodeBlock, expected: &EncodedCodeBlock) {
@@ -98,11 +100,14 @@ fn classic_i64_strided_block_is_byte_exact_at_high_precision() {
 
 #[test]
 fn test_encode_all_zeros() {
-    let coeffs = vec![0i32; 16];
-    let result = encode_code_block(&coeffs, 4, 4, SubBandType::LowLow, 8);
-    assert_eq!(result.num_coding_passes, 0);
-    assert_eq!(result.data, [] as [u8; 0]);
-    assert_eq!(result.num_zero_bitplanes, 8);
+    for (width, height, total_bitplanes) in [(4, 4, 8), (64, 64, 16), (3, 5, 0)] {
+        let coeffs = vec![0i32; width as usize * height as usize];
+        let result =
+            encode_code_block(&coeffs, width, height, SubBandType::LowLow, total_bitplanes);
+        assert_eq!(result.num_coding_passes, 0);
+        assert_eq!(result.data, [] as [u8; 0]);
+        assert_eq!(result.num_zero_bitplanes, total_bitplanes);
+    }
 }
 
 #[test]
@@ -267,20 +272,17 @@ fn padded_coefficient_preparation_stores_sign_in_state_flags() {
 }
 
 #[test]
-fn clear_coded_in_current_pass_touches_only_recorded_indices() {
-    let mut states = vec![0u8; 8];
-    let mut coded_indices = Vec::new();
+fn clear_coded_in_current_pass_keeps_every_other_state_flag() {
+    let mut states = vec![SIGNIFICANT, NEGATIVE, 0, SIGNIFICANT | NEGATIVE];
+    mark_coded_in_current_pass(0, &mut states);
+    mark_coded_in_current_pass(2, &mut states);
 
-    mark_coded_in_current_pass(2, &mut states, &mut coded_indices);
-    mark_coded_in_current_pass(5, &mut states, &mut coded_indices);
-    states[6] = SIGNIFICANT;
+    clear_coded_in_current_pass(&mut states);
 
-    clear_coded_in_current_pass(&mut states, &mut coded_indices);
-
-    assert_eq!(states[2] & CODED_IN_CURRENT_PASS, 0);
-    assert_eq!(states[5] & CODED_IN_CURRENT_PASS, 0);
-    assert_eq!(states[6], SIGNIFICANT);
-    assert_eq!(coded_indices, [] as [usize; 0]);
+    assert_eq!(states, [SIGNIFICANT, NEGATIVE, 0, SIGNIFICANT | NEGATIVE]);
+    assert!(states
+        .iter()
+        .all(|state| state & CODED_IN_CURRENT_PASS == 0));
 }
 
 #[test]
@@ -370,6 +372,234 @@ fn str011a_classic_tier1_byte_baseline() {
             ),
             expected[index],
             "classic Tier-1 bytes or segment accounting changed for style {index}",
+        );
+    }
+}
+
+#[test]
+fn worst_case_blocks_stay_within_the_worker_payload_plan() {
+    // Rows: width, height and the total bitplanes to try. Small blocks try
+    // every count up to 64, the widest u64 magnitude; large ones the widest,
+    // tallest and largest shapes at 1, 16 and 31 bitplanes.
+    let every: Vec<u8> = (1..=64).collect();
+    let few = [1_u8, 16, 31];
+    let shapes: [(usize, usize, &[u8]); 8] = [
+        (1, 1, &every),
+        (4, 4, &every),
+        (3, 5, &every),
+        (64, 64, &few),
+        (7, 64, &few),
+        (64, 7, &few),
+        (1024, 4, &few),
+        (4, 1024, &few),
+    ];
+    let styles = [
+        CodeBlockStyle::default(),
+        CodeBlockStyle {
+            vertically_causal_context: true,
+            ..CodeBlockStyle::default()
+        },
+        CodeBlockStyle {
+            selective_arithmetic_coding_bypass: true,
+            ..CodeBlockStyle::default()
+        },
+        CodeBlockStyle {
+            termination_on_each_pass: true,
+            ..CodeBlockStyle::default()
+        },
+        CodeBlockStyle {
+            reset_context_probabilities: true,
+            segmentation_symbols: true,
+            ..CodeBlockStyle::default()
+        },
+        CodeBlockStyle {
+            selective_arithmetic_coding_bypass: true,
+            reset_context_probabilities: true,
+            termination_on_each_pass: true,
+            vertically_causal_context: true,
+            segmentation_symbols: true,
+            ..CodeBlockStyle::default()
+        },
+    ];
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    for &(width, height, bitplane_counts) in &shapes {
+        for &total_bitplanes in bitplane_counts {
+            let top = (1_u64 << (total_bitplanes - 1)) - 1 + (1_u64 << (total_bitplanes - 1));
+            // Draws: uniform noise over every bitplane, one bit at a random
+            // plane, every coefficient at the top plane, which makes each
+            // full cleanup column a run-length interruption followed by three
+            // significance and sign pairs, and alternating extremes.
+            for draw in 0..4 {
+                let coefficients: Vec<i64> = (0..width * height)
+                    .map(|index| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        let magnitude = match draw {
+                            0 => state & top,
+                            1 => 1 << (state % u64::from(total_bitplanes)),
+                            2 => 1 << (total_bitplanes - 1),
+                            _ => top,
+                        };
+                        let negative =
+                            (draw == 3 && index % 2 == 0) || (draw != 3 && state >> 63 == 1);
+                        match i64::try_from(magnitude) {
+                            Ok(value) if negative => -value,
+                            Ok(value) => value,
+                            Err(_) => i64::MIN,
+                        }
+                    })
+                    .collect();
+                let plan = classic_worker_allocation(width, height, total_bitplanes)
+                    .expect("valid code-block plan");
+                for (index, style) in styles.iter().enumerate() {
+                    let sub_band_type = [
+                        SubBandType::LowLow,
+                        SubBandType::HighLow,
+                        SubBandType::LowHigh,
+                        SubBandType::HighHigh,
+                    ][(index + draw) % 4];
+                    let encoded = super::try_encode_code_block_segments_with_style_i64(
+                        &coefficients,
+                        u32::try_from(width).expect("width fits u32"),
+                        u32::try_from(height).expect("height fits u32"),
+                        sub_band_type,
+                        total_bitplanes,
+                        style,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{width}x{height}, {total_bitplanes} bitplanes, draw {draw}: {error}"
+                        )
+                    });
+                    assert!(
+                        encoded.data.len() <= plan.payload_bytes,
+                        "{width}x{height}, {total_bitplanes} bitplanes, draw {draw}, style {index}: \
+                         {} bytes over the {} byte plan",
+                        encoded.data.len(),
+                        plan.payload_bytes
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn column_word_passes_match_neighbor_byte_passes() {
+    // Rows: width, height and total bitplanes; partial stripes, single rows
+    // and columns, and 31 bitplanes, the most the column words hold.
+    let shapes = [
+        (1, 1, 8),
+        (1, 4, 8),
+        (3, 7, 10),
+        (63, 65, 13),
+        (1, 7, 9),
+        (5, 3, 10),
+        (4, 4, 12),
+        (7, 5, 11),
+        (13, 9, 14),
+        (64, 1, 9),
+        (1, 64, 9),
+        (63, 61, 13),
+        (32, 64, 12),
+        (1024, 4, 10),
+        (64, 64, 16),
+        (64, 64, 31),
+    ];
+    let styles = [
+        CodeBlockStyle::default(),
+        CodeBlockStyle {
+            reset_context_probabilities: true,
+            ..CodeBlockStyle::default()
+        },
+        CodeBlockStyle {
+            segmentation_symbols: true,
+            ..CodeBlockStyle::default()
+        },
+        CodeBlockStyle {
+            reset_context_probabilities: true,
+            segmentation_symbols: true,
+            ..CodeBlockStyle::default()
+        },
+    ];
+    let sub_bands = [
+        SubBandType::LowLow,
+        SubBandType::HighLow,
+        SubBandType::LowHigh,
+        SubBandType::HighHigh,
+    ];
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for (case, &(width, height, total_bitplanes)) in shapes.iter().enumerate() {
+        let full = (1_u64 << total_bitplanes) - 1;
+        // Draws: zero, sparse, uniform, mostly small, and alternating bits.
+        for draw in 0..5 {
+            let coefficients: Vec<i32> = (0..width * height)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    let random = state >> 11;
+                    let magnitude = match draw {
+                        0 => 0,
+                        4 => full / 3,
+                        1 if !random.is_multiple_of(16) => 0,
+                        3 => (random & full) >> (random % u64::from(total_bitplanes)),
+                        _ => random & full,
+                    };
+                    let magnitude = i32::try_from(magnitude).expect("31-bit magnitude fits i32");
+                    if draw == 4 || random & (1 << 52) == 0 {
+                        magnitude
+                    } else {
+                        -magnitude
+                    }
+                })
+                .collect();
+            let view = CoefficientBlockView::try_contiguous(&coefficients, width, height)
+                .expect("contiguous test block");
+            let Some(num_bitplanes) = coded_bitplanes(view, total_bitplanes).expect("fits") else {
+                continue;
+            };
+            let allocation = classic_worker_allocation(width, height, total_bitplanes)
+                .expect("valid code-block plan");
+            for (band, &sub_band_type) in sub_bands.iter().enumerate() {
+                let style = &styles[(case + draw + band) % styles.len()];
+                let column = try_encode_column_passes(
+                    view,
+                    sub_band_type,
+                    num_bitplanes,
+                    style,
+                    allocation.payload_bytes,
+                )
+                .expect("column-word passes");
+                let neighbor = try_encode_neighbor_byte_passes(
+                    view,
+                    sub_band_type,
+                    num_bitplanes,
+                    style,
+                    allocation,
+                )
+                .expect("neighbor-byte passes");
+                let summary = |block: CodedBlock| (block.data, block.num_coding_passes);
+                assert_eq!(
+                    summary(column),
+                    summary(neighbor),
+                    "{width}x{height}, {total_bitplanes} bitplanes, draw {draw}, {sub_band_type:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn classic_encode_rejects_magnitudes_above_the_bitplane_count() {
+    for (coefficient, total_bitplanes) in [(2, 1), (i32::MIN, 31)] {
+        assert_eq!(
+            try_encode_code_block(&[coefficient], 1, 1, SubBandType::LowLow, total_bitplanes)
+                .unwrap_err(),
+            crate::EncodeError::InvalidInput {
+                what: "classic code-block magnitude exceeds configured bitplane count",
+            }
         );
     }
 }

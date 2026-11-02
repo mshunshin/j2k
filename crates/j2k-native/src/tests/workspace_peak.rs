@@ -11,6 +11,12 @@ const COMPONENTS: usize = 3;
 fn decode_context(bytes: &[u8], roi: Option<(u32, u32, u32, u32)>) -> DecoderContext<'_> {
     let image = Image::new(bytes, &DecodeSettings::default()).expect("image");
     let mut context = DecoderContext::default();
+    // Off the tile-wide route, whose worker workspaces would make Tier-1 the
+    // peak of this small image instead of the stages checked here.
+    #[cfg(feature = "parallel")]
+    {
+        context.tile_decode_context.force_per_sub_band = true;
+    }
     match roi {
         Some(roi) => {
             image
@@ -45,11 +51,21 @@ fn whole_decode_peak_holds_every_component_plane_and_one_component_of_coefficien
 
     // Each component finishes Tier-1, the IDWT and store before the next is
     // decoded, so coefficients for only one component are live. Every
-    // component plane is, until the color transform.
+    // component plane is, until the color transform; when the pack takes the
+    // last level, the last plane is the last component's coefficient buffer.
+    // The IDWT holds one component's last level, or, when the pack takes the
+    // last level, one component's LL band of it at a time: each plane keeps
+    // its own LL band in front of the level's other sub-bands.
+    let plane = SIDE * SIDE * size_of::<f32>();
+    let ll_band = plane / 4;
     assert_eq!(counters.stored_coefficients, SIDE * SIDE);
-    assert_eq!(peak.coefficients, SIDE * SIDE * size_of::<f32>());
-    assert!(peak.channels >= COMPONENTS * SIDE * SIDE * size_of::<f32>());
-    assert!(peak.idwt >= SIDE * SIDE * size_of::<f32>());
+    assert_eq!(peak.coefficients, plane);
+    assert!(peak.coefficients + peak.channels >= COMPONENTS * plane);
+    assert!(
+        peak.idwt >= ll_band && peak.idwt < 2 * ll_band,
+        "idwt {}",
+        peak.idwt
+    );
     assert!(peak.tier1 > 0);
     assert!(peak.structure > 0);
 }

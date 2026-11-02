@@ -87,7 +87,7 @@ fn every_workflow_declares_default_permissions_including_contents_read() {
 }
 
 #[test]
-fn jobs_keep_repository_permissions_read_only() {
+fn jobs_limit_write_permissions_to_guarded_exceptions() {
     let mut violations = Vec::new();
     for workflow in workflows() {
         let oidc_publisher = (workflow.file_name == "python-bindings.yml").then(|| {
@@ -106,10 +106,38 @@ fn jobs_keep_repository_permissions_read_only() {
             );
             value_mapping(publish, "PyPI publish job")
         });
+        let evidence_rerun = (workflow.file_name == "gpu-evidence-rerun.yml").then(|| {
+            let expected_trigger: Value = serde_yaml_ng::from_str(
+                "workflow_run: {workflows: [GPU validation], types: [completed]}",
+            ).expect("GPU completion trigger");
+            assert_eq!(workflow.document["on"], expected_trigger);
+            let rerun = &workflow.document["jobs"]["rerun"];
+            assert_eq!(rerun["if"].as_str(), Some(concat!(
+                "${{ github.event.workflow_run.conclusion == 'success' && ",
+                "github.event.workflow_run.event == 'workflow_dispatch' }}"
+            )));
+            let expected_permissions: Value = serde_yaml_ng::from_str(
+                "actions: write\ncontents: read",
+            ).expect("rerun permissions");
+            assert_eq!(rerun["permissions"], expected_permissions);
+            let steps = rerun["steps"].as_sequence().expect("rerun steps");
+            assert_eq!(steps.len(), 2);
+            assert!(steps[0]["uses"].as_str().expect("checkout action")
+                .starts_with("actions/checkout@"));
+            let expected_checkout: Value = serde_yaml_ng::from_str(
+                "ref: ${{ github.workflow_sha }}\npersist-credentials: false\nsparse-checkout: scripts",
+            ).expect("trusted workflow checkout");
+            assert_eq!(steps[0]["with"], expected_checkout);
+            assert_eq!(steps[1]["run"].as_str(), Some("python3 -m scripts.rerun_gpu_evidence"));
+            value_mapping(rerun, "GPU evidence rerun job")
+        });
         visit_mappings(&workflow.document, &mut |mapping| {
             let Some(permissions) = mapping_get(mapping, "permissions") else {
                 return;
             };
+            if evidence_rerun.is_some_and(|rerun| std::ptr::eq(mapping, rerun)) {
+                return;
+            }
             if oidc_publisher.is_some_and(|publish| std::ptr::eq(mapping, publish)) {
                 let scopes = value_mapping(permissions, "PyPI publisher permissions");
                 assert_eq!(scopes.len(), 1, "the publisher only needs an OIDC token");
@@ -132,7 +160,7 @@ fn jobs_keep_repository_permissions_read_only() {
     violations.dedup();
     assert!(
         violations.is_empty(),
-        "only the guarded PyPI publish job may request OIDC token creation: {violations:?}"
+        "write permissions are limited to guarded publishing and evidence reruns: {violations:?}"
     );
 }
 
@@ -245,6 +273,70 @@ fn rust_quality_job_fetches_release_tags() {
     assert!(
         fetches_full_history,
         "rust-quality checkout must fetch release tags used by repo-lint"
+    );
+}
+
+#[test]
+fn pull_requests_review_the_public_api_before_merge() {
+    // Full validation runs after merge, when an API change can no longer be blocked.
+    let ci = workflow("ci.yml");
+    let root = value_mapping(&ci.document, &ci.file_name);
+    let jobs = jobs(root, &ci.file_name);
+    let planner_outputs = jobs
+        .get(Value::String("planner".to_owned()))
+        .and_then(Value::as_mapping)
+        .and_then(|planner| mapping_get(planner, "outputs"))
+        .and_then(Value::as_mapping)
+        .expect("planner outputs");
+    assert_eq!(
+        mapping_get(planner_outputs, "public_api").and_then(Value::as_str),
+        Some("${{ steps.plan.outputs.public_api }}"),
+        "the planner must export whether a PR can change the public API"
+    );
+
+    let public_api = jobs
+        .get(Value::String("public-api".to_owned()))
+        .and_then(Value::as_mapping)
+        .expect("PR public-api job");
+    assert_eq!(
+        mapping_get(public_api, "if").and_then(Value::as_str),
+        Some("${{ needs.planner.outputs.public_api == 'true' }}"),
+        "the public API review must run whenever the planner says the API may change"
+    );
+    assert_eq!(
+        mapping_get(public_api, "runs-on").and_then(Value::as_str),
+        Some("macos-latest"),
+        "published Metal baselines include macOS-gated public API"
+    );
+    let steps = mapping_get(public_api, "steps")
+        .and_then(Value::as_sequence)
+        .expect("public-api steps");
+    let commands = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter_map(|step| mapping_get(step, "run").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    for command in ["cargo xtask stable-api", "cargo xtask semver"] {
+        assert!(
+            commands.contains(&command),
+            "public-api must run `{command}`"
+        );
+    }
+    let fetches_full_history = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .find(|step| {
+            mapping_get(step, "uses")
+                .and_then(Value::as_str)
+                .is_some_and(|reference| reference.starts_with("actions/checkout@"))
+        })
+        .and_then(|checkout| mapping_get(checkout, "with"))
+        .and_then(Value::as_mapping)
+        .and_then(|with| mapping_get(with, "fetch-depth"))
+        .is_some_and(is_numeric_zero);
+    assert!(
+        fetches_full_history,
+        "public-api checkout must fetch release tags used by stable-api and semver"
     );
 }
 

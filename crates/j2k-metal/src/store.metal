@@ -49,6 +49,7 @@ struct J2kRepeatedGrayStoreParams {
     float max_value;
     float u8_scale;
     float u16_scale;
+    uint is_signed;
 };
 
 struct J2kGrayStoreParams {
@@ -136,11 +137,6 @@ struct J2kStoreWindowIndices {
     uint src_idx;
     uint dst_idx;
 };
-
-inline short j2k_pack_native_i16(float value, float positive_max) {
-    const float negative_min = -positive_max - 1.0f;
-    return short(rint(clamp(value, negative_min, positive_max)));
-}
 
 inline J2kStoreWindowIndices j2k_store_window_indices(
     uint input_width,
@@ -264,7 +260,7 @@ kernel void j2k_store_component_repeated_gray_u16(
         gid.z * input_plane_len,
         gid.z * output_plane_len
     );
-    output[indices.dst_idx] = pack_to_u16(j2k_shift_centered_sample(input[indices.src_idx], params.addend, true), params.max_value, params.u16_scale);
+    output[indices.dst_idx] = pack_sample_to_u16(j2k_shift_centered_sample(input[indices.src_idx], params.addend, true), params.max_value, params.u16_scale, params.is_signed != 0u);
 }
 
 kernel void j2k_store_component_repeated_gray_i16(
@@ -323,7 +319,7 @@ kernel void j2k_store_component_repeated_gray_u16_contiguous(
         return;
     }
 
-    output[gid] = pack_to_u16(j2k_shift_centered_sample(input[gid], params.addend, true), params.max_value, params.u16_scale);
+    output[gid] = pack_sample_to_u16(j2k_shift_centered_sample(input[gid], params.addend, true), params.max_value, params.u16_scale, params.is_signed != 0u);
 }
 
 kernel void j2k_store_component_gray_u8(
@@ -375,8 +371,8 @@ kernel void j2k_store_component_gray_u16(
 }
 
 // Signed sources of at most eight bits written to Gray16: the CPU takes the
-// sample's two's-complement byte and widens it like any eight-bit sample
-// (x * 257), so -128 becomes 0x8080.
+// sample's two's-complement byte and widens it using the declared precision.
+// At eight bits this is x * 257, so -128 becomes 0x8080.
 kernel void j2k_store_component_gray_i8_widened_u16(
     device const float *input [[buffer(0)]],
     device ushort *output [[buffer(1)]],
@@ -398,11 +394,10 @@ kernel void j2k_store_component_gray_i8_widened_u16(
         0u,
         params.output_item_offset
     );
-    const short sample = j2k_pack_native_i16(
+    output[indices.dst_idx] = j2k_pack_signed_narrow_u16(
         j2k_shift_centered_sample(input[indices.src_idx], params.addend, true),
         params.max_value
     );
-    output[indices.dst_idx] = ushort(uchar(char(sample))) * 257u;
 }
 
 kernel void j2k_store_component_gray_i16(

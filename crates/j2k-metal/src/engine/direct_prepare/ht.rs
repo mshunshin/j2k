@@ -15,7 +15,7 @@ mod zero_rects;
 
 pub(in crate::engine) use self::grouped::prepare_ht_sub_band_groups;
 pub(super) use self::referenced::prepare_referenced_ht_sub_band;
-pub(in crate::engine) use self::zero_rects::append_span_rects;
+pub(in crate::engine) use self::zero_rects::{append_span_rects, band_cells, BandCells};
 
 #[cfg(target_os = "macos")]
 pub(in crate::engine) fn prepare_ht_sub_band(
@@ -64,6 +64,7 @@ pub(in crate::engine) fn prepare_ht_sub_band(
 
     Ok(PreparedHtSubBand {
         band_id: job.band_id,
+        origin: (0, 0),
         width: job.width,
         height: job.height,
         payload_source: PreparedHtPayloadSource::Contiguous(coded_data),

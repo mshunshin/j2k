@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Metal JPEG2000 Rust - J2K</title>
   <meta name="description" content="Metal JPEG2000 Rust support in J2K: Apple Metal backends for supported JPEG 2000 / HTJ2K decode, encode-stage, and transcode paths on macOS.">
-  <link rel="canonical" href="https://frames-sg.github.io/j2k/metal-jpeg2000-rust/">
+  <link rel="canonical" href="https://frames-sg.com/j2k/metal-jpeg2000-rust/">
   <meta property="og:title" content="Metal JPEG2000 Rust">
   <meta property="og:description" content="Metal JPEG2000 Rust support in J2K: Apple Metal backends for supported JPEG 2000 / HTJ2K decode, encode-stage, and transcode paths on macOS.">
-  <meta property="og:url" content="https://frames-sg.github.io/j2k/metal-jpeg2000-rust/">
+  <meta property="og:url" content="https://frames-sg.com/j2k/metal-jpeg2000-rust/">
   <meta property="og:type" content="article">
   <meta property="og:image" content="https://frames-sg.github.io/j2k/assets/og-card.png">
   <meta property="og:image:width" content="1200">
@@ -29,7 +29,7 @@
     "isPartOf": { "@type": "SoftwareSourceCode", "name": "J2K", "codeRepository": "https://github.com/frames-sg/j2k", "programmingLanguage": "Rust" }
   }
   </script>
-  <link rel="stylesheet" href="../assets/site.css?v=20260814">
+  <link rel="stylesheet" href="../assets/site.css?v=20261021">
 </head>
 <body>
   <header class="site-header">
@@ -43,6 +43,13 @@
       </nav>
     </div>
   </header>
+  <aside class="site-move" aria-label="Primary Frames website">
+    <div class="wrap site-move-inner">
+      <span class="site-move-label">Primary site</span>
+      <p class="site-move-copy">J2K has a new home on <strong>frames-sg.com</strong>.</p>
+      <a class="site-move-link" href="https://frames-sg.com/j2k/metal-jpeg2000-rust/">Open the current Metal JPEG 2000 page <span aria-hidden="true">↗</span></a>
+    </div>
+  </aside>
   <main>
     <section class="hero">
       <div class="wrap hero-grid">
@@ -69,7 +76,7 @@
         </article>
         <article class="card">
           <h2>JPEG input</h2>
-          <p><code>j2k-jpeg-metal</code> provides Metal-backed JPEG decode surfaces and selected baseline encode paths.</p>
+          <p><code>j2k-jpeg-metal</code> decodes every JPEG the CPU decoder supports into Metal memory, and encodes baseline and lossless JPEG from Metal buffers.</p>
           <pre class="code">cargo add j2k-jpeg-metal</pre>
         </article>
         <article class="card">
@@ -83,7 +90,7 @@
       <div class="wrap copy">
         <h2>Supported shape policy</h2>
         <p>Metal covers selected shapes. Explicit Metal requests return an unsupported-request error for other shapes.</p>
-        <p>The Metal backends support the same formats as the main crate: JPEG 2000 Part 1, JP2 files, HTJ2K Part 15, and JPH files. Shapes Metal does not support, or was not measured to speed up, run on the CPU.</p>
+        <p>The Metal backends support the same formats as the main crate: JPEG 2000 Part 1, JP2 files, HTJ2K Part 15, and JPH files. Shapes Metal does not support, or was not measured to speed up, run on the CPU. Device decodes of signed grayscale and color sources follow the CPU's sample conversion.</p>
         <p class="note">Benchmark results are in <a href="https://github.com/frames-sg/j2k/blob/main/docs/benchmark-evidence.md">docs/benchmark-evidence.md</a>. Published Metal numbers list the hardware, commands, shapes, skipped rows, and <code>publication_eligible=true</code> from the benchmark tooling.</p>
       </div>
     </section>

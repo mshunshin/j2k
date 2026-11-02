@@ -16,6 +16,28 @@ codestreams, and JPH files. JPX (Part 2) extensions are not supported except
 where JP2/JPH decoding needs them. The detailed list is in
 [`docs/public-support.md`](public-support.md).
 
+## Encode geometry and implementation scope
+
+Multi-tile encode keeps absolute tile-component coordinates through the forward
+transform, subband partitioning, and packet progression. The shared geometry
+helpers implement the reference-grid mappings in ITU-T T.800 (11/2015), B.5–B.7
+and B.12; the odd-origin lifting paths use F.4's symmetric extension and lifting
+equations. CPU, Metal, and CUDA stage adapters carry the same origin and phase.
+Legacy accelerator hooks remain usable for phases equivalent to origin zero.
+The existing smallest-edge-tile decomposition policy still applies.
+
+Image parsing has no 60,000-pixel dimension cap. Grid arithmetic handles clipped
+precinct and code-block endpoints at the `u32` boundary, while decode allocations
+remain subject to structural and retained-memory budgets. Long-image fixtures
+from OpenJPEG cover full decode and far-edge regions.
+
+These changes repair geometry and transform behavior; they do not replace the
+entire historically imported codec. Inherited parsing, entropy coding, packet
+handling, inverse transforms, and shared tables remain subject to the existing
+attribution in `NOTICES.md`. The implementation work involved exposure to that
+source and makes no formal clean-room claim. A complete provenance replacement
+requires separate subsystem work and independently derived table definitions.
+
 ## Crate classes
 
 | Crate | Class | Role |
@@ -29,13 +51,13 @@ where JP2/JPH decoding needs them. The detailed list is in
 | `j2k-profile`, `j2k-metal-support` | support | Runtime/profile helpers used by adapters and codec crates. |
 | `j2k-cuda-runtime` | CUDA runtime | Codec-neutral CUDA Driver API integration, checked generic module/kernel launch, context/stream/event lifecycle, memory pools, pinned staging, diagnostics, completion, and guarded external-allocation validation shared by CUDA engines. |
 | `j2k-cuda-build-support` | build support | Internal shared CUDA-Oxide project staging, toolchain invocation, placeholder policy, and PTX packaging for codec engine build scripts. |
-| `j2k-cuda-j2k-engine` | CUDA engine | Internal J2K/HTJ2K/ML operations on a borrowed low-level CUDA context: transforms, Tier-1, dequantization, final store, encode, packetization, kernel ABI, validation, launch orchestration, and CUDA-Oxide packaging. |
+| `j2k-cuda-j2k-engine` | CUDA engine | Internal J2K/HTJ2K operations on a borrowed low-level CUDA context: transforms, Tier-1, dequantization, final store, encode, packetization, kernel ABI, validation, launch orchestration, and CUDA-Oxide packaging. |
 | `j2k-cuda-jpeg-engine` | CUDA engine | Internal JPEG operations on a borrowed low-level CUDA context: JPEG plans, validation, host allocation, kernel ABI byte views, CUDA-Oxide projects, and launch orchestration. |
 | `j2k-cuda-transcode-engine` | CUDA engine | Internal coefficient-domain transcode operations: reversible/irreversible transforms and quantization, validation, launch geometry, stage timings, and CUDA-Oxide packaging. |
 | `j2k-jpeg-cuda`, `j2k-cuda`, `j2k-transcode-cuda` | CUDA adapter | Codec-facing CUDA APIs, persistent batch sessions, route policy, resident output, and validated caller-owned destinations for supported paths. |
 | `j2k-jpeg-metal`, `j2k-metal`, `j2k-transcode-metal` | Metal adapter | macOS Metal adapters built on `j2k-metal-support`. J2K transforms, Tier-1, packetization, store, and resident encode/decode are in the private `j2k-metal::engine` module; the transcode adapter has its own coefficient-domain kernels and does not depend on `j2k-metal`. |
-| `j2k-ml` | framework integration | Thin Burn allocation and codec-interop adapter for owned integer batch output. |
-| `j2k-python` | optional framework integration | Rust PyO3 extension exposing pixels and selected wavelet bands through owned DLPack tensors; optional CUDA decode into PyTorch-owned storage; CPU RGB research encode/decode and float 9/7 transforms. No Python dependencies in default Rust builds. |
+| `j2k-ml` | framework integration | Thin Burn allocation and codec-interop adapter for owned integer batch output, including mixed JPEG and JPEG 2000 CPU batches. |
+| `j2k-python` | optional framework integration | Rust PyO3 extension exposing pixels and selected wavelet bands through owned DLPack tensors; optional CUDA decode into PyTorch-owned storage and Metal decode into fresh buffers transferred to PyTorch MPS; CPU RGB research encode/decode and float 9/7 transforms. No Python dependencies in default Rust builds. |
 | `j2k-mpsgraph-support` | support | Codec-independent graph submission, callback/error ownership, completion, and retained input lifetime shared with JPEG XR. |
 | `j2k-mpsgraph` | framework integration | Experimental Apple Silicon direct bridge from Metal-resident native integer batches to static rank-four MPSGraph programs. |
 | `j2k-transcode` | transcode | JPEG-to-HTJ2K coefficient-domain transcode algorithms and shared types. |
@@ -49,8 +71,8 @@ where JP2/JPH decoding needs them. The detailed list is in
 ## Dependency rules
 
 - The public `j2k` crate owns the JPEG 2000 / HTJ2K API surface.
-- `j2k`, `j2k-native`, `j2k-cuda`, and `j2k-metal` own codec parsing,
-  preparation, grouping, decoding, scratch reuse, and device execution.
+- `j2k`, `j2k-native`, `j2k-jpeg`, `j2k-cuda`, and `j2k-metal` own codec
+  parsing, preparation, grouping, decoding, scratch reuse, and device execution.
 - `j2k-ml` may allocate or materialize Burn tensors and establish safe
   framework/codec ordering. It must not duplicate entropy decode, transforms,
   grouping policy, normalization, or training behavior.
@@ -61,7 +83,7 @@ where JP2/JPH decoding needs them. The detailed list is in
   `j2k-native` extracts selected bands through the existing Tier-1 decoders;
   `j2k` owns the public method. No framework code participates in extraction.
 - `j2k-python` owns interpreter conversion, DLPack lifetime transfer, and the
-  CUDA/PyTorch allocation boundary. It reuses codec preparation and external
+  CUDA/Metal PyTorch allocation boundary. It reuses codec preparation and external
   destinations. Dataset policy, normalization, and model code stay with the
   application.
 - Codec crates may depend on `j2k-core` and support crates.
@@ -93,8 +115,8 @@ j2k-cuda-runtime -> j2k-core
 j2k-cuda-j2k-engine -> j2k-codec-math, j2k-core, j2k-cuda-runtime, j2k-types
 j2k-cuda-jpeg-engine -> j2k-codec-math, j2k-core, j2k-cuda-runtime
 j2k-cuda-transcode-engine -> j2k-core, j2k-cuda-runtime
-j2k-ml -> j2k, j2k-cuda, j2k-metal, j2k-metal-support
-j2k-python -> j2k, j2k-cuda, j2k-cuda-runtime, j2k-jpeg, j2k-native
+j2k-ml -> j2k, j2k-core, j2k-cuda, j2k-cuda-runtime, j2k-jpeg, j2k-metal, j2k-metal-support
+j2k-python -> j2k, j2k-cuda, j2k-cuda-runtime, j2k-jpeg, j2k-metal, j2k-metal-support, j2k-native
 j2k-mpsgraph -> j2k, j2k-core, j2k-metal, j2k-metal-support, j2k-mpsgraph-support
 j2k-transcode-metal -> j2k-codec-math, j2k-core, j2k-metal-support, j2k-transcode, j2k-types
 j2k-transcode-cuda -> j2k-core, j2k-cuda-j2k-engine, j2k-cuda-runtime, j2k-cuda-transcode-engine, j2k-native, j2k-transcode
@@ -110,6 +132,10 @@ NCHW or NHWC order and preserves source indices. Straight and premultiplied
 alpha are distinct grouping keys. Preparation retains the caller-owned
 codestream bytes and reusable decode plans without duplicating the codestream.
 Broader component layouts remain on the component-plane APIs.
+`j2k_jpeg::JpegBatchDecoder` decodes complete 8-bit JPEGs on the CPU into dense
+RGB8 groups in the same layouts, grouped by size; a failing input is reported
+by index and the rest of its group is kept. Both batch decoders use the
+`BatchLayout` defined in `j2k-core`.
 
 ### CPU JPEG SIMD boundary
 
@@ -157,13 +183,18 @@ CUDA adapters use `j2k-cuda-runtime` for the shared CUDA Driver API runtime,
 generic module loading, checked launch geometry, memory, and completion.
 `j2k-jpeg-cuda` calls into `j2k-cuda-jpeg-engine` for JPEG plans, validation,
 CUDA-Oxide packaging, and launch orchestration. `j2k-cuda` calls into
-`j2k-cuda-j2k-engine` for J2K-ML, transforms, classic Tier-1 decode, HTJ2K
+`j2k-cuda-j2k-engine` for transforms, classic Tier-1 decode, HTJ2K
 decode, dequantization, the final store, encode, and packetization, including
 queued completion and PTX packaging. The CUDA kernels are compiled from CUDA
 Oxide projects; the Rust host code drives them through the Driver API.
 The Burn CUDA upload adapter waits for the decoded GPU output, copies the
 pixels to host memory, and creates the Burn tensor with Burn's public upload
 API.
+The direct Burn CUDA adapter instead allocates Burn-owned CUDA storage,
+checks that it belongs to the codec's CUDA context, decodes into it, waits
+for codec completion, and registers that same allocation as the Burn tensor.
+It uses `j2k-cuda-runtime` for the checked external-destination view and for
+the completion guard that protects the allocation during error unwinding.
 
 Metal adapters use `j2k-metal-support` for device, queue, shader-library,
 pipeline loading, checked buffer access, and route-label helpers. All raw
@@ -193,6 +224,12 @@ at least four. When the caller leaves the worker count unset and the host has
 more threads than admitted workers, each worker decodes its image with internal parallelism:
 prepared HTJ2K plans decode their rows of code blocks and wavelet bands on the
 shared Rayon pool, still without reparsing.
+
+Under `CpuDecodeParallelism::Auto`, a multi-tile full-image decode whose components
+are all sampled 1x1 decodes its tiles concurrently, without a code-block hook. Each
+worker owns its scratch and stores into its own row slices of the component planes,
+so the output is bit-identical. The workers split the bytes the decode cap leaves; on
+any failure the serial tile loop decodes the image again and reports its error.
 
 Single-image CPU decode under `CpuDecodeParallelism::Auto` decodes every code
 block of an HT-only tile in one parallel pass, one row of code blocks per task,
@@ -231,11 +268,23 @@ homogeneous group. Resident and external-destination routes share the codec
 pipeline; an external destination receives the final samples without a decoded
 host transfer or an intermediate final device allocation.
 
-GPU prepared decode returns an error for nonzero ROI maxshift (RGN markers)
-and for shapes a backend's plans cannot describe. Subsampled components, mixed
-precision or signedness, arbitrary component counts, and precision above 16
-bits use the CPU component-plane APIs or return a fast-batch
-representability error. A shape stays off the GPU until it has been measured.
+CUDA and Metal device decodes follow the CPU's sample conversion for signed
+grayscale and color sources. Component plans keep the source signedness from
+construction and reject color components of mixed signedness.
+
+CUDA and Metal prepared decode support ROI maxshift from RGN markers in
+supported classic and HT profiles. Both limit the coded bitplane count including
+the ROI shift to 31; classic blocks must fit within 64×64, and HT geometry and
+pass limits are backend-specific. Shapes a backend's plans cannot describe
+return an error. See the tested ROI profiles in
+[`j2k-ml.md`](j2k-ml.md#gpu-adapter-support). Mixed precision or
+signedness, arbitrary component counts, and precision above 16 bits use the
+CPU component-plane APIs or return a fast-batch representability error.
+Images whose components use different sampling batch on the CPU for every
+request kind; Metal batches them for full-image RGB (see below), and other
+such shapes return a capability error from the GPU backends. Uniformly
+subsampled images remain a representability error. A shape stays off the GPU until it has
+been measured.
 Machines, dates, and measurements are in
 [`docs/benchmark-evidence.md`](benchmark-evidence.md).
 
@@ -281,13 +330,18 @@ plan is unchanged. Multi-tile, offset,
 signed, alpha, MCT, and reduced/region geometry retain their existing routes.
 
 The legacy Metal full-image and tile-batch APIs prepare these plans before
-submission. Matching component graphs are stacked across images, including
-classic entropy jobs, IDWT, and component stores. Geometry that cannot be stacked
-uses independent resident graphs in the same command buffer. A small GPU pass
-replicates samples onto the image grid, including incomplete blocks at odd image
-edges, before the existing RGB/RGBA packer. It performs no ICC or YCbCr transform;
-those remain the caller's job. The owned dense batch API still rejects
-subsampling.
+submission. The owned batch decoder prepares them for full-image subsampled
+RGB inputs, which have no offset plan, and decodes them through the same
+resident group encoder as other RGB groups. Matching component graphs are
+stacked across images, including classic entropy jobs, IDWT, and component
+stores. Geometry that cannot be stacked uses independent resident graphs in
+the same command buffer. A small GPU pass replicates samples onto the image
+grid, including incomplete blocks at odd image edges, before the existing
+RGB/RGBA packer. In the owned batch decoder one replication dispatch covers
+each stacked component of a group. It performs no ICC or YCbCr transform;
+those remain the caller's job. Region and reduced requests for subsampled
+inputs still return a capability error from the Metal batch decoder, which
+callers can route to a single-image decode.
 
 One command buffer retains all intermediate resources until completion. Existing
 checked allocation and status-retirement paths own scratch buffers and propagate

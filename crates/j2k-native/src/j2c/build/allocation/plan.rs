@@ -6,8 +6,10 @@ use super::super::{PrecinctSelection, PrecinctUse};
 use super::{BuildWorkspace, DecompositionAllocationPlan};
 use crate::error::{DecodingError, Result, ValidationError};
 use crate::j2c::build::SubBandType;
-use crate::j2c::idwt::idwt_buffer_size;
+use crate::j2c::codestream::WaveletTransform;
+use crate::j2c::idwt::planned_workspace_elements;
 use crate::j2c::rect::IntRect;
+use crate::j2c::roi::RoiPlan;
 use crate::j2c::tile::{ResolutionTile, Tile};
 
 #[derive(Clone, Copy)]
@@ -24,6 +26,7 @@ pub(super) fn build_allocation_plan(
     include_roi_workspace: bool,
     workspace: BuildWorkspace,
     selection: Option<&PrecinctSelection>,
+    roi_plan: Option<&RoiPlan>,
 ) -> Result<(DecompositionAllocationPlan, usize)> {
     let mut plan = DecompositionAllocationPlan::new(
         retained_baseline_bytes,
@@ -33,6 +36,7 @@ pub(super) fn build_allocation_plan(
     )?;
     let mut idwt_workspace_elements = 0_usize;
     let mut resolution_run = 0usize;
+    let parsed_in_scratch = selection.is_some_and(PrecinctSelection::parsed_in_scratch);
     let keep = |run: usize| -> Result<Option<&[PrecinctUse]>> {
         match selection {
             Some(selection) => Ok(Some(
@@ -56,6 +60,8 @@ pub(super) fn build_allocation_plan(
             SubBandType::LowLow,
             tile,
             keep(resolution_run)?,
+            parsed_in_scratch,
+            roi_plan,
             &mut plan,
         )?;
         resolution_run += 1;
@@ -69,6 +75,7 @@ pub(super) fn build_allocation_plan(
         );
         let mut idwt_tracker = IdwtWorkspaceTracker::new(
             workspace.active_decomposition_count(total_decomposition_count),
+            component_tile.component_info.wavelet_transform(),
         );
         let mut observed_decomposition_count = 0usize;
         for resolution_tile in resolution_tiles {
@@ -89,6 +96,8 @@ pub(super) fn build_allocation_plan(
                     sub_band_type,
                     tile,
                     resolution_keep,
+                    parsed_in_scratch,
+                    roi_plan,
                     &mut plan,
                 )?;
             }
@@ -104,20 +113,57 @@ pub(super) fn build_allocation_plan(
         }
     }
 
+    include_scratch_precincts(&mut plan)?;
     plan.validate_minimum_live_workspace(idwt_workspace_elements)?;
     Ok((plan, idwt_workspace_elements))
 }
 
+/// Move scratch storage from the parse-only charge to the built counts.
+/// Each slot's maxima come only from precincts using that slot, whose
+/// code-blocks and nodes are already charged but never built. Their sums
+/// cover the scratch, so the total and the rejection points stay unchanged.
+fn include_scratch_precincts(plan: &mut DecompositionAllocationPlan) -> Result<()> {
+    for (code_blocks, tree_nodes) in plan
+        .scratch_code_blocks
+        .into_iter()
+        .zip(plan.scratch_tree_nodes)
+    {
+        let nodes = tree_nodes
+            .checked_mul(2)
+            .ok_or(ValidationError::ImageTooLarge)?;
+        plan.parse_only_code_blocks = plan
+            .parse_only_code_blocks
+            .checked_sub(code_blocks)
+            .ok_or(DecodingError::InvalidPrecinct)?;
+        plan.parse_only_tag_tree_nodes = plan
+            .parse_only_tag_tree_nodes
+            .checked_sub(nodes)
+            .ok_or(DecodingError::InvalidPrecinct)?;
+        DecompositionAllocationPlan::checked_add_count(&mut plan.code_blocks, code_blocks)?;
+        DecompositionAllocationPlan::checked_add_count(&mut plan.tag_tree_nodes, nodes)?;
+    }
+    Ok(())
+}
+
 /// Count one sub-band's precincts, code-blocks, layers and tag-tree nodes.
 /// With `keep`, precincts it excludes are counted as `build` makes them: no
-/// code-blocks and root-only tag trees.
+/// precinct record at all, though one with root-only tag trees is charged.
+/// Precincts parsed in scratch get no code-blocks or tag-tree nodes, but
+/// theirs are charged. With
+/// `roi_plan`, only the code-blocks it requires get layers, as `build` makes
+/// them.
 fn include_sub_band_allocations(
     resolution_tile: &ResolutionTile<'_>,
     sub_band_type: SubBandType,
     tile: &Tile<'_>,
     keep: Option<&[PrecinctUse]>,
+    parsed_in_scratch: bool,
+    roi_plan: Option<&RoiPlan>,
     plan: &mut DecompositionAllocationPlan,
 ) -> Result<()> {
+    // Sub-bands are counted in build order, so this is the index `build`
+    // gives the sub-band.
+    let sub_band_idx = plan.sub_bands;
     DecompositionAllocationPlan::checked_add_count(&mut plan.sub_bands, 1)?;
 
     let sub_band_rect = resolution_tile.sub_band_rect(sub_band_type);
@@ -133,7 +179,7 @@ fn include_sub_band_allocations(
     } else {
         0
     };
-    include_code_blocks(plan, code_block_count, tile)?;
+    include_code_blocks(plan, code_block_count, code_block_count, tile)?;
 
     // Every tag tree has a root even when its code-block grid is empty. Count
     // both roots up front and reject a metadata bomb before walking precincts.
@@ -145,29 +191,53 @@ fn include_sub_band_allocations(
 
     let mut observed_precincts = 0usize;
     let mut observed_code_blocks = 0usize;
-    for (precinct_idx, precinct_data) in resolution_tile
-        .precincts()
-        .ok_or(DecodingError::InvalidPrecinct)?
-        .enumerate()
-    {
+    let precincts = resolution_tile
+        .precinct_grid()
+        .ok_or(DecodingError::InvalidPrecinct)?;
+    for precinct_idx in 0..precinct_count {
         observed_precincts = observed_precincts
             .checked_add(1)
             .ok_or(ValidationError::ImageTooLarge)?;
-        if keep.is_some_and(|keep| {
-            keep.get(precinct_idx)
-                .is_some_and(|precinct_use| !precinct_use.is_built())
-        }) {
+        let precinct_use = keep.and_then(|keep| keep.get(precinct_idx).copied());
+        if precinct_use == Some(PrecinctUse::Unused) {
+            // No record and no tag-tree roots: move both, counted up front,
+            // to the charge.
+            plan.precincts = plan
+                .precincts
+                .checked_sub(1)
+                .ok_or(DecodingError::InvalidPrecinct)?;
+            plan.tag_tree_nodes = plan
+                .tag_tree_nodes
+                .checked_sub(2)
+                .ok_or(DecodingError::InvalidPrecinct)?;
+            DecompositionAllocationPlan::checked_add_count(&mut plan.unbuilt_precincts, 1)?;
             continue;
         }
-        let grid = code_block_grid(resolution_tile, sub_band_rect, precinct_data.rect)?;
+        let precinct_rect = precincts
+            .rect_at(precinct_idx)
+            .ok_or(DecodingError::InvalidPrecinct)?;
+        let grid = code_block_grid(resolution_tile, sub_band_rect, precinct_rect)?;
         let block_count = (grid.columns as usize)
             .checked_mul(grid.rows as usize)
             .ok_or(ValidationError::ImageTooLarge)?;
+        if precinct_use == Some(PrecinctUse::Parsed) && parsed_in_scratch {
+            include_scratch_parsed_precinct(plan, &grid, block_count, tile, sub_band_type)?;
+            plan.validate_minimum_live_workspace(0)?;
+            continue;
+        }
         observed_code_blocks = observed_code_blocks
             .checked_add(block_count)
             .ok_or(ValidationError::ImageTooLarge)?;
         if keep.is_some() {
-            include_code_blocks(plan, block_count, tile)?;
+            let layered_blocks = roi_plan.map_or(block_count, |roi_plan| {
+                required_code_block_count(
+                    &grid,
+                    resolution_tile,
+                    sub_band_rect,
+                    roi_plan.sub_band_window(sub_band_idx),
+                )
+            });
+            include_code_blocks(plan, block_count, layered_blocks, tile)?;
         }
 
         let nodes_per_tree = tag_tree_node_count(grid.columns, grid.rows)?;
@@ -189,19 +259,66 @@ fn include_sub_band_allocations(
     Ok(())
 }
 
+/// Charge a precinct parsed in scratch as if it were built with no layered
+/// code-blocks, and size its scratch slot to hold it. Its tag-tree roots,
+/// counted up front, move to the charge.
+fn include_scratch_parsed_precinct(
+    plan: &mut DecompositionAllocationPlan,
+    grid: &CodeBlockGrid,
+    block_count: usize,
+    tile: &Tile<'_>,
+    sub_band_type: SubBandType,
+) -> Result<()> {
+    let nodes_per_tree = tag_tree_node_count(grid.columns, grid.rows)?;
+    plan.tag_tree_nodes = plan
+        .tag_tree_nodes
+        .checked_sub(2)
+        .ok_or(DecodingError::InvalidPrecinct)?;
+    let tree_nodes = nodes_per_tree
+        .checked_mul(2)
+        .ok_or(ValidationError::ImageTooLarge)?;
+    DecompositionAllocationPlan::checked_add_count(
+        &mut plan.parse_only_tag_tree_nodes,
+        tree_nodes,
+    )?;
+    DecompositionAllocationPlan::checked_add_count(&mut plan.parse_only_code_blocks, block_count)?;
+    let layers = block_count
+        .checked_mul(usize::from(tile.num_layers))
+        .ok_or(ValidationError::ImageTooLarge)?;
+    DecompositionAllocationPlan::checked_add_count(&mut plan.parse_only_layers, layers)?;
+    let slot = match sub_band_type {
+        SubBandType::LowLow | SubBandType::HighLow => 0,
+        SubBandType::LowHigh => 1,
+        SubBandType::HighHigh => 2,
+    };
+    plan.scratch_code_blocks[slot] = plan.scratch_code_blocks[slot].max(block_count);
+    plan.scratch_tree_nodes[slot] = plan.scratch_tree_nodes[slot].max(nodes_per_tree);
+    Ok(())
+}
+
+/// Count `code_block_count` code-blocks, of which `layered_blocks` get one
+/// layer record per quality layer. The others' layer records are charged but
+/// never built.
 fn include_code_blocks(
     plan: &mut DecompositionAllocationPlan,
     code_block_count: usize,
+    layered_blocks: usize,
     tile: &Tile<'_>,
 ) -> Result<()> {
     DecompositionAllocationPlan::checked_add_count(&mut plan.code_blocks, code_block_count)?;
-    let layer_count = code_block_count
-        .checked_mul(usize::from(tile.num_layers))
+    let layers = usize::from(tile.num_layers);
+    let parse_only_count = code_block_count
+        .checked_sub(layered_blocks)
+        .and_then(|blocks| blocks.checked_mul(layers))
+        .ok_or(ValidationError::ImageTooLarge)?;
+    DecompositionAllocationPlan::checked_add_count(&mut plan.parse_only_layers, parse_only_count)?;
+    let layer_count = layered_blocks
+        .checked_mul(layers)
         .ok_or(ValidationError::ImageTooLarge)?;
     DecompositionAllocationPlan::checked_add_count(&mut plan.layers, layer_count)
 }
 
-fn global_code_block_count(
+pub(in crate::j2c) fn global_code_block_count(
     resolution_tile: &ResolutionTile<'_>,
     sub_band_rect: IntRect,
 ) -> Result<usize> {
@@ -262,14 +379,13 @@ pub(in crate::j2c::build) fn code_block_grid(
 
     let cb_x0 = (u32::max(precinct_rect.x0, sub_band_rect.x0) / cb_width) * cb_width;
     let cb_y0 = (u32::max(precinct_rect.y0, sub_band_rect.y0) / cb_height) * cb_height;
-    let cb_x1 = u32::min(precinct_rect.x1, sub_band_rect.x1)
-        .div_ceil(cb_width)
-        .checked_mul(cb_width)
-        .ok_or(ValidationError::ImageTooLarge)?;
-    let cb_y1 = u32::min(precinct_rect.y1, sub_band_rect.y1)
-        .div_ceil(cb_height)
-        .checked_mul(cb_height)
-        .ok_or(ValidationError::ImageTooLarge)?;
+    let block_end_x = u32::min(precinct_rect.x1, sub_band_rect.x1).div_ceil(cb_width);
+    let block_end_y = u32::min(precinct_rect.y1, sub_band_rect.y1).div_ceil(cb_height);
+    // Keep counts in block coordinates: the last grid cell can end at 2^32,
+    // beyond every representable image/subband endpoint. Only its rectangle
+    // is clipped; the last partial block must still contribute to the count.
+    let cb_x1 = block_end_x.saturating_mul(cb_width);
+    let cb_y1 = block_end_y.saturating_mul(cb_height);
     if cb_x0 > cb_x1 || cb_y0 > cb_y1 {
         return Err(DecodingError::InvalidPrecinct.into());
     }
@@ -278,12 +394,12 @@ pub(in crate::j2c::build) fn code_block_grid(
     let columns = if sub_band_rect.width() == 0 {
         0
     } else {
-        area.width() / cb_width
+        block_end_x - cb_x0 / cb_width
     };
     let rows = if sub_band_rect.height() == 0 {
         0
     } else {
-        area.height() / cb_height
+        block_end_y - cb_y0 / cb_height
     };
 
     Ok(CodeBlockGrid {
@@ -293,6 +409,43 @@ pub(in crate::j2c::build) fn code_block_grid(
     })
 }
 
+/// The code-blocks of `grid` the ROI plan requires: those whose rectangles,
+/// clipped to the sub-band, meet the sub-band's `window`. They form a run of
+/// columns by a run of rows, so they are counted without walking the grid,
+/// and an oversized precinct is still rejected from its block count alone.
+fn required_code_block_count(
+    grid: &CodeBlockGrid,
+    resolution_tile: &ResolutionTile<'_>,
+    sub_band_rect: IntRect,
+    window: Option<IntRect>,
+) -> usize {
+    let Some(window) = window.filter(|window| window.intersects(sub_band_rect)) else {
+        return 0;
+    };
+    // The cells that start at `start` and step by `size`, `count` of them, which
+    // meet the span from `low` to `high` the way `IntRect::intersects` does.
+    let cells = |start: u32, size: u32, count: u32, low: u32, high: u32| {
+        let first = (low.saturating_sub(start) / size).min(count);
+        let end = high.saturating_sub(start).div_ceil(size).min(count);
+        end.saturating_sub(first) as usize
+    };
+    let columns = cells(
+        grid.area.x0,
+        resolution_tile.code_block_width(),
+        grid.columns,
+        window.x0,
+        window.x1,
+    );
+    let rows = cells(
+        grid.area.y0,
+        resolution_tile.code_block_height(),
+        grid.rows,
+        window.y0,
+        window.y1,
+    );
+    columns * rows
+}
+
 fn checked_rect_elements(rect: IntRect) -> Result<usize> {
     (rect.width() as usize)
         .checked_mul(rect.height() as usize)
@@ -300,55 +453,55 @@ fn checked_rect_elements(rect: IntRect) -> Result<usize> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct IdwtWorkspaceTracker {
+pub(in crate::j2c) struct IdwtWorkspaceTracker {
     active_decomposition_count: Option<usize>,
+    transform: WaveletTransform,
     observed_count: usize,
+    third_highest_active_rect: Option<IntRect>,
     second_highest_active_rect: Option<IntRect>,
     highest_active_rect: Option<IntRect>,
 }
 
 impl IdwtWorkspaceTracker {
-    pub(super) fn new(active_decomposition_count: Option<usize>) -> Self {
+    pub(in crate::j2c) fn new(
+        active_decomposition_count: Option<usize>,
+        transform: WaveletTransform,
+    ) -> Self {
         Self {
             active_decomposition_count,
+            transform,
             observed_count: 0,
+            third_highest_active_rect: None,
             second_highest_active_rect: None,
             highest_active_rect: None,
         }
     }
 
-    pub(super) fn observe(&mut self, rect: IntRect) {
+    pub(in crate::j2c) fn observe(&mut self, rect: IntRect) {
         if self
             .active_decomposition_count
             .is_some_and(|count| self.observed_count < count)
         {
+            self.third_highest_active_rect = self.second_highest_active_rect;
             self.second_highest_active_rect = self.highest_active_rect;
             self.highest_active_rect = Some(rect);
         }
         self.observed_count = self.observed_count.saturating_add(1);
     }
 
-    pub(super) fn finish(self, ll_rect: IntRect) -> Result<Option<usize>> {
+    pub(in crate::j2c) fn finish(self, ll_rect: IntRect) -> Result<Option<usize>> {
         if self.active_decomposition_count.is_none() {
             return Ok(None);
         }
         let workspace = match self.highest_active_rect {
-            Some(highest_rect) => {
-                let output = idwt_buffer_size(highest_rect)?.1;
-                let scratch = self
-                    .second_highest_active_rect
-                    .map(|rect| idwt_buffer_size(rect).map(|(_, maximum)| maximum))
-                    .transpose()?
-                    .unwrap_or(0);
-                let band_scratch = crate::j2c::idwt::planned_band_scratch_elements(
-                    highest_rect.width() as usize,
-                    highest_rect.height() as usize,
-                )?;
-                output
-                    .checked_add(scratch)
-                    .and_then(|elements| elements.checked_add(band_scratch))
-                    .ok_or(ValidationError::ImageTooLarge)?
-            }
+            Some(highest_rect) => planned_workspace_elements(
+                highest_rect,
+                [
+                    self.second_highest_active_rect,
+                    self.third_highest_active_rect,
+                ],
+                self.transform,
+            )?,
             None => checked_rect_elements(ll_rect)?,
         };
         Ok(Some(workspace))

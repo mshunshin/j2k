@@ -4,6 +4,8 @@
 
 use super::super::cleanup::cleanup_symbol_stride;
 use super::super::readers::flat_magsgn_capacity;
+#[cfg(feature = "simd")]
+use super::super::readers::flat_vlc_capacity;
 use super::super::significance::sigma_stride;
 use super::super::state::HtBlockDecodeScratch;
 use crate::error::{Result, ValidationError};
@@ -18,6 +20,7 @@ struct HtWorkspaceLayout {
     sigma_symbols: usize,
     previous_row_symbols: usize,
     magsgn_bytes: usize,
+    vlc_bytes: usize,
 }
 
 fn workspace_layout(width: u32, height: u32) -> Result<HtWorkspaceLayout> {
@@ -42,6 +45,10 @@ fn workspace_layout(width: u32, height: u32) -> Result<HtWorkspaceLayout> {
     let previous_row_len = (width.div_ceil(4) as usize)
         .checked_add(8)
         .ok_or(ValidationError::ImageTooLarge)?;
+    #[cfg(feature = "simd")]
+    let vlc_bytes = flat_vlc_capacity(width, height);
+    #[cfg(not(feature = "simd"))]
+    let vlc_bytes = 0;
     Ok(HtWorkspaceLayout {
         coefficients: coefficient_len,
         cleanup_symbols: cleanup_len,
@@ -49,6 +56,7 @@ fn workspace_layout(width: u32, height: u32) -> Result<HtWorkspaceLayout> {
         sigma_symbols: sigma_len,
         previous_row_symbols: previous_row_len,
         magsgn_bytes: flat_magsgn_capacity(coefficient_len)?,
+        vlc_bytes,
     })
 }
 
@@ -61,6 +69,7 @@ pub(crate) fn ht_decode_workspace_bytes(width: u32, height: u32) -> Result<usize
     include_elements::<u16>(&mut bytes, layout.sigma_symbols)?;
     include_elements::<u16>(&mut bytes, layout.previous_row_symbols)?;
     include_elements::<u8>(&mut bytes, layout.magsgn_bytes)?;
+    include_elements::<u8>(&mut bytes, layout.vlc_bytes)?;
     Ok(bytes)
 }
 
@@ -88,5 +97,6 @@ pub(crate) fn prepare_scratch(
     try_reserve_decode_elements(&mut scratch.v_n, layout.v_n_words)?;
     try_reserve_decode_elements(&mut scratch.sigma, layout.sigma_symbols)?;
     try_reserve_decode_elements(&mut scratch.prev_row_sig, layout.previous_row_symbols)?;
-    try_reserve_decode_elements(&mut scratch.magsgn, layout.magsgn_bytes)
+    try_reserve_decode_elements(&mut scratch.magsgn, layout.magsgn_bytes)?;
+    try_reserve_decode_elements(&mut scratch.vlc, layout.vlc_bytes)
 }

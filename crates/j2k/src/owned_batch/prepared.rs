@@ -34,6 +34,69 @@ impl PreparedCodecPlan {
     }
 }
 
+/// CPU execution chosen during preparation from the planned working memory.
+/// Device decoders ignore it: the retained codec plan is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CpuExecution {
+    /// Execute the retained offset plan; `bytes` is its planned peak.
+    OffsetPlan { bytes: usize },
+    /// Reparse and decode whole component planes; no offset plan exists.
+    ComponentPlanes,
+    /// The planned offset-plan execution exceeds the per-decode memory
+    /// bound and the output has no streamed route (not Gray8 or RGB8), so the
+    /// CPU decoder rejects the image before any decode work.
+    ExceedsDecodeBound,
+    /// A Gray8/RGB8 image whose offset plan exceeds the per-decode bound
+    /// streams rows from the full-output region decode, whose working memory
+    /// does not grow with the image.
+    StreamedRows,
+    /// A Gray8/RGB8 image whose offset plan fits the bound (`bytes` is its
+    /// parallel peak) but exceeds the streaming threshold. It streams rows
+    /// like [`Self::StreamedRows`], except as the only image of a Gray8
+    /// group: alone in flight, its plan spreads one component's code-block
+    /// rows over every core, which the streamed route does not match.
+    StreamedRowsOrPlan { bytes: usize },
+}
+
+impl CpuExecution {
+    /// Conservative bytes for staged-window sizing: the planned peak of an
+    /// offset plan, or one worst-case native decode.
+    pub(super) const fn claim_bytes(self) -> usize {
+        match self {
+            Self::OffsetPlan { bytes } => bytes,
+            // The streamed route has no planned peak yet; size it as one
+            // worst-case native decode (measured: 95 MiB for a 5661 x 8287
+            // RGB8 scan at default threads).
+            // An optional plan fits the bound, so its peak is within this
+            // amount too.
+            Self::ComponentPlanes | Self::StreamedRows | Self::StreamedRowsOrPlan { .. } => {
+                crate::batch::allocation::GENERIC_WORKER_CLAIM_BYTES
+            }
+            Self::ExceedsDecodeBound => 0,
+        }
+    }
+
+    /// The planned peak of the offset plan this image may decode, if any:
+    /// what the staged route, which decodes plans only, budgets for it.
+    pub(super) const fn plan_bytes(self) -> Option<usize> {
+        match self {
+            Self::OffsetPlan { bytes } | Self::StreamedRowsOrPlan { bytes } => Some(bytes),
+            Self::ComponentPlanes | Self::ExceedsDecodeBound | Self::StreamedRows => None,
+        }
+    }
+
+    /// Whether the CPU decoder may stream this image's rows; a group holding
+    /// such an image never takes the staged route.
+    pub(super) const fn streams(self) -> bool {
+        matches!(self, Self::StreamedRows | Self::StreamedRowsOrPlan { .. })
+    }
+
+    /// The error the offset-plan execution would report, raised up front.
+    pub(super) fn decode_bound_error() -> crate::J2kError {
+        crate::J2kError::from_native_decode_error(j2k_native::ValidationError::ImageTooLarge.into())
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct PreparedImageInner {
     pub(super) bytes: Arc<[u8]>,
@@ -45,6 +108,7 @@ pub(super) struct PreparedImageInner {
     pub(super) plan: DeviceDecodePlan,
     pub(super) codestream_range: J2kCodestreamRange,
     pub(super) codec_plan: PreparedCodecPlan,
+    pub(super) cpu_execution: CpuExecution,
 }
 
 impl PreparedImage {
@@ -128,6 +192,10 @@ impl PreparedImage {
     pub(super) fn codec_plan(&self) -> &PreparedCodecPlan {
         &self.inner.codec_plan
     }
+
+    pub(super) fn cpu_execution(&self) -> CpuExecution {
+        self.inner.cpu_execution
+    }
 }
 
 /// One homogeneous set of prepared images.
@@ -138,6 +206,14 @@ pub struct PreparedBatchGroup {
     pub(super) execution_shape: BatchExecutionShape,
     pub(super) images: Vec<PreparedImage>,
     pub(super) source_indices: Vec<usize>,
+}
+
+/// Borrowed images and source indices of one homogeneous prepared group.
+#[derive(Clone, Copy)]
+pub(super) struct PreparedBatchGroupRef<'a> {
+    pub(super) info: &'a BatchGroupInfo,
+    pub(super) images: &'a [PreparedImage],
+    pub(super) source_indices: &'a [usize],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

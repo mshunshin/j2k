@@ -241,8 +241,7 @@ pub(in crate::j2c::encode) fn finish_plan(
     )?;
     let component_packets = split_component_resolution_packets_by_precinct_for_session(
         component_packets,
-        params.width,
-        params.height,
+        super::super::tile_grid::tile_bounds(params.width, params.height, (0, 0))?,
         &params.component_sampling,
         params.num_decomposition_levels,
         &params.precinct_exponents,
@@ -259,6 +258,7 @@ pub(in crate::j2c::encode) fn finish_plan(
         prepared_packets.iter(),
         params.num_decomposition_levels,
         params.reversible,
+        false,
     )?;
     let packet_descriptors = packet_descriptors_for_session(
         &prepared_packets,
@@ -316,7 +316,7 @@ pub(in crate::j2c::encode) fn encode_plan(
             &mut packet_descriptors,
             descriptor_capacity,
             &params,
-            (params.width, params.height),
+            super::super::tile_grid::tile_bounds(params.width, params.height, (0, 0))?,
             packet_encode::PacketMarkerOptions {
                 write_sop: params.write_sop,
                 write_eph: params.write_eph,

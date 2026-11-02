@@ -2,11 +2,20 @@
 
 //! Scoped scheduling over worker contexts retained by an owned batch session.
 
-use j2k_core::{BatchInfrastructureError, TileBatchOptions};
+use alloc::vec::Vec;
 
-use super::{join_batch_workers, plan_batch, ScopedWorkerHandle};
-use crate::batch::allocation::try_vec_with_capacity;
+use j2k_core::{BatchInfrastructureError, PixelFormat, TileBatchOptions};
+
+use super::{
+    allocate_result_slots, collect_results, join_batch_workers, plan_batch, ScopedWorkerHandle,
+};
+use crate::batch::allocation::{
+    actual_warning_owner_bytes, ensure_execution_capacity, ensure_pre_execution_capacity,
+    try_vec_with_capacity,
+};
 use crate::batch::worker::BatchWorker;
+use crate::batch::{BatchOutcome, TileBatchError, TileDecodeJob};
+use crate::DecodeSettings;
 
 /// Parallelism each retained worker uses inside one image decode for a batch
 /// of `job_count` jobs; see `with_inner_parallelism`.
@@ -15,6 +24,15 @@ pub(crate) fn retained_inner_parallelism(
     options: TileBatchOptions,
 ) -> Result<crate::CpuDecodeParallelism, BatchInfrastructureError> {
     Ok(plan_batch(job_count, options)?.inner_parallelism)
+}
+
+/// Workers that [`run_retained_chunks`] runs at once for a batch of
+/// `job_count` jobs.
+pub(crate) fn retained_worker_count(
+    job_count: usize,
+    options: TileBatchOptions,
+) -> Result<usize, BatchInfrastructureError> {
+    Ok(plan_batch(job_count, options)?.worker_count)
 }
 
 /// Run disjoint jobs without destroying worker-owned scratch after each call.
@@ -79,4 +97,31 @@ where
         }
         join_batch_workers(handles, spawn_error)
     })
+}
+
+/// Decode full-tile jobs on retained workers with the one-shot path's
+/// admission plan, capacity checks, and ordered result collection.
+pub(crate) fn decode_retained_tiles(
+    workers: &mut [BatchWorker],
+    jobs: &mut [TileDecodeJob<'_, '_>],
+    fmt: PixelFormat,
+    options: TileBatchOptions,
+    settings: DecodeSettings,
+) -> Result<Vec<BatchOutcome>, TileBatchError> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let plan = plan_batch(jobs.len(), options)?;
+    let (mut results, capacity_extra) = allocate_result_slots(jobs.len())?;
+    ensure_pre_execution_capacity(plan, capacity_extra)?;
+    run_retained_chunks(
+        workers,
+        jobs,
+        &mut results,
+        options,
+        |worker, chunk, slots| worker.decode_retained_tile_jobs(chunk, slots, fmt, settings),
+    )?;
+    let warning_bytes = actual_warning_owner_bytes(&results)?;
+    ensure_execution_capacity(plan, capacity_extra, warning_bytes)?;
+    collect_results(results)
 }

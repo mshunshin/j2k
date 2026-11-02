@@ -20,6 +20,7 @@ mod allocation;
 pub(crate) struct PreparedDirectGrayscalePlan {
     pub(super) dimensions: (u32, u32),
     pub(super) bit_depth: u8,
+    pub(super) signed: bool,
     /// Whether the final store rounds centered samples ties-to-even before
     /// the level shift, as the CPU does for integer output. False only for
     /// the first three components of an MCT color plan, which the inverse
@@ -51,7 +52,88 @@ pub(crate) struct PreparedDirectColorPlan {
     pub(super) signed: bool,
     pub(super) mct: bool,
     pub(super) transform: J2kWaveletTransform,
+    /// SIZ sampling factors of the three color components. A component plan
+    /// with factors other than `(1, 1)` decodes on its own grid and is
+    /// replicated onto `dimensions` before the final store. Alpha is always
+    /// unit-sampled.
+    pub(super) color_sampling: [(u8, u8); 3],
     pub(super) component_plans: Vec<PreparedDirectGrayscalePlan>,
+}
+
+pub(super) const UNIT_COLOR_SAMPLING: [(u8, u8); 3] = [(1, 1); 3];
+
+impl PreparedDirectColorPlan {
+    /// Sampling factors of component `index`.
+    pub(super) fn component_sampling(&self, index: usize) -> (u8, u8) {
+        self.color_sampling.get(index).copied().unwrap_or((1, 1))
+    }
+
+    /// Dimensions component `index` decodes at before any replication.
+    pub(super) fn component_dimensions(&self, index: usize) -> (u32, u32) {
+        sampled_dimensions(self.dimensions, self.component_sampling(index))
+    }
+
+    /// Whether any component decodes on a smaller grid than the image.
+    pub(super) fn has_sampled_components(&self) -> bool {
+        (0..self.component_plans.len())
+            .any(|index| self.component_dimensions(index) != self.dimensions)
+    }
+}
+
+#[cfg(test)]
+impl PreparedDirectColorPlan {
+    /// Output dimensions and the coefficients each component's Tier-1 groups
+    /// store.
+    pub(crate) fn geometry_for_test(&self) -> ((u32, u32), Vec<usize>) {
+        let coefficients = self
+            .component_plans
+            .iter()
+            .map(|component| {
+                component
+                    .classic_groups
+                    .iter()
+                    .map(|group| group.total_coefficients)
+                    .chain(
+                        component
+                            .ht_groups
+                            .iter()
+                            .map(|group| group.total_coefficients),
+                    )
+                    .sum()
+            })
+            .collect();
+        (self.dimensions, coefficients)
+    }
+
+    /// Tier-1 jobs and owned coded bytes across all components.
+    pub(crate) fn jobs_for_test(&self) -> (usize, usize) {
+        let mut jobs = 0;
+        let mut coded = 0;
+        for component in &self.component_plans {
+            for step in &component.steps {
+                match step {
+                    PreparedDirectGrayscaleStep::ClassicSubBand(band) => {
+                        jobs += band.jobs.len();
+                        coded += band.coded_data.len();
+                    }
+                    PreparedDirectGrayscaleStep::HtSubBand(band) => {
+                        jobs += band.jobs.len();
+                        coded += band.payload_source.owned_payload_capacity();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (jobs, coded)
+    }
+}
+
+/// Component-grid dimensions of an origin-zero image. Zero factors are
+/// rejected by codestream parsing; they map to the image grid here so the
+/// caller's dimension check fails instead of dividing by zero.
+pub(super) fn sampled_dimensions(dimensions: (u32, u32), sampling: (u8, u8)) -> (u32, u32) {
+    let (sx, sy) = (u32::from(sampling.0.max(1)), u32::from(sampling.1.max(1)));
+    (dimensions.0.div_ceil(sx), dimensions.1.div_ceil(sy))
 }
 
 // SAFETY: The color plan contains only immutable metadata and prepared
@@ -60,6 +142,25 @@ unsafe impl Send for PreparedDirectColorPlan {}
 // SAFETY: No mutable state is exposed after construction, so concurrent cache
 // readers cannot race host or GPU writes through this owner.
 unsafe impl Sync for PreparedDirectColorPlan {}
+
+/// All components of a direct color store must share source signedness.
+pub(super) fn color_signedness(
+    plans: &[j2k_native::J2kDirectGrayscalePlan],
+) -> Result<bool, crate::Error> {
+    let Some(first) = plans.first() else {
+        return Err(crate::Error::capability_rejected(
+            j2k_core::CapabilityRejection::geometry_mismatch("Metal color plan has no components"),
+        ));
+    };
+    if plans.iter().any(|plan| plan.signed != first.signed) {
+        return Err(crate::Error::capability_rejected(
+            j2k_core::CapabilityRejection::unsupported_operation(
+                "Metal decode needs every component to share one signedness",
+            ),
+        ));
+    }
+    Ok(first.signed)
+}
 
 /// Applies the CPU's color rounding split to freshly prepared component plans:
 /// with MCT, components 0-2 are rounded after the inverse transform and any
@@ -88,6 +189,9 @@ pub(super) struct PreparedDirectIdwt {
 
 pub(super) struct PreparedClassicSubBand {
     pub(super) band_id: J2kDirectBandId,
+    /// The stored coefficients: `width` x `height` from `origin` in sub-band
+    /// coordinates, the whole sub-band unless a region crop narrowed it.
+    pub(super) origin: (u32, u32),
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) zero_fill: bool,
@@ -134,6 +238,8 @@ pub(super) struct PreparedClassicSubBandGroupMember {
 
 pub(super) struct PreparedHtSubBand {
     pub(super) band_id: J2kDirectBandId,
+    /// As [`PreparedClassicSubBand::origin`].
+    pub(super) origin: (u32, u32),
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) payload_source: PreparedHtPayloadSource,
@@ -142,6 +248,29 @@ pub(super) struct PreparedHtSubBand {
 }
 
 pub(super) struct PreparedHtExecutionOwner;
+
+impl PreparedClassicSubBand {
+    /// The stored coefficients' window in sub-band coordinates.
+    pub(super) fn window(&self) -> J2kRequiredBandRegion {
+        stored_window(self.origin, self.width, self.height)
+    }
+}
+
+impl PreparedHtSubBand {
+    /// The stored coefficients' window in sub-band coordinates.
+    pub(super) fn window(&self) -> J2kRequiredBandRegion {
+        stored_window(self.origin, self.width, self.height)
+    }
+}
+
+fn stored_window((x0, y0): (u32, u32), width: u32, height: u32) -> J2kRequiredBandRegion {
+    J2kRequiredBandRegion {
+        x0,
+        y0,
+        x1: x0 + width,
+        y1: y0 + height,
+    }
+}
 
 pub(super) enum PreparedHtPayloadSource {
     Contiguous(Vec<u8>),
@@ -161,13 +290,6 @@ impl PreparedHtPayloadSource {
     }
 
     pub(super) fn contiguous(&self) -> Option<&[u8]> {
-        match self {
-            Self::Contiguous(data) => Some(data),
-            Self::Referenced { .. } => None,
-        }
-    }
-
-    pub(super) fn contiguous_mut(&mut self) -> Option<&mut Vec<u8>> {
         match self {
             Self::Contiguous(data) => Some(data),
             Self::Referenced { .. } => None,

@@ -164,8 +164,10 @@ pub(crate) mod writer;
 use crate::math::{dispatch, Level};
 #[cfg(test)]
 use color::cielab_to_rgb;
+#[doc(hidden)]
+pub use color::pack_rgb8;
 pub(crate) use color::{
-    convert_color_space, interleave_and_convert, interleave_and_convert_region,
+    convert_color_space, interleave_and_convert_after_mct, interleave_and_convert_region,
     resolve_alpha_and_color_space, resolve_palette_indices, validate_and_reorder_channels,
     validate_interleaved_output_buffer,
 };
@@ -174,7 +176,7 @@ pub use color::{
     NativeComponentPlane, RawBitmap,
 };
 #[doc(hidden)]
-pub use color::{ComponentPlaneParts, NativeComponentPlaneParts};
+pub use color::{ComponentPlaneParts, ComponentRowSink, NativeComponentPlaneParts};
 #[doc(hidden)]
 pub use color::{DecodedComponentsParts, DecodedNativeComponentsParts};
 #[doc(hidden)]
@@ -187,9 +189,10 @@ pub use direct_cpu::{
     finish_referenced_htj2k_staged, finish_referenced_htj2k_tile_staged,
     prepare_referenced_classic_entropy_workspace, prepare_referenced_classic_staged,
     prepare_referenced_classic_tile_staged, prepare_referenced_htj2k_entropy_workspace,
-    prepare_referenced_htj2k_staged, prepare_referenced_htj2k_tile_staged, J2kDirectCodeBlockIndex,
-    J2kDirectCpuEntropyWorkspace, J2kDirectCpuScratch, J2kDirectDecodedComponents,
-    J2kDirectDecodedPlane,
+    prepare_referenced_htj2k_staged, prepare_referenced_htj2k_tile_staged,
+    referenced_classic_plan_execution_bytes, referenced_htj2k_plan_execution_bytes,
+    J2kDirectCodeBlockIndex, J2kDirectCpuEntropyWorkspace, J2kDirectCpuScratch,
+    J2kDirectDecodedComponents, J2kDirectDecodedPlane,
 };
 #[doc(hidden)]
 pub use direct_plan::{
@@ -203,6 +206,7 @@ pub use direct_plan::{
 #[doc(hidden)]
 pub use direct_roi::{
     idwt_required_input_window_for_rects, idwt_required_input_windows, idwt_required_output_margin,
+    window_referenced_classic_plan_to_stores, window_referenced_htj2k_plan_to_stores,
     J2kIdwtRequiredInputWindows, J2kRequiredBandRegion,
 };
 pub use inspect::{
@@ -255,9 +259,10 @@ pub use j2c::encode::{
     encode_prequantized_htj2k_97_with_accelerator_and_max_host_bytes,
     encode_resident_htj2k_with_accelerator, encode_typed_component_planes_53,
     encode_with_accelerator, encode_with_accelerator_and_roi_regions, encode_with_roi_regions,
-    irreversible_quantization_profile_scale_ceiling, irreversible_quantization_step_for_subband,
-    EncodeComponentPlane, EncodeOptions, EncodeProgressionOrder, EncodeRoiRegion,
-    EncodeTypedComponentPlane, ResidentHtj2kEncodeError,
+    irreversible_quantization_profile_scale_ceiling, irreversible_quantization_scale_bounds,
+    irreversible_quantization_step_for_subband, EncodeComponentPlane, EncodeOptions,
+    EncodeProgressionOrder, EncodeRoiRegion, EncodeTypedComponentPlane, IrreversibleScaleEncoder,
+    ResidentHtj2kEncodeError,
 };
 pub use j2c::{
     CpuDecodeParallelism, DecoderContext, DecoderWorkspace, DecoderWorkspaceStats,
@@ -300,10 +305,20 @@ pub use j2c::ht_encode_tables::HtUvlcTableEntry;
 const MAX_CLASSIC_DECODE_BITPLANES: u8 = j2c::MAX_BITPLANE_COUNT;
 const MAX_DEINTERLEAVE_REFERENCE_BIT_DEPTH: u8 = j2k_types::MAX_JPEG2000_PART1_SAMPLE_BIT_DEPTH;
 pub(crate) use j2k_types::MAX_JPEG2000_PART1_COMPONENTS as MAX_J2K_SPEC_COMPONENTS;
-pub(crate) const MAX_J2K_IMAGE_DIMENSION: u32 = 60_000;
 pub(crate) const MAX_J2K_TILE_COUNT: u64 = u16::MAX as u64 + 1;
 #[doc(hidden)]
 pub use j2k_types::{DEFAULT_MAX_CODEC_BYTES, DEFAULT_MAX_DECODE_BYTES};
+
+/// The threads a [`CpuDecodeParallelism::Auto`] decode runs on: the global
+/// worker pool's size with the `parallel` feature, else one.
+#[doc(hidden)]
+#[must_use]
+pub fn cpu_decode_pool_threads() -> usize {
+    #[cfg(feature = "parallel")]
+    return rayon::current_num_threads();
+    #[cfg(not(feature = "parallel"))]
+    1
+}
 
 #[inline]
 pub(crate) fn checked_decode_usize_product2(left: usize, right: usize) -> Result<usize> {
@@ -362,6 +377,52 @@ pub(crate) fn try_resize_decode_elements<T: Clone>(
     try_reserve_decode_elements(values, target_len)?;
     values.resize(target_len, value);
     Ok(())
+}
+
+/// [`try_resize_decode_elements`] to zeros. On a pool of at most
+/// [`MAX_POOL_THREADS_FOR_ZEROED_BUFFERS`] threads, an empty buffer whose
+/// capacity is short of `target_len` is replaced by a zeroed allocation
+/// instead of being zeroed here: memory fresh from the system is already
+/// zero, so the threads that fill the buffer take its page faults, instead
+/// of this thread taking every one of them first while the pool waits.
+pub(crate) fn try_zero_fill_decode_elements<T: Copy + Default + bytemuck::Zeroable>(
+    values: &mut Vec<T>,
+    target_len: usize,
+) -> Result<()> {
+    zero_fill_decode_elements(
+        values,
+        target_len,
+        cpu_decode_pool_threads() <= MAX_POOL_THREADS_FOR_ZEROED_BUFFERS,
+    )
+}
+
+/// Most pool threads for which fresh decode buffers come zeroed from the
+/// allocator. First-touch page faults on one allocation from many threads
+/// at once contend in the kernel: on 4 to 10 threads, spreading them over
+/// the pool cut a process's first decode of a 4096 x 2048 RGB image by 10 to
+/// 15%, but on 18 threads the faults took about four times the system time
+/// and HTJ2K images, which decode each page quickly, lost 3 to 7%.
+const MAX_POOL_THREADS_FOR_ZEROED_BUFFERS: usize = 10;
+
+/// [`try_zero_fill_decode_elements`] with the choice made. An empty buffer
+/// short of capacity holds nothing that is read, so it is released rather
+/// than copied into a larger allocation; the new one comes zeroed from the
+/// allocator when `zeroed_allocation`, else it is zeroed here.
+fn zero_fill_decode_elements<T: Copy + Default + bytemuck::Zeroable>(
+    values: &mut Vec<T>,
+    target_len: usize,
+    zeroed_allocation: bool,
+) -> Result<()> {
+    checked_decode_byte_len2(target_len, core::mem::size_of::<T>())?;
+    if values.is_empty() && values.capacity() < target_len {
+        *values = Vec::new();
+        if zeroed_allocation {
+            *values = bytemuck::allocation::try_zeroed_vec(target_len)
+                .map_err(|()| DecodingError::HostAllocationFailed)?;
+            return Ok(());
+        }
+    }
+    try_resize_decode_elements(values, target_len, T::default())
 }
 
 #[inline]

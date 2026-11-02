@@ -10,22 +10,18 @@ mod kernels {
             J2kHtPacketSubband, J2kHtPacketSubbandTagState, J2kHtPacketTagNodeState,
         },
         constants::{
-            J2K_ENCODE_STATUS_OK, J2K_FDWT97_INV_KAPPA, J2K_FDWT97_KAPPA,
-            J2K_HT_COMPACT_ASSEMBLE_FLAG, J2K_HT_COMPACT_LENGTH_MASK, J2K_HT_MEL_OFFSET,
-            J2K_HT_VLC_OFFSET, J2K_HT_VLC_SIZE,
+            J2K_ENCODE_STATUS_OK, J2K_HT_COMPACT_ASSEMBLE_FLAG, J2K_HT_COMPACT_LENGTH_MASK,
+            J2K_HT_MEL_OFFSET, J2K_HT_VLC_OFFSET, J2K_HT_VLC_SIZE, J2K_PACKET_BLOCK_HEADER_WORDS,
+            J2K_PACKET_HEADER_THREADS, J2K_PACKET_MAX_TAG_NODES,
         },
-        dwt53::{j2k_fdwt53_predict_col, j2k_fdwt53_predict_row},
-        dwt97::{
-            j2k_fdwt97_high2_col, j2k_fdwt97_high2_row, j2k_fdwt97_low2_col,
-            j2k_fdwt97_low2_row,
-        },
+        dwt53::j2k_fdwt53_sample,
+        dwt97::j2k_fdwt97_sample,
         helpers::{
-            floor_f32, forward_ict_rgb, load_f32, load_f32_u64, load_job, load_u8, load_u32,
-            sign_extend_u32, store_f32, store_f32_u64, store_i32, store_u8, store_u32,
+            floor_f32, forward_ict_rgb, load_f32_u64, load_job, load_u8, load_u32, sign_extend_u32,
+            store_f32, store_f32_u64, store_i32, store_u8, store_u32,
         },
-        packetization::{
-            j2k_packet_build_header_serial, j2k_packet_copy_body_cooperative, j2k_packet_status,
-        },
+        packetization::j2k_packet_copy_body_cooperative,
+        parallel_header::{J2kPacketHeaderInput, J2kPacketHeaderScratch, j2k_packet_build_header},
         quantization::j2k_quantize_sample,
     };
     use cuda_device::{SharedArray, kernel, thread};
@@ -155,34 +151,16 @@ mod kernels {
         full_width: u32,
         current_width: u32,
         current_height: u32,
-        low_width: u32,
+        low_extent: u32,
+        phase: u32,
     ) {
         let x = thread::index_2d_col() as u32;
         let y = thread::index_2d_row() as u32;
         if x >= current_width || y >= current_height {
             return;
         }
-
-        let row_base = y * full_width;
-        if x < low_width {
-            let even = x * 2;
-            let left = if x > 0 {
-                j2k_fdwt53_predict_row(src, row_base, current_width, x - 1)
-            } else {
-                j2k_fdwt53_predict_row(src, row_base, current_width, 0)
-            };
-            let right = if even + 1 < current_width {
-                j2k_fdwt53_predict_row(src, row_base, current_width, x)
-            } else {
-                left
-            };
-            let value = load_f32(src, row_base + even) + floor_f32((left + right) * 0.25 + 0.5);
-            store_f32(dst, row_base + x, value);
-            return;
-        }
-
-        let value = j2k_fdwt53_predict_row(src, row_base, current_width, x - low_width);
-        store_f32(dst, row_base + x, value);
+        let value = j2k_fdwt53_sample(src, y * full_width, 1, current_width, low_extent, phase, x);
+        store_f32(dst, y * full_width + x, value);
     }
 
     #[kernel]
@@ -192,33 +170,15 @@ mod kernels {
         full_width: u32,
         current_width: u32,
         current_height: u32,
-        low_height: u32,
+        low_extent: u32,
+        phase: u32,
     ) {
         let x = thread::index_2d_col() as u32;
         let y = thread::index_2d_row() as u32;
         if x >= current_width || y >= current_height {
             return;
         }
-
-        if y < low_height {
-            let even = y * 2;
-            let top = if y > 0 {
-                j2k_fdwt53_predict_col(src, x, full_width, current_height, y - 1)
-            } else {
-                j2k_fdwt53_predict_col(src, x, full_width, current_height, 0)
-            };
-            let bottom = if even + 1 < current_height {
-                j2k_fdwt53_predict_col(src, x, full_width, current_height, y)
-            } else {
-                top
-            };
-            let value =
-                load_f32(src, even * full_width + x) + floor_f32((top + bottom) * 0.25 + 0.5);
-            store_f32(dst, y * full_width + x, value);
-            return;
-        }
-
-        let value = j2k_fdwt53_predict_col(src, x, full_width, current_height, y - low_height);
+        let value = j2k_fdwt53_sample(src, x, full_width, current_height, low_extent, phase, y);
         store_f32(dst, y * full_width + x, value);
     }
 
@@ -229,21 +189,16 @@ mod kernels {
         full_width: u32,
         current_width: u32,
         current_height: u32,
-        low_width: u32,
+        low_extent: u32,
+        phase: u32,
     ) {
         let x = thread::index_2d_col() as u32;
         let y = thread::index_2d_row() as u32;
         if x >= current_width || y >= current_height {
             return;
         }
-
-        let row_base = y * full_width;
-        let value = if x < low_width {
-            j2k_fdwt97_low2_row(src, row_base, current_width, x) * J2K_FDWT97_INV_KAPPA
-        } else {
-            j2k_fdwt97_high2_row(src, row_base, current_width, x - low_width) * J2K_FDWT97_KAPPA
-        };
-        store_f32(dst, row_base + x, value);
+        let value = j2k_fdwt97_sample(src, y * full_width, 1, current_width, low_extent, phase, x);
+        store_f32(dst, y * full_width + x, value);
     }
 
     #[kernel]
@@ -253,20 +208,15 @@ mod kernels {
         full_width: u32,
         current_width: u32,
         current_height: u32,
-        low_height: u32,
+        low_extent: u32,
+        phase: u32,
     ) {
         let x = thread::index_2d_col() as u32;
         let y = thread::index_2d_row() as u32;
         if x >= current_width || y >= current_height {
             return;
         }
-
-        let value = if y < low_height {
-            j2k_fdwt97_low2_col(src, x, full_width, current_height, y) * J2K_FDWT97_INV_KAPPA
-        } else {
-            j2k_fdwt97_high2_col(src, x, full_width, current_height, y - low_height)
-                * J2K_FDWT97_KAPPA
-        };
+        let value = j2k_fdwt97_sample(src, x, full_width, current_height, low_extent, phase, y);
         store_f32(dst, y * full_width + x, value);
     }
 
@@ -404,8 +354,40 @@ mod kernels {
         statuses: *mut J2kHtPacketStatus,
         packet_count: u64,
     ) {
-        static mut HEADER_RESULT: SharedArray<u32, 3> = SharedArray::UNINIT;
-
+        // The parallel builder and serial fallback use disjoint lifetimes in
+        // this arena. Six node arrays fit exactly in the 48 KiB block budget.
+        const _: () = {
+            assert!(J2K_PACKET_MAX_TAG_NODES % 2 == 0 && J2K_PACKET_HEADER_THREADS % 2 == 0);
+            assert!(
+                3 * J2K_PACKET_MAX_TAG_NODES
+                    + J2K_PACKET_HEADER_THREADS as usize * (2 * J2K_PACKET_BLOCK_HEADER_WORDS + 3)
+                    + 3
+                    <= 6 * J2K_PACKET_MAX_TAG_NODES
+            );
+        };
+        static mut HEADER_ARENA: SharedArray<u64, { 3 * J2K_PACKET_MAX_TAG_NODES }> =
+            SharedArray::UNINIT;
+        let scratch = unsafe {
+            let nodes = HEADER_ARENA.as_mut_ptr().cast::<u32>();
+            let bits = nodes.add(3 * J2K_PACKET_MAX_TAG_NODES).cast::<u64>();
+            let bit_lens = bits
+                .add(J2K_PACKET_HEADER_THREADS as usize * J2K_PACKET_BLOCK_HEADER_WORDS)
+                .cast::<u32>();
+            let body_lens = bit_lens
+                .add(J2K_PACKET_HEADER_THREADS as usize)
+                .cast::<u64>();
+            J2kPacketHeaderScratch {
+                inclusion: nodes,
+                zero_bitplanes: nodes.add(J2K_PACKET_MAX_TAG_NODES),
+                first_coded: nodes.add(2 * J2K_PACKET_MAX_TAG_NODES),
+                bits,
+                bit_lens,
+                body_lens,
+                flags: body_lens
+                    .add(J2K_PACKET_HEADER_THREADS as usize)
+                    .cast::<u32>(),
+            }
+        };
         let packet_idx = thread::blockIdx_x() as u64;
         if packet_idx >= packet_count {
             return;
@@ -414,10 +396,11 @@ mod kernels {
         let packet = load_job(packets, packet_idx as u32);
         let status = unsafe { statuses.add(packet_idx as usize) };
         let packet_out = unsafe { out.add(packet.output_offset as usize) };
-        let header_result = unsafe { HEADER_RESULT.as_mut_ptr() };
+        // Both builders have consumed the first tree before writing the result.
+        let header_result = scratch.inclusion;
 
-        if thread::threadIdx_x() == 0 {
-            let result = j2k_packet_build_header_serial(
+        j2k_packet_build_header(
+            J2kPacketHeaderInput {
                 payload_len,
                 packet,
                 subbands,
@@ -427,12 +410,11 @@ mod kernels {
                 tag_state_count,
                 tag_node_count,
                 packet_out,
-            );
-            store_u32(header_result, 0, result.code);
-            store_u32(header_result, 1, result.header_len);
-            store_u32(header_result, 2, result.body_len);
-            j2k_packet_status(status, result.code, result.detail, result.output_len);
-        }
+            },
+            &scratch,
+            header_result,
+            status,
+        );
         thread::sync_threads();
 
         let shared_code = load_u32(header_result.cast_const(), 0);

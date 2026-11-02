@@ -12,8 +12,10 @@ fn hybrid_encode_upload_owns_bytes_after_caller_storage_is_reused() {
     let session = crate::MetalBackendSession::system_default().expect("Metal session");
     let expected = vec![3u8, 5, 8, 13, 21];
     let mut caller_bytes = expected.clone();
-    let buffer = super::super::copy_padded_metal_buffer_from_bytes(&session, &caller_bytes)
-        .expect("copy hybrid encode input");
+    let mut staging = Vec::new();
+    let buffer =
+        super::super::copy_padded_metal_buffer_from_bytes(&session, &caller_bytes, &mut staging)
+            .expect("copy hybrid encode input");
 
     caller_bytes.fill(0xff);
     drop(caller_bytes);
@@ -151,6 +153,81 @@ fn auto_classic_host_output_stays_cpu_without_metal_dispatches() {
     assert_eq!(accelerator.packetization_dispatches(), 0);
     assert_eq!(encoded.dispatch_report, J2kEncodeDispatchReport::default());
     assert!(accelerator.prefer_parallel_cpu_code_block_fallback());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn auto_host_output_declines_every_stage_only_outside_measured_cells() {
+    let context = |num_pixels, reversible| J2kEncodeContext {
+        num_pixels,
+        num_components: 3,
+        bit_depth: 8,
+        signed: false,
+        reversible,
+    };
+    let mut auto = MetalEncodeStageAccelerator::for_auto_host_output();
+    auto.begin_encode(context(2592 * 1944, true))
+        .expect("begin lossless encode");
+    assert!(auto.declines_every_stage());
+    auto.begin_encode(context(2592 * 1944, false))
+        .expect("begin measured lossy encode");
+    assert!(!auto.declines_every_stage());
+    let mut explicit = MetalEncodeStageAccelerator::default();
+    explicit
+        .begin_encode(context(64 * 64, true))
+        .expect("begin explicit encode");
+    assert!(!explicit.declines_every_stage());
+
+    // The CPU encodes Auto then takes its fused paths with unchanged bytes.
+    let (width, height) = (96u32, 80u32);
+    let pixels: Vec<u8> = (0..width * height * 3)
+        .map(|i| u8::try_from((i * 37 + i / 7) & 0xff).expect("masked pixel fits u8"))
+        .collect();
+    for mode in [
+        J2kBlockCodingMode::HighThroughput,
+        J2kBlockCodingMode::Classic,
+    ] {
+        let options = |backend| {
+            J2kLosslessEncodeOptions::default()
+                .with_backend(backend)
+                .with_block_coding_mode(mode)
+                .with_validation(J2kEncodeValidation::External)
+        };
+        let samples = || J2kLosslessSamples::new(&pixels, width, height, 3, 8, false).unwrap();
+        let cpu = encode_j2k_lossless(samples(), &options(EncodeBackendPreference::CpuOnly))
+            .expect("CPU lossless encode");
+        let actual = encode_j2k_lossless_with_accelerator(
+            samples(),
+            &options(EncodeBackendPreference::Auto),
+            BackendKind::Metal,
+            &mut MetalEncodeStageAccelerator::for_auto_host_output(),
+        )
+        .expect("Auto lossless encode");
+        assert_eq!(actual.backend, BackendKind::Cpu);
+        assert_eq!(actual.codestream, cpu.codestream, "{mode:?} lossless");
+
+        let lossy_options = |backend| {
+            J2kLossyEncodeOptions::default()
+                .with_backend(backend)
+                .with_block_coding_mode(mode)
+                .with_validation(J2kEncodeValidation::External)
+        };
+        let lossy_samples = || J2kLossySamples::new(&pixels, width, height, 3, 8, false).unwrap();
+        let cpu = j2k::encode_j2k_lossy(
+            lossy_samples(),
+            &lossy_options(EncodeBackendPreference::CpuOnly),
+        )
+        .expect("CPU lossy encode");
+        let actual = encode_j2k_lossy_with_accelerator(
+            lossy_samples(),
+            &lossy_options(EncodeBackendPreference::Auto),
+            BackendKind::Metal,
+            &mut MetalEncodeStageAccelerator::for_auto_host_output(),
+        )
+        .expect("Auto lossy encode");
+        assert_eq!(actual.dispatch_report, J2kEncodeDispatchReport::default());
+        assert_eq!(actual.codestream, cpu.codestream, "{mode:?} lossy");
+    }
 }
 
 #[cfg(target_os = "macos")]

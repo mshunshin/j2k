@@ -65,7 +65,7 @@ pub(crate) use self::direct_buffers::{
 #[cfg(target_os = "macos")]
 use self::direct_buffers::{
     checked_buffer_copy_into, copied_recyclable_shared_slice_buffer, copied_slice_buffer,
-    new_private_buffer, new_shared_buffer, new_shared_buffer_with_slice,
+    new_private_buffer, new_shared_buffer, new_shared_buffer_with_slice, read_completed_buffer,
     take_classic_coefficients_scratch_buffer, take_classic_states_scratch_buffer,
     zeroed_recyclable_shared_buffer, zeroed_shared_buffer,
 };
@@ -125,9 +125,15 @@ use self::direct_plan_validation::{
     prepared_direct_color_plan_supports_runtime, store_shapes_match,
 };
 mod direct_scratch;
+#[cfg(target_os = "macos")]
+pub(crate) use self::direct_scratch::{
+    copied_session_shared_buffer, recycle_session_shared_buffers,
+};
+#[cfg(target_os = "macos")]
 use self::direct_scratch::{
     recycle_private_buffers, recycle_scratch_buffers, recycle_shared_buffers,
-    take_f32_scratch_buffer, take_recyclable_private_buffer, DirectScratchBuffer,
+    take_f32_scratch_buffer, take_recyclable_private_buffer, take_recyclable_shared_buffer,
+    DirectScratchBuffer,
 };
 #[cfg(target_os = "macos")]
 mod direct_status;
@@ -248,8 +254,8 @@ use self::runtime::{
 };
 #[cfg(target_os = "macos")]
 pub(crate) use self::runtime::{
-    current_runtime, current_runtime_device_registry_id, runtime_initialization_error,
-    with_runtime_for_session, MetalRuntime,
+    current_runtime, current_runtime_device_registry_id, default_session,
+    runtime_initialization_error, with_runtime_for_session, MetalRuntime,
 };
 #[cfg(all(target_os = "macos", test))]
 pub(crate) use j2k_metal_support::MetalSupportError;
@@ -270,6 +276,7 @@ mod direct_plane_pack;
 #[cfg(target_os = "macos")]
 use self::direct_plane_pack::{
     encode_batched_mct_rgb8_to_surfaces_in_command_buffer,
+    encode_fused_idwt_mct_rgb8_to_surface_in_command_buffer,
     encode_mct_rgb8_to_surface_in_command_buffer, encode_plane_stage_to_surface_in_command_buffer,
     encode_repeated_mct_rgb8_to_surfaces_in_command_buffer,
     repeated_shared_direct_color_plan_count, PlaneStage,
@@ -285,8 +292,8 @@ pub(crate) use self::direct_grayscale_execute::{
     execute_prepared_direct_grayscale_plan, execute_prepared_direct_grayscale_plan_batch,
     execute_prepared_direct_grayscale_plan_into,
     execute_prepared_direct_grayscale_plan_with_device,
-    execute_repeated_prepared_direct_grayscale_plan, submit_cooperative_cpu_color_group,
-    submit_prepared_direct_color_plan_batch_into_group,
+    execute_repeated_prepared_direct_grayscale_plan, prepare_component_grid_color_plan,
+    submit_cooperative_cpu_color_group, submit_prepared_direct_color_plan_batch_into_group,
     submit_prepared_direct_color_plan_batches_into_groups,
     submit_prepared_direct_grayscale_plan_batch_into_group, ColorGroupSubmission,
     DirectDestinationConsumerOrdering, SubmittedDirectDestination,
@@ -294,7 +301,7 @@ pub(crate) use self::direct_grayscale_execute::{
 #[cfg(target_os = "macos")]
 mod direct_prepare;
 #[cfg(target_os = "macos")]
-use self::direct_prepare::append_span_rects;
+use self::direct_prepare::{append_span_rects, band_cells, BandCells};
 #[cfg(target_os = "macos")]
 pub(crate) use self::direct_prepare::{
     prepare_direct_grayscale_plan, prepare_referenced_classic_color_plan,
@@ -305,7 +312,10 @@ pub(crate) use self::direct_prepare::{
 #[cfg(target_os = "macos")]
 mod direct_roi;
 #[cfg(target_os = "macos")]
-pub(crate) use self::direct_roi::crop_prepared_direct_grayscale_plan_to_output_region;
+pub(crate) use self::direct_roi::{
+    crop_prepared_direct_grayscale_plan_to_output_region,
+    prune_prepared_direct_grayscale_plan_to_stores,
+};
 #[cfg(target_os = "macos")]
 mod direct_stacked_batch;
 #[cfg(target_os = "macos")]
@@ -315,7 +325,7 @@ use self::direct_stacked_batch::{
     encode_stacked_direct_component_plane_batch,
     encode_stacked_direct_component_plane_batch_with_shared_tier1,
     encode_stacked_direct_gray_batch, lookup_direct_band_slice, lookup_direct_band_slice_entry,
-    signed_sample_bias, supports_stacked_direct_component_plane_batch,
+    mct_level_shifts, push_member_band_slices, supports_stacked_direct_component_plane_batch,
     try_encode_stacked_mct_rgb8_direct_color_batch, DirectBandSlice, DirectColorPlanRequest,
     RepeatedDirectGrayscalePlanRequest, StackedDirectColorBatchRequest,
     StackedDirectComponentPlaneBatchRequest, StackedGrayBatch, StackedGrayOutput,
@@ -337,7 +347,7 @@ mod direct_execute;
 #[cfg(target_os = "macos")]
 pub(crate) use self::direct_execute::{
     crop_prepared_direct_color_plan_to_output_region, prepare_direct_color_plan,
-    prepare_direct_color_plan_for_cpu_upload,
+    prepare_direct_color_plan_for_cpu_upload, prune_prepared_direct_color_plan_to_stores,
 };
 #[cfg(all(target_os = "macos", test))]
 use self::direct_execute::{
@@ -401,8 +411,8 @@ pub(crate) use self::resident_tier1::{
     J2kLosslessCodestreamBlockCodingMode, J2kLosslessDeviceBatchPrepareItem,
     J2kLosslessDeviceCodeBlock, J2kLosslessDevicePrepareJob,
     J2kPendingResidentLosslessCodestreamBatch, J2kPreparedLosslessDeviceCodeBlocks,
-    J2kResidentPacketizationEncodeJob, J2kResidentPacketizationResolution,
-    J2kResidentPacketizationSubband,
+    J2kResidentHtEncodedBlock, J2kResidentPacketizationEncodeJob,
+    J2kResidentPacketizationResolution, J2kResidentPacketizationSubband,
 };
 #[cfg(target_os = "macos")]
 mod tier1_encode;
@@ -412,7 +422,7 @@ pub(crate) use self::tier1_encode::{
     encode_classic_tier1_prepared_device_code_blocks_resident, encode_ht_cleanup_code_block,
     encode_ht_cleanup_code_blocks, encode_ht_code_block_sets,
     encode_ht_prepared_device_code_blocks_resident,
-    read_resident_ht_tier1_code_blocks_for_cpu_packetization,
+    read_resident_ht_tier1_code_blocks_for_cpu_packetization, recycle_resident_ht_tier1_buffers,
 };
 #[cfg(all(target_os = "macos", test))]
 pub(crate) use self::tier1_encode::{
@@ -461,7 +471,7 @@ fn classic_style_flags(style: j2k_native::J2kCodeBlockStyle) -> u32 {
 #[cfg(target_os = "macos")]
 mod surface_decode;
 #[cfg(all(test, target_os = "macos"))]
-mod tests;
+pub(crate) mod tests;
 #[cfg(target_os = "macos")]
 pub(crate) use self::surface_decode::{
     decode_image_to_surface, decode_image_to_surface_with_device, decode_region_scaled_to_surface,

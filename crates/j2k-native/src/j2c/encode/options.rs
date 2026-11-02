@@ -64,7 +64,17 @@ pub struct EncodeOptions {
     /// Optional component-specific irreversible multipliers in QCD/QCC order:
     /// final LL, then HL/LH/HH from coarsest to finest resolution.
     /// Each component needs exactly `1 + 3 * actual_decomposition_levels` entries.
-    /// Multipliers compose with the global scale and orientation multipliers.
+    /// An active profile multiplies the unrounded nominal step
+    /// `2^-guard_bits * global_scale * orientation_scale * norm_weight`, then
+    /// rounds once to the stored tuple. `norm_weight` is the band's 9/7
+    /// synthesis-norm weight: 1 for the finest HL/LH bands, below 1 for coarser
+    /// bands. Every resulting tuple must be representable; active
+    /// profiles never silently saturate. An exact all-ones profile disables
+    /// weighting and is byte-identical to no profile, including global saturation.
+    /// For example, at precision 30 and two guard bits the finest HL band's
+    /// nominal 0.25 step clips to 0.5 without a profile. Active weights 0.99 or
+    /// 1.01 are rejected for that band; weight 2 is representable. Weights are
+    /// not based on the clipped 0.5 step.
     /// Raw-pixel irreversible encoding supports this profile; precomputed
     /// coefficient paths reject it until their metadata contract is extended.
     pub irreversible_quantization_profile: Option<Vec<Vec<f32>>>,
@@ -82,11 +92,9 @@ pub struct EncodeOptions {
     pub roi_component_shifts: Vec<u8>,
     /// Optional tile width and height for multi-tile codestream output.
     ///
-    /// Each tile origin must be a multiple of `2^num_decomposition_levels`,
-    /// and no tile may straddle a code-block or precinct boundary of the image
-    /// grid unless it starts on one. Without component subsampling,
-    /// power-of-two tile sizes at least as large as the code-block size
-    /// always qualify. Other grids return [`crate::EncodeError::Unsupported`].
+    /// Tile dimensions need not align with the wavelet, code-block, or precinct
+    /// grids. Each tile is transformed and partitioned at its absolute origin.
+    /// The effective decomposition depth is capped by the smallest tile-component.
     pub tile_size: Option<(u32, u32)>,
     /// Optional maximum number of complete packets to place in each tile-part.
     pub tile_part_packet_limit: Option<u16>,

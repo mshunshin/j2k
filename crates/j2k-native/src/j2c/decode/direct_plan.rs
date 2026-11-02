@@ -21,6 +21,10 @@ use crate::{
 };
 
 mod classic;
+#[cfg(feature = "parallel")]
+pub(super) use self::classic::{
+    classic_allocation_counts, extend_reserved, push_reserved, walk_classic_segments,
+};
 pub(super) use self::classic::{
     collect_classic_code_block_data, collect_referenced_classic_code_block_data,
 };
@@ -93,7 +97,10 @@ fn build_and_parse_direct_tile_metadata<'a>(
             output_region,
             structural_workspace_bytes,
         )?,
-        None => None,
+        // A plan reads the packets the decodes read.
+        None => {
+            build::select_whole_image_precincts(tile, header, storage, structural_workspace_bytes)?
+        }
     };
     let selection_bytes = selection
         .as_ref()
@@ -106,7 +113,7 @@ fn build_and_parse_direct_tile_metadata<'a>(
             .ok_or(ValidationError::ImageTooLarge)?,
         decode_region.is_some(),
         build::BuildWorkspace::MetadataOnly,
-        selection.as_ref(),
+        decode_region.and(selection.as_ref()),
     )?;
     if decode_region.is_some() && storage.roi_plan.is_none() {
         build::release_unused_roi_workspace(storage, tile.component_infos.len())?;
@@ -161,7 +168,7 @@ fn build_direct_grayscale_plan_inner<'a>(
 
     let mut next_band_id = 0;
     let output_region = ctx.tile_decode_context.output_region;
-    build_direct_grayscale_tile_plan(
+    let plan = build_direct_grayscale_tile_plan(
         data,
         payload_range_owner,
         &tiles[0],
@@ -173,7 +180,9 @@ fn build_direct_grayscale_plan_inner<'a>(
         None,
         ht_payloads,
         classic_payloads,
-    )
+    )?;
+    reject_grayscale_mct(&tiles, header)?;
+    Ok(plan)
 }
 
 #[expect(
@@ -268,6 +277,17 @@ fn validate_grayscale_tile(tile: &Tile<'_>) -> Result<()> {
         ));
     }
     validate_unit_sampled_component(&tile.component_infos[0])
+}
+
+/// A multiple component transform needs three components: a decode of a
+/// one-component image one of whose tiles asks for one fails, as
+/// `mct::apply_inverse` does, after every tile's packets are parsed, and so
+/// does its plan, once every tile it covers is planned.
+fn reject_grayscale_mct(tiles: &[Tile<'_>], header: &Header<'_>) -> Result<()> {
+    if header.strict && tiles.iter().any(|tile| tile.mct) {
+        bail!(ColorError::Mct);
+    }
+    Ok(())
 }
 
 fn validate_color_tile<const COMPONENT_COUNT: usize>(
@@ -382,10 +402,13 @@ fn append_classic_payload_records(
     append_decode_elements(ranges, tile_ranges)
 }
 
+/// A tile's decoded and destination rectangles, or `None` when it stores
+/// nothing: tile selection rounds tile bounds outward onto the reduced grid,
+/// so it can keep a boundary tile that contributes no samples.
 fn grayscale_plan_rects(
     geometry: &J2kDirectGrayscalePlan,
     output_rect: J2kRect,
-) -> Result<(J2kRect, J2kRect)> {
+) -> Result<Option<(J2kRect, J2kRect)>> {
     let mut stores = geometry.steps.iter().filter_map(|step| match step {
         J2kDirectGrayscaleStep::Store(store) => Some(store),
         J2kDirectGrayscaleStep::ClassicSubBand(_)
@@ -393,8 +416,11 @@ fn grayscale_plan_rects(
         | J2kDirectGrayscaleStep::Idwt(_) => None,
     });
     let store = stores.next().ok_or(DecodingError::CodeBlockDecodeFailure)?;
-    if stores.next().is_some() || store.copy_width == 0 || store.copy_height == 0 {
+    if stores.next().is_some() {
         bail!(DecodingError::CodeBlockDecodeFailure);
+    }
+    if store.copy_width == 0 || store.copy_height == 0 {
+        return Ok(None);
     }
     let destination_rect = J2kRect {
         x0: store.output_x,
@@ -408,13 +434,15 @@ fn grayscale_plan_rects(
         x1: output_rect.x0.saturating_add(destination_rect.x1),
         y1: output_rect.y0.saturating_add(destination_rect.y1),
     };
-    Ok((decoded_rect, destination_rect))
+    Ok(Some((decoded_rect, destination_rect)))
 }
 
+/// The rectangles every component of a tile shares, or `None` when none of
+/// them stores anything.
 fn color_plan_rects<const COMPONENT_COUNT: usize>(
     component_plans: &[J2kDirectGrayscalePlan],
     output_rect: J2kRect,
-) -> Result<(J2kRect, J2kRect)> {
+) -> Result<Option<(J2kRect, J2kRect)>> {
     if component_plans.len() != COMPONENT_COUNT {
         bail!(DecodingError::CodeBlockDecodeFailure);
     }

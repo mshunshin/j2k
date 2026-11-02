@@ -14,7 +14,7 @@ use crate::{
     backend,
     batch::{
         allocation::{generic_batch_worker_limit, J2K_BATCH_METADATA_ALLOWANCE_BYTES},
-        scheduler::{retained_inner_parallelism, run_retained_chunks},
+        scheduler::{retained_inner_parallelism, retained_worker_count, run_retained_chunks},
         worker::BatchWorker,
     },
     decode::decode_warnings_for_recovery,
@@ -37,7 +37,9 @@ pub use self::errors::{
 
 mod prepared;
 pub use self::prepared::{BatchDecoder, PreparedBatch, PreparedBatchGroup, PreparedImage};
-use self::prepared::{BatchExecutionShape, PreparedCodecPlan, PreparedImageInner};
+use self::prepared::{
+    BatchExecutionShape, CpuExecution, PreparedBatchGroupRef, PreparedCodecPlan, PreparedImageInner,
+};
 
 mod prepared_plan;
 pub use self::prepared_plan::{
@@ -55,7 +57,7 @@ use self::cpu_fast::CpuGroupFastWorkspace;
 mod cpu_staged;
 use self::cpu_staged::{CpuEntropyOutcome, CpuStagedWorkspace, CPU_ENTROPY_IMAGES_PER_WINDOW};
 mod cpu_execute;
-use self::cpu_execute::decode_cpu_group;
+use self::cpu_execute::{decode_cpu_group, CpuStreamPool};
 mod cpu;
 mod cpu_materialize;
 mod cpu_staged_execute;
@@ -63,10 +65,10 @@ pub use self::cpu::{CpuBatchDecodeResult, CpuBatchDecoder, CpuBatchGroup, CpuBat
 mod cpu_diagnostics;
 pub use self::cpu_diagnostics::CpuBatchWorkspaceStats;
 mod prepare;
-use self::prepare::prepare_batch_with_workers;
 #[cfg(test)]
 use self::prepare::prepare_staging_bytes;
 pub use self::prepare::{prepare_batch, prepare_batch_from_images};
+use self::prepare::{prepare_batch_from_images_for, prepare_batch_with_workers, PrepareFor};
 
 #[cfg(test)]
 mod tests {

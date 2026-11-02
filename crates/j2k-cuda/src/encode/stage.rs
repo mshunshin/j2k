@@ -11,7 +11,7 @@ use j2k::{
 #[cfg(feature = "cuda-runtime")]
 use j2k_cuda_j2k_engine::{CudaHtj2kEncodeResources, CudaJ2kQuantizeJob};
 #[cfg(feature = "cuda-runtime")]
-use j2k_cuda_runtime::{CudaContext, CudaError};
+use j2k_cuda_runtime::{CudaBufferPool, CudaContext, CudaError};
 #[cfg(feature = "cuda-runtime")]
 use std::sync::Arc;
 
@@ -92,6 +92,9 @@ pub struct CudaEncodeStageAccelerator {
     context: Option<CudaContext>,
     #[cfg(feature = "cuda-runtime")]
     encode_resources: Option<Arc<CudaHtj2kEncodeResources>>,
+    /// Device buffers reused across this accelerator's encodes.
+    #[cfg(feature = "cuda-runtime")]
+    encode_pool: Option<CudaBufferPool>,
     #[cfg(feature = "cuda-runtime")]
     device_unavailable_observed: bool,
     #[cfg_attr(
@@ -278,6 +281,13 @@ impl CudaEncodeStageAccelerator {
         self.encode_resources
             .clone()
             .ok_or_else(|| internal_invariant("CUDA HTJ2K encode resources unavailable"))
+    }
+
+    #[cfg(feature = "cuda-runtime")]
+    fn cuda_encode_pool(&mut self, context: &CudaContext) -> CudaBufferPool {
+        self.encode_pool
+            .get_or_insert_with(|| context.best_fit_buffer_pool())
+            .clone()
     }
 
     pub(super) fn encode_profile_report(
@@ -543,6 +553,14 @@ impl J2kEncodeStageAccelerator for CudaEncodeStageAccelerator {
         &mut self,
         job: J2kForwardDwt53Job<'_>,
     ) -> CudaStageResult<Option<J2kForwardDwt53Output>> {
+        self.encode_forward_dwt53_at_origin(job, (0, 0))
+    }
+
+    fn encode_forward_dwt53_at_origin(
+        &mut self,
+        job: J2kForwardDwt53Job<'_>,
+        origin: (u32, u32),
+    ) -> CudaStageResult<Option<J2kForwardDwt53Output>> {
         self.forward_dwt53_attempts = self.forward_dwt53_attempts.saturating_add(1);
         if job.num_levels == 0 {
             emit_cuda_encode_route!(
@@ -559,11 +577,12 @@ impl J2kEncodeStageAccelerator for CudaEncodeStageAccelerator {
                 &context,
                 self.collect_profile,
                 || {
-                    j2k_cuda_j2k_engine::J2kCudaEngine::new(&context).j2k_forward_dwt53(
+                    j2k_cuda_j2k_engine::J2kCudaEngine::new(&context).j2k_forward_dwt53_at_origin(
                         job.samples,
                         job.width,
                         job.height,
                         job.num_levels,
+                        origin,
                     )
                 },
             )
@@ -583,7 +602,7 @@ impl J2kEncodeStageAccelerator for CudaEncodeStageAccelerator {
             return Ok(Some(cuda_dwt53_output_to_j2k(&output)?));
         }
         #[cfg(not(feature = "cuda-runtime"))]
-        let _ = job;
+        let _ = (job, origin);
         emit_cuda_encode_route!(
             ("op", "encode_forward_dwt53"),
             ("decision", "cpu_fallback"),
@@ -595,6 +614,14 @@ impl J2kEncodeStageAccelerator for CudaEncodeStageAccelerator {
     fn encode_forward_dwt97(
         &mut self,
         job: J2kForwardDwt97Job<'_>,
+    ) -> CudaStageResult<Option<J2kForwardDwt97Output>> {
+        self.encode_forward_dwt97_at_origin(job, (0, 0))
+    }
+
+    fn encode_forward_dwt97_at_origin(
+        &mut self,
+        job: J2kForwardDwt97Job<'_>,
+        origin: (u32, u32),
     ) -> CudaStageResult<Option<J2kForwardDwt97Output>> {
         self.forward_dwt97_attempts = self.forward_dwt97_attempts.saturating_add(1);
         if job.num_levels == 0 {
@@ -612,11 +639,12 @@ impl J2kEncodeStageAccelerator for CudaEncodeStageAccelerator {
                 &context,
                 self.collect_profile,
                 || {
-                    j2k_cuda_j2k_engine::J2kCudaEngine::new(&context).j2k_forward_dwt97(
+                    j2k_cuda_j2k_engine::J2kCudaEngine::new(&context).j2k_forward_dwt97_at_origin(
                         job.samples,
                         job.width,
                         job.height,
                         job.num_levels,
+                        origin,
                     )
                 },
             )
@@ -636,7 +664,7 @@ impl J2kEncodeStageAccelerator for CudaEncodeStageAccelerator {
             return Ok(Some(cuda_dwt97_output_to_j2k(&output)?));
         }
         #[cfg(not(feature = "cuda-runtime"))]
-        let _ = job;
+        let _ = (job, origin);
         emit_cuda_encode_route!(
             ("op", "encode_forward_dwt97"),
             ("decision", "cpu_fallback"),
@@ -842,9 +870,11 @@ impl J2kEncodeStageAccelerator for CudaEncodeStageAccelerator {
         #[cfg(feature = "cuda-runtime")]
         if let Some(context) = self.cuda_context()? {
             let resources = self.cuda_encode_resources(&context)?;
+            let pool = self.cuda_encode_pool(&context);
             let Some(encoded) = cuda_encode_htj2k_tile_body(
                 &context,
                 resources.as_ref(),
+                &pool,
                 job,
                 self.collect_profile,
             )?
@@ -956,8 +986,14 @@ impl J2kEncodeStageAccelerator for CudaEncodeStageAccelerator {
         #[cfg(feature = "cuda-runtime")]
         if let Some(context) = self.cuda_context()? {
             let resources = self.cuda_encode_resources(&context)?;
-            let encoded =
-                cuda_encode_ht_subband(&context, resources.as_ref(), job, self.collect_profile)?;
+            let pool = self.cuda_encode_pool(&context);
+            let encoded = cuda_encode_ht_subband(
+                &context,
+                resources.as_ref(),
+                &pool,
+                job,
+                self.collect_profile,
+            )?;
             let quantize_dispatches = encoded.quantize_dispatches;
             let encode_dispatches = encoded.encode.execution().kernel_dispatches();
             let timings = encoded.timings;

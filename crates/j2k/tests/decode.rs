@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use j2k::{
-    encode_j2k_lossless, encode_j2k_lossless_components, DecodeSettings as FacadeDecodeSettings,
-    EncodeBackendPreference, J2kBlockCodingMode, J2kCodec, J2kComponentPlane, J2kContext,
-    J2kDecodeWarning, J2kDecoder, J2kError, J2kLosslessComponentPlane, J2kLosslessComponentSamples,
-    J2kLosslessEncodeOptions, J2kLosslessSamples, J2kRowDecodeOptions, J2kView,
-    ReversibleTransform,
+    encode_j2k_lossless, encode_j2k_lossless_components, CpuDecodeParallelism,
+    DecodeSettings as FacadeDecodeSettings, EncodeBackendPreference, J2kBlockCodingMode, J2kCodec,
+    J2kComponentPlane, J2kContext, J2kDecodeWarning, J2kDecoder, J2kError,
+    J2kLosslessComponentPlane, J2kLosslessComponentSamples, J2kLosslessEncodeOptions,
+    J2kLosslessSamples, J2kRowDecodeOptions, J2kView, ReversibleTransform,
 };
 use j2k_core::{
     BufferError, CodecContext, Downscale, ImageDecodeRows, PixelFormat, Rect, RowSink,
@@ -322,14 +322,51 @@ fn decoder_reuses_native_context_across_multiple_decode_calls() {
 
 #[test]
 fn decode_rgba8_fills_opaque_alpha_for_rgb_source() {
-    let pixels = [1, 2, 3, 4, 5, 6];
-    let codestream = encode_codestream(&pixels, 2, 1, 3, 8, true);
-    let mut decoder = J2kDecoder::new(&codestream).expect("decoder");
-    let mut out = [0_u8; 8];
-    decoder
-        .decode_into(&mut out, 2 * 4, PixelFormat::Rgba8)
-        .expect("decode");
-    assert_eq!(out, [1, 2, 3, 255, 4, 5, 6, 255]);
+    for (width, height) in [(2_u32, 1_u32), (96, 80), (97, 88)] {
+        let pixels: Vec<_> = (0..width * height * 3)
+            .map(|i| (i * 37 + i / 17).to_le_bytes()[0])
+            .collect();
+        for reversible in [true, false] {
+            let options = EncodeOptions {
+                reversible,
+                num_decomposition_levels: if width < 64 { 1 } else { 3 },
+                ..EncodeOptions::default()
+            };
+            let bytes = encode(&pixels, width, height, 3, 8, false, &options).expect("encode");
+            let expected = backend_decode_u8(&bytes);
+            if reversible {
+                assert_eq!(expected, pixels);
+            }
+            let mut decoder = J2kDecoder::new(&bytes).expect("decoder");
+            for padding in [0, 7] {
+                let stride = width as usize * 4 + padding;
+                let mut out = vec![0x5a; stride * height as usize + 13];
+                for _ in 0..2 {
+                    decoder
+                        .decode_into(&mut out, stride, PixelFormat::Rgba8)
+                        .expect("decode");
+                    for (rgb, rgba) in expected
+                        .chunks_exact(width as usize * 3)
+                        .zip(out.chunks_exact(stride).take(height as usize))
+                    {
+                        for (rgb, rgba) in rgb
+                            .as_chunks::<3>()
+                            .0
+                            .iter()
+                            .zip(rgba[..width as usize * 4].as_chunks::<4>().0)
+                        {
+                            assert_eq!(&rgba[..3], rgb);
+                            assert_eq!(rgba[3], 255);
+                        }
+                        assert!(rgba[width as usize * 4..].iter().all(|&byte| byte == 0x5a));
+                    }
+                    assert!(out[stride * height as usize..]
+                        .iter()
+                        .all(|&byte| byte == 0x5a));
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -966,6 +1003,154 @@ fn decode_rejects_too_small_stride() {
     ));
 }
 
+/// The decode entry points [`decode_to_strided_buffer`] covers.
+#[derive(Debug, Clone, Copy)]
+enum StridedRoute {
+    Full,
+    Region,
+    Scaled,
+    RegionScaled,
+}
+
+/// Decode `bytes` on `route` to `fmt` at a stride three bytes past the
+/// output rows, into a buffer of exactly [`j2k_core::strided_output_len`]
+/// bytes when `tight`, which has no padding after its last row, and of one
+/// padded row per output row otherwise. Every byte starts as `0xa5`. A
+/// `planes_budget` holds full-image decodes' planes to it: 0 streams every
+/// decode that can stream, `usize::MAX` keeps them on the planes.
+fn decode_to_strided_buffer(
+    bytes: &[u8],
+    (parallelism, planes_budget): (CpuDecodeParallelism, Option<usize>),
+    route: StridedRoute,
+    fmt: PixelFormat,
+    tight: bool,
+) -> Vec<u8> {
+    let mut decoder = J2kDecoder::new(bytes).expect("decoder");
+    decoder.set_cpu_decode_parallelism(parallelism);
+    if let Some(bytes) = planes_budget {
+        decoder.set_full_decode_planes_budget(bytes);
+    }
+    let dims = decoder.info().dimensions;
+    let roi = Rect {
+        x: 3,
+        y: 5,
+        w: dims.0 - 7,
+        h: dims.1 - 6,
+    };
+    let scale = Downscale::Half;
+    let output = match route {
+        StridedRoute::Full => Rect::full(dims),
+        StridedRoute::Region => roi,
+        StridedRoute::Scaled => Rect::full((dims.0.div_ceil(2), dims.1.div_ceil(2))),
+        StridedRoute::RegionScaled => roi.scaled_covering(scale),
+    };
+    let stride = output.w as usize * fmt.bytes_per_pixel() + 3;
+    let len = if tight {
+        j2k_core::strided_output_len((output.w, output.h), stride, fmt).expect("output length")
+    } else {
+        stride * output.h as usize
+    };
+    let mut out = vec![0xa5; len];
+    let pool = &mut j2k::J2kScratchPool::new();
+    let outcome = match route {
+        StridedRoute::Full => decoder.decode_into(&mut out, stride, fmt),
+        StridedRoute::Region => decoder.decode_region_into(pool, &mut out, stride, fmt, roi),
+        StridedRoute::Scaled => decoder.decode_scaled_into(pool, &mut out, stride, fmt, scale),
+        StridedRoute::RegionScaled => {
+            decoder.decode_region_scaled_into(pool, &mut out, stride, fmt, roi, scale)
+        }
+    }
+    .unwrap_or_else(|error| panic!("{route:?} {fmt:?} decode: {error}"));
+    assert_eq!(outcome.decoded, output);
+    out
+}
+
+#[test]
+fn decode_writes_the_last_row_of_a_buffer_without_trailing_padding() {
+    let encode_image = |(width, height): (u32, u32), components: u16, bit_depth: u8, tile| {
+        let bytes_per_sample = u32::from(bit_depth).div_ceil(8);
+        let mut pixels: Vec<u8> = (0..width * height * u32::from(components) * bytes_per_sample)
+            .map(|i| (i * 37 + i / 11).to_le_bytes()[0])
+            .collect();
+        if bit_depth > 8 {
+            // Keep each little-endian sample within its bit depth.
+            for sample in pixels.as_chunks_mut::<2>().0 {
+                sample[1] &= (1 << (bit_depth - 8)) - 1;
+            }
+        }
+        let options = EncodeOptions {
+            reversible: components != 3,
+            num_decomposition_levels: 3,
+            tile_size: tile,
+            ..EncodeOptions::default()
+        };
+        encode(
+            &pixels, width, height, components, bit_depth, false, &options,
+        )
+        .expect("encode")
+    };
+    let small = (45, 31);
+    let gray8 = encode_image(small, 1, 8, None);
+    let gray12 = encode_image(small, 1, 12, None);
+    let rgb8 = encode_image(small, 3, 8, None);
+    let rgb12 = encode_image(small, 3, 12, None);
+    let rgba8_jp2 = wrap_jp2_rgba_codestream(&encode_image(small, 4, 8, None), 45, 31, 8);
+    // Six tiles, which a two-thread pool streams three at a time.
+    let rgb8_tiled = encode_image((768, 512), 3, 8, Some((256, 256)));
+    let gray_formats = [PixelFormat::Gray8, PixelFormat::Gray16];
+    let color_formats = [
+        PixelFormat::Rgb8,
+        PixelFormat::Rgba8,
+        PixelFormat::Rgb16,
+        PixelFormat::Rgba16,
+    ];
+    let cases: [(&str, &[u8], &[PixelFormat]); 5] = [
+        ("gray8", &gray8, &gray_formats),
+        ("gray12", &gray12, &gray_formats),
+        ("rgb8", &rgb8, &color_formats),
+        ("rgb12", &rgb12, &color_formats),
+        ("rgba8", &rgba8_jp2, &color_formats),
+    ];
+    let mut failures = Vec::new();
+    let mut compare = |name: &str, bytes: &[u8], settings, route, fmt| {
+        let padded = decode_to_strided_buffer(bytes, settings, route, fmt, false);
+        let tight = decode_to_strided_buffer(bytes, settings, route, fmt, true);
+        if tight != padded[..tight.len()] {
+            failures.push(format!("{name} {fmt:?} {route:?} {settings:?}"));
+        }
+    };
+    for (name, bytes, formats) in cases {
+        for &fmt in formats {
+            for parallelism in [CpuDecodeParallelism::Auto, CpuDecodeParallelism::Serial] {
+                // The planes, the streamed rows, and the default route.
+                for budget in [Some(usize::MAX), Some(0), None] {
+                    for route in [StridedRoute::Full, StridedRoute::Scaled] {
+                        compare(name, bytes, (parallelism, budget), route, fmt);
+                    }
+                }
+                for route in [StridedRoute::Region, StridedRoute::RegionScaled] {
+                    compare(name, bytes, (parallelism, None), route, fmt);
+                }
+            }
+        }
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .expect("pool");
+    pool.install(|| {
+        for fmt in color_formats {
+            let settings = (CpuDecodeParallelism::Auto, Some(0));
+            compare("rgb8 tiled", &rgb8_tiled, settings, StridedRoute::Full, fmt);
+        }
+    });
+    assert!(
+        failures.is_empty(),
+        "a buffer that ends after the last row's pixels must hold the padded decode's \
+         bytes: {failures:#?}"
+    );
+}
+
 #[test]
 fn decode_scaled_into_matches_backend_target_resolution_decode() {
     let pixels: Vec<u8> = (0_u8..48).collect();
@@ -1045,7 +1230,13 @@ fn reused_decoder_region_scaled_decodes_match_fresh_decodes_across_scales() {
     let mut reused = J2kDecoder::new(&codestream).expect("reused decoder");
     let mut reused_pool = j2k::J2kScratchPool::new();
 
-    for scale in [Downscale::Quarter, Downscale::Half, Downscale::Quarter] {
+    for scale in [
+        Downscale::Quarter,
+        Downscale::None,
+        Downscale::Half,
+        Downscale::None,
+        Downscale::Quarter,
+    ] {
         let scaled_roi = roi.scaled_covering(scale);
         let stride = scaled_roi.w as usize * PixelFormat::Rgb8.bytes_per_pixel();
         let mut expected = vec![0_u8; stride * scaled_roi.h as usize];

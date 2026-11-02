@@ -5,7 +5,7 @@
 use j2k_core::BatchInfrastructureError;
 use j2k_native::HtCodeBlockPayloadRanges;
 
-use super::super::{BatchCodecRoute, PreparedBatchGroup};
+use super::super::{BatchCodecRoute, PreparedBatchGroupRef};
 use super::plan::{
     append_input_range, empty_range, ht_bucket, ht_bucket_index, ht_group_requirements,
     reserve_reused, visit_ht_jobs,
@@ -15,7 +15,7 @@ use super::{CpuFlattenedPayloadJob, CpuGroupFastWorkspace, CpuPayloadBucket};
 impl CpuGroupFastWorkspace {
     pub(super) fn prepare_htj2k(
         &mut self,
-        group: &PreparedBatchGroup,
+        group: PreparedBatchGroupRef<'_>,
     ) -> Result<(), BatchInfrastructureError> {
         let (payload_count, payload_bytes) = ht_group_requirements(group)?;
         self.initialize_ht_storage(group, payload_count, payload_bytes)?;
@@ -26,7 +26,7 @@ impl CpuGroupFastWorkspace {
 
     fn initialize_ht_storage(
         &mut self,
-        group: &PreparedBatchGroup,
+        group: PreparedBatchGroupRef<'_>,
         payload_count: usize,
         payload_bytes: usize,
     ) -> Result<(), BatchInfrastructureError> {
@@ -47,17 +47,17 @@ impl CpuGroupFastWorkspace {
                 refinement: None,
             },
         );
-        self.assign_image_spans(group, |image| {
+        self.assign_image_spans(group.images, |image| {
             let plan = image
                 .htj2k_plan()
                 .ok_or(BatchInfrastructureError::MissingResult { index: 0 })?;
-            visit_ht_jobs(plan.native_plan(), |_, _, _, _| {})
+            visit_ht_jobs(plan.cpu_plan(), |_, _, _, _| {})
         })
     }
 
     fn collect_ht_jobs(
         &mut self,
-        group: &PreparedBatchGroup,
+        group: PreparedBatchGroupRef<'_>,
         payload_count: usize,
     ) -> Result<(), BatchInfrastructureError> {
         for bucket in [
@@ -72,7 +72,7 @@ impl CpuGroupFastWorkspace {
                 let span = self.image_spans[image_slot];
                 let mut bucket_ordinals = [0_usize; 3];
                 visit_ht_jobs(
-                    plan.native_plan(),
+                    plan.cpu_plan(),
                     |job_index, payload_records, block_index, coding_passes| {
                         if ht_bucket(coding_passes) == bucket {
                             let bucket_index = ht_bucket_index(bucket);
@@ -110,7 +110,7 @@ impl CpuGroupFastWorkspace {
 
     fn materialize_ht_payloads(
         &mut self,
-        group: &PreparedBatchGroup,
+        group: PreparedBatchGroupRef<'_>,
     ) -> Result<(), BatchInfrastructureError> {
         for job in &self.jobs {
             if group.source_indices.get(job.image_slot).copied() != Some(job.source_index) {
@@ -130,7 +130,7 @@ impl CpuGroupFastWorkspace {
             let payloads = image
                 .htj2k_plan()
                 .and_then(|plan| {
-                    plan.native_plan()
+                    plan.cpu_plan()
                         .payloads()
                         .get(job.payload_index..payload_end)
                 })

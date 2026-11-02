@@ -26,7 +26,7 @@ fn target_dispatch_preserves_none_bytes_and_bpp_semantics() {
         ..J2kLossyEncodeOptions::default()
     };
     let mut scales = Vec::new();
-    let attempt = encode_lossy_targeted(samples, &options, None, |scale| {
+    let attempt = encode_lossy_targeted(samples, &options, None, &mut |scale: f32| {
         scales.push(scale);
         Ok(vec![1, 2, 3])
     })
@@ -36,7 +36,7 @@ fn target_dispatch_preserves_none_bytes_and_bpp_semantics() {
     assert_eq!(attempt.quantization_scale.to_bits(), 1.0_f32.to_bits());
 
     for target in [J2kRateTarget::Bytes(1), J2kRateTarget::BitsPerPixel(8.0)] {
-        let attempt = encode_lossy_targeted(samples, &options, Some(target), |scale| {
+        let attempt = encode_lossy_targeted(samples, &options, Some(target), &mut |scale: f32| {
             let len = if scale <= 1.0 { 600 } else { 1 };
             Ok(vec![0; len])
         })
@@ -272,4 +272,75 @@ fn rate_target_and_metric_helpers_cover_numeric_edges() {
         bits_per_pixel(single_pixel_samples(), 2).to_bits(),
         16.0_f64.to_bits()
     );
+}
+
+#[test]
+fn closure_candidates_keep_the_final_byte_re_encode() {
+    use super::super::candidates::LossyCandidates;
+    let source = |_scale: f32| -> Result<Vec<u8>, J2kError> { Ok(Vec::new()) };
+    assert!(!source.reuse_terminal_byte_output());
+}
+
+#[test]
+fn terminal_byte_probe_reuse_preserves_search_decisions() {
+    use super::super::{candidates::LossyCandidates, encode_lossy_to_byte_target};
+    #[derive(Clone)]
+    struct Probes {
+        reuse: bool,
+        calls: Vec<u32>,
+        lengths: [usize; 3],
+    }
+    impl LossyCandidates for Probes {
+        fn reuse_terminal_byte_output(&self) -> bool {
+            self.reuse
+        }
+        fn encode_candidate(&mut self, scale: f32) -> Result<Vec<u8>, J2kError> {
+            let bits = scale.to_bits();
+            self.calls.push(bits);
+            let [initial, upper, middle] = self.lengths;
+            let len = if bits == 1.0_f32.to_bits() {
+                initial
+            } else if bits == 2.0_f32.to_bits() {
+                upper
+            } else if middle != 0 {
+                middle
+            } else {
+                // Lengths rise toward the target as scales approach 1.0, so each
+                // bisection probe wins until f32 precision ends the search.
+                900 + usize::try_from(bits.abs_diff(1.0_f32.to_bits()).leading_zeros()).unwrap()
+            };
+            Ok(vec![scale.to_bits().to_le_bytes()[0]; len])
+        }
+    }
+    let mut options = J2kLossyEncodeOptions::default();
+    for (lengths, budget, hit) in [
+        ([1200, 0, 0], 8, true),
+        ([2000, 500, 1000], 8, false),
+        ([2000, 500, 1001], 1, true),
+        ([2000, 500, 1001], 0, true),
+        ([2000, 900, 1300], 1, false),
+        ([2000, 900, 1100], 1, false),
+        ([2000, 500, 990], 1, true),
+        ([2000, 908, 0], 64, true),
+    ] {
+        options.psnr_iteration_budget = budget;
+        let mut reference = Probes {
+            reuse: false,
+            calls: Vec::new(),
+            lengths,
+        };
+        let mut reused = reference.clone();
+        reused.reuse = true;
+        let run = |source: &mut Probes| {
+            let result =
+                encode_lossy_to_byte_target(single_pixel_samples(), &options, 1000, source)
+                    .unwrap();
+            (result.codestream, result.quantization_scale.to_bits())
+        };
+        assert_eq!(run(&mut reused), run(&mut reference));
+        if hit {
+            reference.calls.pop();
+        }
+        assert_eq!(reused.calls, reference.calls, "budget {budget}, hit {hit}");
+    }
 }

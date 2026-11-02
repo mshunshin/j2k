@@ -19,9 +19,12 @@ mod ht;
 #[cfg(feature = "parallel")]
 mod parallel;
 mod pending;
+mod placement;
 #[cfg(feature = "parallel")]
 mod tile_parallel;
 use self::classic::decode_sub_band_classic_blocks;
+#[cfg(feature = "parallel")]
+use self::classic::ClassicJobParameters;
 use self::ht::{decode_sub_band_ht_blocks, decode_sub_band_ht_blocks_i64};
 #[cfg(all(feature = "parallel", not(test)))]
 use self::parallel::{copy_decoded_classic_blocks_to_sub_band, copy_decoded_ht_blocks_to_sub_band};
@@ -32,10 +35,18 @@ pub(super) use self::parallel::{
 #[cfg(feature = "parallel")]
 use self::parallel::{
     decode_classic_sub_band_blocks_parallel, decode_ht_sub_band_blocks_parallel,
-    release_coefficient_slab, ClassicParallelParameters, HtParallelParameters,
+    release_coefficient_slab, HtParallelParameters,
 };
 use self::pending::{collect_pending_classic_blocks, collect_pending_ht_blocks};
 pub(in crate::j2c::decode) use self::pending::{count_classic_code_blocks, count_ht_code_blocks};
+pub(crate) use self::placement::BlockPlacement;
+#[cfg(all(test, feature = "parallel"))]
+pub(crate) use self::tile_parallel::MIN_BAND_WORK;
+#[cfg(feature = "parallel")]
+pub(in crate::j2c::decode) use self::tile_parallel::{
+    plan_band_route, plan_band_route_beside, pool_entry_bytes, routes_tile, BandOutput, BandRoute,
+    BandRouting, BlockScratch, PayloadSource, LOCK_BYTES,
+};
 
 /// Decode the code-blocks of the tile's `components` into their sub-bands.
 #[expect(
@@ -53,7 +64,7 @@ pub(crate) fn decode_component_tile_bit_planes<'a>(
     profile_enabled: bool,
 ) -> Result<()> {
     #[cfg(feature = "parallel")]
-    let cpu_decode_parallelism = match tile_parallel::plan_tile_ht_route(
+    let cpu_decode_parallelism = match tile_parallel::plan_tile_route(
         tile,
         components.clone(),
         tile_ctx,
@@ -61,12 +72,25 @@ pub(crate) fn decode_component_tile_bit_planes<'a>(
         header,
         ht_decoder,
         cpu_decode_parallelism,
-        profile_enabled,
-    )? {
-        tile_parallel::TileHtRoute::Decoded => return Ok(()),
-        tile_parallel::TileHtRoute::Serial => CpuDecodeParallelism::Serial,
-        tile_parallel::TileHtRoute::PerSubBand => cpu_decode_parallelism,
+    ) {
+        Ok(tile_parallel::TileRoute::Decoded) => return Ok(()),
+        Ok(tile_parallel::TileRoute::PerSubBand) => cpu_decode_parallelism,
+        Ok(tile_parallel::TileRoute::Serial) => CpuDecodeParallelism::Serial,
+        Err(_) => {
+            // Planning can fail in a later band before earlier blocks decode,
+            // and workers can fail in any order. Retry serially to preserve
+            // the serial error. Skipped blocks need zeros after partial writes.
+            // Storage holds either this component or the whole active tile.
+            storage.coefficients.fill(0.0);
+            storage.coefficients_i64.fill(0);
+            storage.stale_coefficients = false;
+            CpuDecodeParallelism::Serial
+        }
     };
+    if core::mem::take(&mut storage.stale_coefficients) {
+        storage.coefficients.fill(0.0);
+        storage.coefficients_i64.fill(0);
+    }
 
     let component_infos = tile
         .component_infos
@@ -209,6 +233,22 @@ pub(super) fn decode_sub_band_bitplanes(
     )
 }
 
+/// Where `code_block` lands in `sub_band`'s stored rectangle.
+pub(super) fn stored_placement(code_block: &CodeBlock, sub_band: &SubBand) -> BlockPlacement {
+    BlockPlacement::new(code_block.rect, sub_band.storage_rect)
+}
+
+/// Code-blocks are built in row order within each precinct. A banded Tier-1
+/// decode visits only the row it is decoding; whole-window paths visit all.
+fn tier1_code_blocks(blocks: &[CodeBlock], band_y0: Option<u32>) -> &[CodeBlock] {
+    let Some(band_y0) = band_y0 else {
+        return blocks;
+    };
+    let start = blocks.partition_point(|block| block.rect.y0 < band_y0);
+    let end = blocks.partition_point(|block| block.rect.y0 <= band_y0);
+    &blocks[start..end]
+}
+
 pub(super) fn code_block_required_by_index(
     storage: &DecompositionStorage<'_>,
     sub_band_idx: usize,
@@ -224,7 +264,9 @@ pub(crate) fn should_decode_classic_sub_band_in_parallel(
     parallelism: CpuDecodeParallelism,
     code_block_count: usize,
 ) -> bool {
-    cfg!(feature = "parallel") && parallelism == CpuDecodeParallelism::Auto && code_block_count >= 4
+    // As for HT, one worker decodes straight into the sub-band: staging would
+    // give every block its own workspace and copy the slab back.
+    should_decode_ht_sub_band_in_parallel(parallelism, code_block_count)
 }
 
 pub(crate) fn should_decode_ht_sub_band_in_parallel(

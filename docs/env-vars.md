@@ -5,7 +5,7 @@ internal and can change without notice.
 
 Stability values:
 
-- Stable: supported for the published v0.12.x contract.
+- Stable: supported for the published v0.13.x contract.
 - Experimental: diagnostics and adapter tuning; may change before 1.0.
 - Test/CI: repository tests, CI, and release validation only.
 - Benchmark: benchmark harnesses only.
@@ -17,7 +17,7 @@ Stability values:
 | --- | --- | --- | --- |
 | `J2K_GPU_ROUTE_PROFILE` | Emits facade/adapter GPU route decisions. Use `1` for rows or `summary` for aggregate rows. | Disabled | Experimental |
 | `J2K_JPEG_PROFILE_STAGES` | Emits JPEG CPU profiling rows. Use `1` for rows or `summary` where supported. | Disabled | Experimental |
-| `J2K_PROFILE_STAGES` | Emits native/CUDA J2K profiling rows. Use `1` for rows or `summary` where supported. | Disabled | Experimental |
+| `J2K_PROFILE_STAGES` | Emits native/CUDA J2K profiling rows. Use `1` for rows or `summary` where supported. Native rows need `j2k-native`'s `profile` feature, which is on by default. CPU HTJ2K phase timings (`ht_*_us`) cover serially decoded code blocks only, such as decodes on one thread. | Disabled | Experimental |
 | `J2K_CUDA_TRACE` | Writes CUDA HTJ2K profile trace JSON to this path. The file must not exist and its parent directory must. | No trace file | Experimental |
 | `J2K_CUDA_IDWT_TRACE` | Enables CUDA IDWT trace/profile output. | Disabled | Experimental |
 | `J2K_CUDA_FINAL_STORE_PROFILE` | Restricts the CUDA HTJ2K decode benchmark to the final-IDWT/store timing matrix. Requires `J2K_REQUIRE_CUDA_BENCH=1`. | Disabled | Benchmark |
@@ -50,14 +50,14 @@ Stability values:
 | `J2K_METAL_CLASSIC_TIER1_SPLIT_MQ_BYTE_GPU_TOKEN_PACK` | Set to `1` to request, or `0` to disable, the split MQ-byte GPU token-pack route. | Auto | Experimental |
 | `J2K_HYBRID_FLAT_CPU_TIER1` | Forces flat CPU Tier-1 batching for J2K Metal hybrid decode when set to a truthy value accepted by the adapter. | Adapter default | Experimental |
 | `J2K_CUDA_OXIDE_ARCH` | Overrides the cuda-oxide build target when a `j2k-cuda-runtime/cuda-oxide-*` feature is enabled. | `sm_80` | Experimental |
-| `J2K_REQUIRE_CUDA_OXIDE_BUILD` | Requires every enabled cuda-oxide PTX project to build successfully. Use this on Linux/NVIDIA validation and benchmark hosts. | Disabled | Test/CI |
+| `J2K_REQUIRE_CUDA_OXIDE_BUILD` | Requires every enabled cuda-oxide PTX project to build successfully, and makes CUDA tests fail instead of skipping when a kernel's PTX was not built. Use this on Linux/NVIDIA validation and benchmark hosts. | Disabled; tests skip when PTX was not built | Test/CI |
 
 ## Test And CI Gates
 
 | Variable | Effect | Default | Stability |
 | --- | --- | --- | --- |
 | `J2K_ML_BATCH_INPUT_MODE` | Selects content-distinct generated inputs (`distinct`) or one repeated `Arc` owner (`repeated`) for the `j2k-ml` batch benchmarks. One process uses one mode. | `distinct` | Benchmark |
-| `J2K_MPSGRAPH_BENCH_ITERATIONS` | Number of repeated samples per size/batch/path cell in the direct MPSGraph benchmark. | `5` | Benchmark |
+| `J2K_MPSGRAPH_BENCH_ITERATIONS` | Repeated samples per size/batch/path cell in the direct MPSGraph benchmark. Invalid values use the build default; `0` is clamped to `1`. | `30` without debug assertions, `1` with debug assertions | Benchmark |
 | `J2K_JPEG_HARNESS_BASELINE_SHADERS` | Directory holding another copy of the JPEG Metal shader files (same names as `crates/j2k-jpeg-metal/src/shaders_*.metal`). The ignored `decode_kernel_stage_profile` test compiles it as a baseline and A/Bs it against the in-tree kernels in one process; the copy must match the current host ABI. | No baseline column | Benchmark |
 | `J2K_JPEG_TEXTURE_SMALL_BATCHES` | When set to any value, selects the small-batch and tile-size control matrix for the ignored JPEG Metal `texture_scheduling_experiment` test. | Regular 16-tile timing matrix | Benchmark |
 | `J2K_ML_BATCH_PROCESS_MODE` | Selects uninstrumented Criterion measurement (`criterion`) or the separate low-batch telemetry/profile process (`profile`) for CUDA and Metal batch benchmarks. | `criterion` | Benchmark |
@@ -66,6 +66,8 @@ Stability values:
 | `J2K_REQUIRE_OPENJPH` | Makes optional OpenJPH fixture comparator rows fail instead of skip when `ojph_expand` is unavailable. Intended only for HTJ2K/JPH-compatible CLI context rows. | Skip unavailable OpenJPH path unless explicitly included | Benchmark |
 | `J2K_REQUIRE_KAKADU` | Makes optional Kakadu fixture/encoder comparator rows fail instead of skip when `kdu_expand` or `kdu_compress` is unavailable. Intended only for proprietary CLI/file-output context rows. | Skip unavailable Kakadu path unless explicitly included | Benchmark |
 | `J2K_REQUIRE_LIBJPEG_TURBO` | Makes libjpeg-turbo comparison tests fail instead of skip when the bench feature/tooling is unavailable. | Skip unavailable comparator path | Test/CI |
+| `J2K_REQUIRE_CUDA` | Set to `1` to make `j2k-python` CUDA tests fail when the CUDA build or device is unavailable. | Skip unavailable Python CUDA tests | Test/CI |
+| `J2K_REQUIRE_METAL` | Set to `1` to make `j2k-python` Metal tests fail when the Metal build or PyTorch MPS device is unavailable. | Skip unavailable Python MPS tests | Test/CI |
 | `J2K_REQUIRE_CUDA_RUNTIME` | Makes CUDA tests and benchmarks require a usable CUDA runtime instead of skipping. | Skip runtime-only CUDA paths | Test/CI |
 | `J2K_CUDA_LOSSY_PARITY_PNM` | Path to an external RGB PNM fixture used by required CUDA irreversible color-transform, DWT 9/7, and lossy encode parity tests. | Optional generated fixture unless the release runner supplies a file | Test/CI |
 | `J2K_REQUIRE_CUDA_JPEG_HARDWARE_DECODE` | Requires CUDA JPEG hardware decode coverage in relevant CUDA tests/benches. | Hardware decode may skip | Test/CI |
@@ -76,6 +78,30 @@ Stability values:
 | `J2K_REQUIRE_WSI_ROOT` | Makes external JPEG WSI tests fail if `J2K_WSI_ROOT` is missing or empty. | Skip external WSI tests | Test/CI |
 | `J2K_REQUIRE_TRANSCODE_WSI_ROOT` | Makes transcode corpus validation require `J2K_TRANSCODE_WSI_ROOT`. | Skip external transcode WSI corpus | Test/CI |
 | `J2K_REQUIRE_NDPI` | Makes NDPI passthrough tests fail if `J2K_NDPI_PATH` is missing. | Skip NDPI passthrough test | Test/CI |
+
+## DICOM Decode Benchmarks And Metal Step Profiling
+
+These variables control `jp2k_dicom_bench`, the Metal `dicom_decode_bench`
+example, and the ignored `single_image_step_profile` test.
+
+| Variable | Effect | Default | Stability |
+| --- | --- | --- | --- |
+| `J2K_DICOM_BENCH_REPEATS` | Positive timed repeats per row; series rows use at most five. | `15` | Benchmark |
+| `J2K_DICOM_BENCH_RAW_DIR` | Directory of `<stem>.RAW` little-endian reference pixels for exact verification. | No external RAW comparison | Benchmark |
+| `J2K_DICOM_BENCH_THREADS` | Positive worker count for the series row. | Available parallelism, or `1` if unavailable | Benchmark |
+| `J2K_DICOM_BENCH_SERIES_REPEAT` | Positive number of copies of each input in the series row. | `8` | Benchmark |
+| `J2K_DICOM_BENCH_MODE` | Selects `serial`, `parallel`, or `series`; empty runs every mode. Other values are errors. | All modes | Benchmark |
+| `J2K_DICOM_BENCH_REUSE_DECODER` | Any value enables reuse of one prepared decoder for repeated single-image decodes. | Fresh decoder per decode | Benchmark |
+| `J2K_METAL_BENCH_ONLY` | Selects `metal-single`, `auto`, `metal-into`, or `metal-batch`; unset or unrecognized values run CPU/Metal single and batch rows. | Full comparison | Benchmark |
+| `J2K_METAL_BENCH_REPEATS` | Positive timed repeats per Metal benchmark row. | `11` | Benchmark |
+| `J2K_METAL_BENCH_BATCH` | Positive batch size for Metal benchmark batch rows. | `16` | Benchmark |
+| `J2K_METAL_BENCH_REUSE` | Any value reuses one decoder, its prepared plan, and device payloads for `metal-single` rows. | Fresh decoder per decode | Benchmark |
+| `J2K_METAL_BENCH_DISTINCT` | Any value makes `metal-batch` use distinct frames re-encoded as lossless HTJ2K. | Repeated copies of one codestream | Benchmark |
+| `J2K_METAL_BENCH_CAPTURE` | Absolute `.gputrace` output path for one warmed-up first-file `metal-into` decode. Requires `MTL_CAPTURE_ENABLED=1`. | No capture | Benchmark |
+| `J2K_STEP_PROFILE_FILES` | OS-separated path list of Gray16 codestreams to profile instead of generated images. | Generated 512×512, 1024×1024, and 3072×4096 Gray16 images | Benchmark |
+| `J2K_STEP_PROFILE_INTO` | Any value profiles decoding into one reused destination. | New surface per decode | Benchmark |
+| `J2K_STEP_PROFILE_LOSSY` | Any value selects irreversible 9/7 for generated inputs; ignored when files are supplied. | Reversible 5/3 generated inputs | Benchmark |
+| `J2K_STEP_PROFILE_COMPARE_IDWT` | Any value additionally profiles IDWT with single-pass tile kernels disabled. | No two-pass comparison | Benchmark |
 
 ## External Data And Comparator Paths
 
@@ -91,7 +117,8 @@ Stability values:
 | `J2K_NDPI_MAX_PAYLOAD_BYTES` | Maximum NDPI tile payload accepted by the passthrough test. | Test default | Test/CI |
 | `J2K_ISO_CONFORMANCE_DIR` | Path to ISO J2K conformance vectors for ignored/external tests. | Not set | Test/CI |
 | `J2K_APERIO_TILE_FIXTURE` | Path to an Aperio J2K tile fixture for the ignored lossless encode test. | Not set | Test/CI |
-| `J2K_PARITY_CORPUS_MANIFEST` | Manifest path used by `scripts/parity-corpus-fetch.sh`. | `corpus/wsi-samples/manifest.json` or first script argument | Test/CI |
+| `J2K_PROGRESSION_MATRIX_DIR` | Directory the ignored `write_progression_matrix_codestreams` test in `j2k-native` writes its generated progression and packet-layout codestreams to, for use with other decoders. | Not set | Test/CI |
+| `J2K_PARITY_CORPUS_MANIFEST` | Required manifest path for `scripts/parity-corpus-fetch.sh`; overrides the first script argument. Run `scripts/parity-corpus-fetch.sh --help` for usage. | No bundled default; supply this variable or the first script argument | Test/CI |
 | `J2K_PARITY_CORPUS_DIR` | Output directory used by `scripts/parity-corpus-fetch.sh`. | `corpus/wsi-samples` or second script argument | Test/CI |
 | `J2K_PARITY_CORPUS_MAX_BYTES` | Maximum accepted byte size for each downloaded parity-corpus fixture. | `536870912` | Test/CI |
 | `J2K_OPENJPEG_BIN` | Override for OpenJPEG `opj_decompress` in J2K parity tests. | `opj_decompress` on `PATH` | Test/CI |
@@ -159,8 +186,9 @@ Stability values:
 | `J2K_ENCODE_COMPARE_ENCODERS` | Comma-separated encoder filter for local smoke checks, with values `j2k`, `openjpeg`, `grok`, and optional `kakadu`/`kdu`. Any filter blocks publication eligibility. | All default encoders | Benchmark |
 | `J2K_OPENJPH_MATRIX_REPEATS` | Positive encode repeat count per producer/profile/format cell in `jp2k_encode_compare --openjph-matrix`; the median is reported. Parity is checked outside the timed encode operation. | `3` | Benchmark |
 | `J2K_BATCH_COMPARE_REPEATS` | Repeat count for `jp2k_batch_compare`. | Tool default | Benchmark |
-| `J2K_BATCH_COMPARE_THREADS` | Outer worker count shared by J2K and the in-process reference rows in `jp2k_batch_compare`. Reference decoders remain single-threaded per tile to avoid nested oversubscription. | Tool default | Benchmark |
-| `J2K_BATCH_COMPARE_MAX_ABS_DIFF` | Maximum allowed per-byte difference between J2K and each linked OpenHTJ2K/OpenJPH in-process preflight. The benchmark exits before timing when the gate fails. | `1` | Benchmark |
+| `J2K_BATCH_COMPARE_DECODER` | Restrict timed batches to one available decoder (`j2k`, `openjpeg`, `grok`, `openhtj2k`, or `openjph`) for isolated profiling. All available reference parity checks still run before timing; unknown or unavailable names fail. | All available decoders | Benchmark |
+| `J2K_BATCH_COMPARE_THREADS` | Outer worker count shared by J2K and the in-process reference rows in `jp2k_batch_compare`; also sets Grok's process-wide pool size before any decode. Explicit counts keep J2K serial within each job; OpenJPEG and Grok request one decode thread per job, and OpenJPH is serial within each job. Grok may schedule work on its shared pool. | Host available parallelism; J2K automatic policy | Benchmark |
+| `J2K_BATCH_COMPARE_MAX_ABS_DIFF` | Maximum allowed per-byte difference between J2K and every available OpenJPEG/Grok/OpenHTJ2K/OpenJPH comparator. The benchmark exits before timing when the gate fails. Use `0` for lossless comparisons. | `1` | Benchmark |
 | `J2K_ROI_COMPARE_REPEATS` | Repeat count for `jp2k_roi_batch_compare`. | Tool default | Benchmark |
 | `J2K_ROI_COMPARE_THREADS` | Worker count for `jp2k_roi_batch_compare`. | Tool default | Benchmark |
 | `J2K_CUDA_DECODE_FORMATS` | Comma-separated CUDA J2K decode benchmark output formats such as `gray8,rgb8,rgba8`. | Harness default | Benchmark |
@@ -196,6 +224,10 @@ Stability values:
 | `J2K_AUTO_ROUTING_DRIVER` | Driver/toolchain version recorded in routing results. | None; routing runs fail when unset | Benchmark/CI |
 | `J2K_CUDA_PROFILE_BATCH_SIZE` | Batch size for the CUDA decode profile example. | 128 | Benchmark |
 | `J2K_CUDA_PROFILE_ITERATIONS` | Measured iterations after three verified warmup batches in the CUDA decode profile example. | 100 | Benchmark |
+| `J2K_CUDA_PROFILE_DOWNLOAD` | Set to `1` to include a zero-initialized per-batch host output allocation, tight RGB/gray readback, and output destruction in each timed CUDA profile sample; `0` measures completed resident output. | `0` | Benchmark |
+| `J2K_CUDA_PROFILE_API` | CUDA profile API: `surface` uses the existing surface batch entry point; `owned` uses `CudaBatchDecoder` with NHWC output and supports multi-tile codestreams. Both parse and prepare each timed batch and retain the CUDA session. | `surface` | Benchmark |
+| `J2K_CUDA_PROFILE_MAX_ABS_DIFF` | Largest accepted per-sample difference between CUDA output and the CPU reference during the CUDA profile example's three validation passes; the observed maximum is printed. Use a nonzero value only for irreversible inputs. | `0` | Benchmark |
+| `J2K_CUDA_PROFILE_LAYOUT` | Output layout for the CUDA profile example: `nhwc`, or `nchw` (planar, one dense group) with `J2K_CUDA_PROFILE_API=owned`. Planar output is validated and read back as the dense group. | `nhwc` | Benchmark |
 | `J2K_CUDA_PROFILE_INPUT` | One encoded grayscale or RGB input at up to 16 bits for the CUDA decode profile example. Mutually exclusive with `J2K_CUDA_PROFILE_INPUTS`. | Generated RGB8 fixture | Benchmark |
 | `J2K_CUDA_PROFILE_INPUTS` | Encoded input files or recursively scanned directories, separated by the OS path-list separator (`:` on Unix, `;` on Windows). Inputs are sorted, deduplicated, and cycled to fill the batch; all must map to the same output pixel format, but dimensions and decomposition counts may differ. Mutually exclusive with `J2K_CUDA_PROFILE_INPUT`. | Generated RGB8 fixture | Benchmark |
 | `J2K_CUDA_PROFILE_WIDTH` | Generated profile fixture width. Ignored when an input file or corpus is supplied. | 512 | Benchmark |

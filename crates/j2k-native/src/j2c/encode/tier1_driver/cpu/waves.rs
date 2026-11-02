@@ -11,7 +11,6 @@ use super::validate_ht_cpu_jobs;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
-    ParallelSlice, ParallelSliceMut,
 };
 
 pub(in crate::j2c::encode::tier1_driver) type Tier1CpuSlot =
@@ -54,10 +53,10 @@ pub(in crate::j2c::encode::tier1_driver) fn encode_ht_cpu_results_accounted(
             outer_bytes,
             workspace_owner_bytes,
         ];
-        // Charging every job's output and scratch makes this deliberately
-        // independent of Rayon scheduling. If that conservative frontier is
-        // too large, the bounded worker-sized waves below remain available.
-        if try_check_full_ht_wave(jobs, tracker, &full_fixed)? {
+        // Charging every job's output and every worker's scratch makes this
+        // independent of Rayon scheduling. If that frontier is too large, the
+        // bounded worker-sized waves below remain available.
+        if try_check_full_ht_wave(jobs, wave_size, tracker, &full_fixed)? {
             try_fill_ht_workspaces(&mut workspaces, wave_size)?;
             encode_ht_parallel_with_workspaces(jobs, &mut encoded, &mut workspaces);
             retained_payload_bytes = checked_wave_payload_bytes(
@@ -124,10 +123,11 @@ pub(in crate::j2c::encode::tier1_driver) fn encode_ht_cpu_results_accounted(
 #[cfg(any(feature = "parallel", test))]
 fn try_check_full_ht_wave(
     jobs: &[crate::J2kHtCodeBlockEncodeJob<'_>],
+    workers: usize,
     tracker: &mut Tier1PhaseTracker<'_, '_>,
     fixed_and_retained_output: &[usize],
 ) -> NativeEncodePipelineResult<bool> {
-    match check_ht_wave(jobs, tracker, fixed_and_retained_output, jobs.len()) {
+    match check_ht_wave(jobs, tracker, fixed_and_retained_output, workers) {
         Ok(_) => Ok(true),
         Err(NativeEncodePipelineError::Typed(crate::EncodeError::AllocationTooLarge {
             ..
@@ -149,9 +149,10 @@ pub(in crate::j2c::encode::tier1_driver) fn encode_classic_cpu_results_accounted
     encoded.resize_with(jobs.len(), || None);
 
     let parallel = cfg!(feature = "parallel");
-    let wave_size = cpu_worker_limit(jobs.len(), parallel).max(1);
+    let workers = cpu_worker_limit(jobs.len(), parallel).max(1);
     let mut retained_payload_bytes = 0usize;
-    for (job_wave, slot_wave) in jobs.chunks(wave_size).zip(encoded.chunks_mut(wave_size)) {
+    let mut start = 0;
+    while start < jobs.len() {
         let wave_fixed = [
             fixed[0],
             fixed[1],
@@ -160,7 +161,9 @@ pub(in crate::j2c::encode::tier1_driver) fn encode_classic_cpu_results_accounted
             outer_bytes,
             retained_payload_bytes,
         ];
-        check_classic_wave(job_wave, tracker, &wave_fixed, wave_size)?;
+        let end = start + longest_classic_wave(&jobs[start..], workers, tracker, &wave_fixed)?;
+        let (job_wave, slot_wave) = (&jobs[start..end], &mut encoded[start..end]);
+        start = end;
 
         #[cfg(feature = "parallel")]
         if parallel {
@@ -197,6 +200,30 @@ pub(in crate::j2c::encode::tier1_driver) fn encode_classic_cpu_results_accounted
     Ok(encoded)
 }
 
+/// The longest prefix of `jobs`, doubling from one block per worker, whose
+/// worst-case frontier fits the cap. Each wave ends at a barrier, so fewer and
+/// longer waves leave workers idle less often on unequal blocks and cores.
+fn longest_classic_wave(
+    jobs: &[J2kTier1CodeBlockEncodeJob<'_>],
+    workers: usize,
+    tracker: &mut Tier1PhaseTracker<'_, '_>,
+    fixed_and_retained_output: &[usize],
+) -> NativeEncodePipelineResult<usize> {
+    let mut len = workers.min(jobs.len());
+    check_classic_wave(&jobs[..len], tracker, fixed_and_retained_output, workers)?;
+    while len < jobs.len() {
+        let next = len.saturating_mul(2).min(jobs.len());
+        match check_classic_wave(&jobs[..next], tracker, fixed_and_retained_output, workers) {
+            Ok(_) => len = next,
+            Err(NativeEncodePipelineError::Typed(crate::EncodeError::AllocationTooLarge {
+                ..
+            })) => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(len)
+}
+
 fn try_fill_ht_workspaces(
     workspaces: &mut Vec<ht_block_encode::HtEncodeWorkspace>,
     count: usize,
@@ -222,13 +249,17 @@ fn encode_ht_parallel_with_workspaces(
     slots: &mut [Tier1CpuSlot],
     workspaces: &mut [ht_block_encode::HtEncodeWorkspace],
 ) {
-    let chunk_len = jobs.len().div_ceil(workspaces.len());
-    slots
-        .par_chunks_mut(chunk_len)
-        .zip(jobs.par_chunks(chunk_len))
-        .zip(workspaces.par_iter_mut())
-        .for_each(|((slot_chunk, job_chunk), workspace)| {
-            encode_ht_wave_serial(job_chunk, slot_chunk, workspace);
+    // Workers pull small batches so slower cores and denser bands do not
+    // hold the others up; one fixed chunk per worker scaled 1.9x on 10 cores.
+    let batch = (jobs.len() / (4 * workspaces.len())).clamp(1, 8);
+    let batches = std::sync::Mutex::new(slots.chunks_mut(batch).zip(jobs.chunks(batch)));
+    workspaces
+        .par_iter_mut()
+        .with_max_len(1)
+        .for_each(|workspace| {
+            while let Some((slots, jobs)) = batches.lock().ok().and_then(|mut b| b.next()) {
+                encode_ht_wave_serial(jobs, slots, workspace);
+            }
         });
 }
 
@@ -367,6 +398,40 @@ mod tests {
     }
 
     #[test]
+    fn classic_waves_double_while_their_frontier_fits_the_cap() {
+        let coefficients = [1_i32; 16];
+        let jobs = [J2kTier1CodeBlockEncodeJob {
+            coefficients: &coefficients,
+            width: 4,
+            height: 4,
+            sub_band_type: crate::J2kSubBandType::LowLow,
+            total_bitplanes: 1,
+            style: crate::j2c::encode::api_helpers::default_public_code_block_style(),
+        }; 5];
+        let worker =
+            bitplane_encode::classic_worker_allocation(4, 4, 1).expect("worker allocation");
+        // Rows: workers, blocks whose output and running scratch fit, expected wave.
+        for (workers, fitting, expected) in [
+            (1, 1, 1),
+            (1, 3, 2),
+            (1, 4, 4),
+            (1, 5, 5),
+            (2, 2, 2),
+            (2, 3, 2),
+            (2, 5, 5),
+            (5, 5, 5),
+        ] {
+            let cap = fitting * worker.output_bytes + workers.min(fitting) * worker.scratch_bytes;
+            let session = NativeEncodeSession::try_with_cap(NativeEncodeRetainedInput::none(), cap)
+                .expect("session");
+            let mut tracker = Tier1PhaseTracker::new(&session, 0);
+            let actual = longest_classic_wave(&jobs, workers, &mut tracker, &[])
+                .expect("one worker wave fits");
+            assert_eq!(actual, expected, "{workers} workers, {fitting} fitting");
+        }
+    }
+
+    #[test]
     fn full_ht_wave_falls_back_when_only_one_worker_frontier_fits() {
         let coefficients = [1_i32; 16];
         let jobs = [
@@ -393,9 +458,34 @@ mod tests {
             .expect("one-worker session");
         let mut tracker = Tier1PhaseTracker::new(&session, 0);
 
-        assert!(!try_check_full_ht_wave(&jobs, &mut tracker, &[])
+        assert!(!try_check_full_ht_wave(&jobs, 2, &mut tracker, &[])
             .expect("full-wave capacity fallback should be typed"));
         check_ht_wave(&jobs[..1], &mut tracker, &[], 1)
             .expect("one worker remains within the same cap");
+    }
+
+    #[test]
+    fn full_ht_wave_charges_every_output_but_one_scratch_per_worker() {
+        let coefficients = [1_i32; 16];
+        let jobs = [crate::J2kHtCodeBlockEncodeJob {
+            coefficients: &coefficients,
+            width: 4,
+            height: 4,
+            total_bitplanes: 1,
+            target_coding_passes: 1,
+        }; 3];
+        let worker = ht_block_encode::ht_worker_allocation(4, 4, 1).expect("worker allocation");
+        for workers in [1, 2, 3] {
+            let frontier = 3 * worker.output_bytes + workers * worker.scratch_bytes;
+            for (cap, fits) in [(frontier, true), (frontier - 1, false)] {
+                let session =
+                    NativeEncodeSession::try_with_cap(NativeEncodeRetainedInput::none(), cap)
+                        .expect("session");
+                let mut tracker = Tier1PhaseTracker::new(&session, 0);
+                let actual = try_check_full_ht_wave(&jobs, workers, &mut tracker, &[])
+                    .expect("capacity fallback should be typed");
+                assert_eq!(actual, fits, "{workers} workers, cap {cap}");
+            }
+        }
     }
 }

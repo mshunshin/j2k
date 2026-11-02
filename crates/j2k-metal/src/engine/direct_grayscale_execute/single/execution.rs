@@ -20,7 +20,7 @@ use super::super::{
     encode_prepared_ht_sub_band_to_buffer_in_encoder, extend_preallocated_retained_buffers,
     idwt_input_windows_from_slices, j2k_scalar_pack_params, lookup_direct_band_slice,
     lookup_direct_band_slice_entry, prepared_idwt_output_len, prepared_idwt_params,
-    take_f32_scratch_buffer, BandRequiredRegion, Buffer, DirectBandSlice, DirectScratchBuffer,
+    push_member_band_slices, take_f32_scratch_buffer, Buffer, DirectBandSlice, DirectScratchBuffer,
     DirectStatusCheck, Error, GrayStoreDestinationRequest, IdwtSubBandBuffers, J2kGrayStoreParams,
     J2kStoreParams, J2kWaveletTransform, MetalRuntime, PixelFormat, PreparedDirectGrayscaleStep,
     SingleIdwtDispatch, Surface,
@@ -34,12 +34,17 @@ use crate::engine::{
     PreparedDirectIdwt, PreparedHtSubBand, PreparedHtSubBandGroup,
 };
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "source signedness, rounding and destination state are independent properties"
+)]
 pub(super) struct SingleGrayscaleExecution<'a> {
     pub(super) runtime: &'a MetalRuntime,
     pub(super) encoder: &'a ComputeCommandEncoderRef,
     pub(super) fmt: PixelFormat,
     pub(super) dimensions: (u32, u32),
     pub(super) bit_depth: u8,
+    pub(super) signed: bool,
     pub(super) retained_buffers: &'a mut Vec<Buffer>,
     pub(super) status_checks: &'a mut Vec<DirectStatusCheck>,
     pub(super) scratch_buffers: &'a mut Vec<DirectScratchBuffer>,
@@ -76,20 +81,12 @@ impl SingleGrayscaleExecution<'_> {
         self.status_checks.push(status_check);
         self.encoder
             .memory_barrier_with_resources(&[&output.buffer]);
-        for member in &group.members {
-            let offset_bytes = checked_f32_span(
-                member.offset_elements,
-                1,
-                "classic J2K MetalDirect single grouped member offset",
-            )?
-            .bytes;
-            self.bands.push(DirectBandSlice {
-                band_id: member.band_id,
-                buffer: output.buffer.clone(),
-                offset_bytes,
-                window: member.window,
-            });
-        }
+        let members = group.members.iter();
+        push_member_band_slices(
+            &mut self.bands,
+            &output.buffer,
+            members.map(|member| (member.band_id, member.offset_elements, member.window)),
+        )?;
         self.scratch_buffers.push(output);
         Ok(())
     }
@@ -105,26 +102,19 @@ impl SingleGrayscaleExecution<'_> {
             self.runtime,
             self.encoder,
             group,
+            &group.zero_rects,
             &output.buffer,
         )?;
         extend_preallocated_retained_buffers(self.retained_buffers, buffers)?;
         self.status_checks.push(status_check);
         self.encoder
             .memory_barrier_with_resources(&[&output.buffer]);
-        for member in &group.members {
-            let offset_bytes = checked_f32_span(
-                member.offset_elements,
-                1,
-                "HTJ2K MetalDirect single grouped member offset",
-            )?
-            .bytes;
-            self.bands.push(DirectBandSlice {
-                band_id: member.band_id,
-                buffer: output.buffer.clone(),
-                offset_bytes,
-                window: member.window,
-            });
-        }
+        let members = group.members.iter();
+        push_member_band_slices(
+            &mut self.bands,
+            &output.buffer,
+            members.map(|member| (member.band_id, member.offset_elements, member.window)),
+        )?;
         self.scratch_buffers.push(output);
         Ok(())
     }
@@ -151,7 +141,7 @@ impl SingleGrayscaleExecution<'_> {
             band_id: sub_band.band_id,
             buffer: output.buffer.clone(),
             offset_bytes: 0,
-            window: BandRequiredRegion::full(sub_band.width, sub_band.height),
+            window: sub_band.window(),
         });
         self.scratch_buffers.push(output);
         Ok(())
@@ -178,7 +168,7 @@ impl SingleGrayscaleExecution<'_> {
             band_id: sub_band.band_id,
             buffer: output.buffer.clone(),
             offset_bytes: 0,
-            window: BandRequiredRegion::full(sub_band.width, sub_band.height),
+            window: sub_band.window(),
         });
         self.scratch_buffers.push(output);
         Ok(())
@@ -306,7 +296,7 @@ impl SingleGrayscaleExecution<'_> {
         store: &J2kDirectStoreStep,
     ) -> (J2kGrayStoreParams, GraySourceSigning) {
         let scale = j2k_scalar_pack_params(u32::from(self.bit_depth));
-        let signing = GraySourceSigning::for_store(self.fmt, self.bit_depth, store.addend);
+        let signing = GraySourceSigning::for_source(self.fmt, self.bit_depth, self.signed);
         let max_value =
             if self.fmt == PixelFormat::GrayI16 || signing != GraySourceSigning::Unsigned {
                 crate::engine::decode_dispatch::store::signed_store_max_value(self.bit_depth)
@@ -413,6 +403,7 @@ impl SingleGrayscaleExecution<'_> {
             &output.buffer,
             self.dimensions,
             self.bit_depth,
+            self.signed,
             self.fmt,
         )?);
         self.scratch_buffers.push(output);

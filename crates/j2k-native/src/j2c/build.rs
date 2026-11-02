@@ -2,22 +2,27 @@
 
 use super::decode::{DecompositionStorage, TileDecompositions};
 use super::rect::IntRect;
-use super::tag_tree::TagTree;
+use super::roi::RoiPlan;
+use super::tag_tree::{TagNode, TagTree};
 use super::tile::{ResolutionTile, Tile};
 use crate::error::{DecodingError, Result, ValidationError};
-use crate::try_resize_decode_elements;
+use crate::{try_resize_decode_elements, try_zero_fill_decode_elements};
 use core::{iter, ops::Range};
 
 mod allocation;
 mod selection;
 pub(crate) use allocation::{
-    allocate_deferred_coefficients, release_unused_roi_workspace, BuildWorkspace, CoefficientLayout,
+    allocate_deferred_coefficients, lay_out_whole_region_coefficients,
+    release_unused_roi_workspace, BuildWorkspace, CoefficientLayout,
 };
 use allocation::{
     code_block_grid, prepare_decomposition_storage, push_preallocated, tag_tree_node_count,
     DecompositionAllocationPlan,
 };
-pub(crate) use selection::{select_region_precincts, PrecinctSelection, PrecinctUse};
+pub(in crate::j2c) use allocation::{global_code_block_count, IdwtWorkspaceTracker, RecordCounts};
+pub(crate) use selection::{
+    select_region_precincts, select_whole_image_precincts, PrecinctSelection, PrecinctUse,
+};
 
 /// Build and allocate all necessary structures to process the code-blocks
 /// for a specific tile. Also parses the segments for each code-block.
@@ -39,10 +44,6 @@ pub(crate) fn build(
     )
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one pass builds each component's sub-band, precinct, and coefficient ranges in decode order"
-)]
 fn build_decompositions(
     tile: &Tile<'_>,
     storage: &mut DecompositionStorage<'_>,
@@ -64,6 +65,41 @@ fn build_decompositions(
         selection,
     )?;
     resize_planned_coefficients(storage, &plan)?;
+    // Building reads the ROI plan while it fills the rest of storage, so it
+    // is held aside until the components are built.
+    let roi_plan = storage.roi_plan.take();
+    let built = build_components(
+        tile,
+        storage,
+        &plan,
+        workspace,
+        selection,
+        selection.and(roi_plan.as_ref()),
+    );
+    storage.roi_plan = roi_plan;
+    let coefficient_extent = built?;
+    build_scratch_precincts(storage, &plan)?;
+
+    validate_built_storage(&plan, storage, coefficient_extent)?;
+    storage.structural_workspace_bytes = plan.total_bytes;
+    Ok(())
+}
+
+/// Build each component's sub-bands, precincts and code-blocks in decode
+/// order, and return the end of the furthest coefficient range. With
+/// `roi_plan`, only the code-blocks it requires get layer records.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass builds each component's sub-band, precinct, and coefficient ranges in decode order"
+)]
+fn build_components(
+    tile: &Tile<'_>,
+    storage: &mut DecompositionStorage<'_>,
+    plan: &DecompositionAllocationPlan,
+    workspace: BuildWorkspace,
+    selection: Option<&PrecinctSelection>,
+    roi_plan: Option<&RoiPlan>,
+) -> Result<usize> {
     let coefficient_layout = workspace.coefficient_layout();
     storage.coefficient_layout = coefficient_layout;
     let mut coefficient_counter = 0usize;
@@ -72,6 +108,7 @@ fn build_decompositions(
     // Index of the current (component, resolution) in build order, for the
     // precinct selection.
     let mut resolution_run = 0usize;
+    let parsed_in_scratch = selection.is_some_and(PrecinctSelection::parsed_in_scratch);
 
     for (component_idx, component_tile) in tile.component_tiles().enumerate() {
         if coefficient_layout == CoefficientLayout::Component {
@@ -106,7 +143,15 @@ fn build_decompositions(
             );
 
             let keep = selected_precincts(selection, run)?;
-            let precincts = build_precincts(resolution_tile, sub_band_rect, tile, keep, storage)?;
+            let precincts = build_precincts(
+                resolution_tile,
+                sub_band_rect,
+                tile,
+                keep,
+                parsed_in_scratch,
+                roi_plan,
+                storage,
+            )?;
 
             let added_coefficients = (sub_band_rect.width() as usize)
                 .checked_mul(sub_band_rect.height() as usize)
@@ -173,20 +218,14 @@ fn build_decompositions(
         )?;
     }
 
-    validate_built_storage(&plan, storage, coefficient_extent)?;
-    storage.structural_workspace_bytes = plan.total_bytes;
-    Ok(())
+    Ok(coefficient_extent)
 }
 
 fn resize_planned_coefficients(
     storage: &mut DecompositionStorage<'_>,
     plan: &DecompositionAllocationPlan,
 ) -> Result<()> {
-    try_resize_decode_elements(
-        &mut storage.coefficients,
-        plan.coefficient_storage_len(),
-        0.0,
-    )?;
+    try_zero_fill_decode_elements(&mut storage.coefficients, plan.coefficient_storage_len())?;
     if storage.exact_integer_decode {
         try_resize_decode_elements(
             &mut storage.coefficients_i64,
@@ -253,32 +292,53 @@ fn build_precincts(
     sub_band_rect: IntRect,
     tile: &Tile<'_>,
     keep: Option<&[PrecinctUse]>,
+    parsed_in_scratch: bool,
+    roi_plan: Option<&RoiPlan>,
     storage: &mut DecompositionStorage<'_>,
 ) -> Result<Range<usize>> {
     let start = storage.precincts.len();
+    // The sub-band is pushed after its precincts, at this index.
+    let sub_band_idx = storage.sub_bands.len();
+    let required =
+        |rect: IntRect| roi_plan.is_none_or(|plan| plan.code_block_required(sub_band_idx, rect));
 
-    for (precinct_idx, precinct_data) in resolution_tile
-        .precincts()
-        .ok_or(DecodingError::InvalidPrecinct)?
-        .enumerate()
-    {
-        let mut grid = code_block_grid(resolution_tile, sub_band_rect, precinct_data.rect)?;
-        if keep.is_some_and(|keep| {
-            keep.get(precinct_idx)
-                .is_some_and(|precinct_use| !precinct_use.is_built())
-        }) {
-            // Region decode never parses this precinct's packets: build it
-            // with no code-blocks and root-only tag trees.
-            grid.columns = 0;
-            grid.rows = 0;
+    let precincts = resolution_tile
+        .precinct_grid()
+        .ok_or(DecodingError::InvalidPrecinct)?;
+    let precinct_count = usize::try_from(resolution_tile.num_precincts())
+        .map_err(|_| ValidationError::ImageTooLarge)?;
+    for precinct_idx in 0..precinct_count {
+        let precinct_use = keep.and_then(|keep| keep.get(precinct_idx).copied());
+        if precinct_use == Some(PrecinctUse::Unused) {
+            // Region decode never parses this precinct's packets, so it gets
+            // no record. The parser finds the others through the selection.
+            continue;
+        }
+        let precinct_rect = precincts
+            .rect_at(precinct_idx)
+            .ok_or(DecodingError::InvalidPrecinct)?;
+        let grid = code_block_grid(resolution_tile, sub_band_rect, precinct_rect)?;
+        if precinct_use == Some(PrecinctUse::Parsed) && parsed_in_scratch {
+            // Its packets are parsed in a scratch precinct, which only needs
+            // its code-block grid.
+            let start = storage.code_blocks.len();
+            push_preallocated(
+                &mut storage.precincts,
+                Precinct {
+                    code_blocks: start..start,
+                    code_inclusion_tree: TagTree::unplaced(grid.columns, grid.rows),
+                    zero_bitplane_tree: TagTree::unplaced(grid.columns, grid.rows),
+                },
+            )?;
+            continue;
         }
 
         ltrace!(
             "Precinct rect: [{},{} {}x{}], num_code_blocks_wide: {}, num_code_blocks_high: {}",
-            precinct_data.rect.x0,
-            precinct_data.rect.y0,
-            precinct_data.rect.width(),
-            precinct_data.rect.height(),
+            precinct_rect.x0,
+            precinct_rect.y0,
+            precinct_rect.width(),
+            precinct_rect.height(),
             grid.columns,
             grid.rows
         );
@@ -290,6 +350,7 @@ fn build_precincts(
             grid.columns,
             grid.rows,
             tile,
+            &required,
             storage,
         )?;
 
@@ -323,6 +384,12 @@ fn build_precincts(
     Ok(start..end)
 }
 
+/// Build a precinct's code-blocks. Only those `required` keeps get layer
+/// records: packet parsing reads the others' contributions only to skip them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the code-block grid, its tile, and the region filter stay explicit beside the storage they fill"
+)]
 fn build_code_blocks(
     code_block_area: IntRect,
     sub_band_rect: IntRect,
@@ -330,6 +397,7 @@ fn build_code_blocks(
     code_blocks_x: u32,
     code_blocks_y: u32,
     tile: &Tile<'_>,
+    required: &dyn Fn(IntRect) -> bool,
     storage: &mut DecompositionStorage<'_>,
 ) -> Result<Range<usize>> {
     let mut y = code_block_area.y0;
@@ -347,8 +415,13 @@ fn build_code_blocks(
             // the sub-band coefficients. When this happens, only the
             // coefficients lying within the sub-band are coded using the method
             // described in Annex D."
-            let area = IntRect::from_xywh(x, y, code_block_width, code_block_height)
-                .intersect(sub_band_rect);
+            let area = IntRect::from_ltrb(
+                x,
+                y,
+                x.saturating_add(code_block_width),
+                y.saturating_add(code_block_height),
+            )
+            .intersect(sub_band_rect);
 
             ltrace!(
                 "Codeblock rect: [{},{} {}x{}]",
@@ -359,51 +432,42 @@ fn build_code_blocks(
             );
 
             let start = storage.layers.len();
+            let layer_count = if required(area) {
+                usize::from(tile.num_layers)
+            } else {
+                0
+            };
             let end = start
-                .checked_add(usize::from(tile.num_layers))
+                .checked_add(layer_count)
                 .ok_or(ValidationError::ImageTooLarge)?;
             if end > storage.layers.capacity() {
                 return Err(DecodingError::HostAllocationFailed.into());
             }
-            storage.layers.extend(iter::repeat_n(
-                Layer {
-                    // This will be updated once we actually read the
-                    // layer segments.
-                    segments: None,
-                },
-                tile.num_layers as usize,
-            ));
+            // Each layer is updated once its packet's segments are read.
+            storage
+                .layers
+                .extend(iter::repeat_n(Layer::UNREAD, layer_count));
             if storage.layers.len() != end {
                 return Err(DecodingError::InvalidPrecinct.into());
             }
 
             push_preallocated(
                 &mut storage.code_blocks,
-                CodeBlock {
-                    x_idx,
-                    y_idx,
-                    rect: area,
-                    has_been_included: false,
-                    missing_bit_planes: 0,
-                    l_block: 3,
-                    number_of_coding_passes: 0,
-                    ht_total_coding_passes: 0,
-                    ht_first_cleanup_pass: None,
-                    ht_selected_set: None,
-                    coding: None,
-                    layers: start..end,
-                    non_empty_layer_count: 0,
-                },
+                CodeBlock::new(area, x_idx, y_idx, start..end),
             )?;
 
-            x = x
-                .checked_add(code_block_width)
-                .ok_or(ValidationError::ImageTooLarge)?;
+            if x_idx + 1 < code_blocks_x {
+                x = x
+                    .checked_add(code_block_width)
+                    .ok_or(ValidationError::ImageTooLarge)?;
+            }
         }
 
-        y = y
-            .checked_add(code_block_height)
-            .ok_or(ValidationError::ImageTooLarge)?;
+        if y_idx + 1 < code_blocks_y {
+            y = y
+                .checked_add(code_block_height)
+                .ok_or(ValidationError::ImageTooLarge)?;
+        }
     }
 
     let end = storage.code_blocks.len();
@@ -456,7 +520,9 @@ pub(crate) struct PrecinctData {
     /// The y coordinate mapped back to the reference grid.
     pub(crate) r_y: u32,
     /// The actual rectangle of the precinct (in the sub-band coordinate
-    /// system).
+    /// system). Decodes ask `PrecinctGrid::rect_at` for the rectangles they
+    /// need; tests check the two agree.
+    #[cfg(test)]
     pub(crate) rect: IntRect,
     /// The index of the precinct in the sub-band.
     pub(crate) idx: u64,
@@ -489,6 +555,183 @@ pub(crate) struct CodeBlock {
     pub(crate) non_empty_layer_count: u8,
 }
 
+impl CodeBlock {
+    /// A code-block before any packet has included it.
+    fn new(rect: IntRect, x_idx: u32, y_idx: u32, layers: Range<usize>) -> Self {
+        Self {
+            x_idx,
+            y_idx,
+            rect,
+            has_been_included: false,
+            missing_bit_planes: 0,
+            l_block: 3,
+            number_of_coding_passes: 0,
+            ht_total_coding_passes: 0,
+            ht_first_cleanup_pass: None,
+            ht_selected_set: None,
+            coding: None,
+            layers,
+            non_empty_layer_count: 0,
+        }
+    }
+}
+
+/// Scratch precincts a region decode's parsed-only precincts borrow, one per
+/// sub-band of a packet, at the end of the code-block and tag-tree storage.
+///
+/// In progressions that read all of a precinct's layers in a row, a
+/// precinct whose code-blocks the region doesn't use is parsed only to reach
+/// later packets, and its parsing state is dead after its last packet. Such
+/// precincts are built with no code-blocks or tag-tree nodes, and while their
+/// packets are parsed, they borrow a scratch precinct, which starts afresh for
+/// each. After parsing, every precinct has given its scratch back.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ParseScratch {
+    /// The first code-block of each scratch precinct.
+    code_block_start: [usize; SCRATCH_PRECINCTS],
+    /// Code-blocks per scratch precinct.
+    code_blocks: [usize; SCRATCH_PRECINCTS],
+    /// The first tag-tree node of each scratch precinct.
+    node_start: [usize; SCRATCH_PRECINCTS],
+    /// Tag-tree nodes per scratch precinct, for both of its trees.
+    nodes: [usize; SCRATCH_PRECINCTS],
+    /// The precinct, as an index into the storage's precincts, that borrows
+    /// each scratch precinct.
+    borrowers: [Option<usize>; SCRATCH_PRECINCTS],
+}
+
+/// One scratch precinct per sub-band of a packet.
+pub(crate) const SCRATCH_PRECINCTS: usize = 3;
+
+impl ParseScratch {
+    /// Lend scratch precinct `slot` to `precinct`, unless it already has it.
+    /// The precinct that held it gives it back, and its state is gone, so
+    /// a precinct can only borrow scratch for its first packet, at `layer` 0.
+    pub(crate) fn lend(
+        &mut self,
+        slot: usize,
+        precinct: usize,
+        layer: u8,
+        precincts: &mut [Precinct],
+        code_blocks: &mut [CodeBlock],
+        tag_tree_nodes: &mut [TagNode],
+    ) -> Option<()> {
+        let borrower = self.borrowers.get_mut(slot)?;
+        if *borrower == Some(precinct) {
+            return Some(());
+        }
+        if layer != 0 {
+            return None;
+        }
+        if let Some(previous) = borrower.take() {
+            give_back(precincts.get_mut(previous)?, self.code_block_start[slot]);
+        }
+
+        let target = precincts.get_mut(precinct)?;
+        let columns = target.code_inclusion_tree.width();
+        let count = (columns as usize).checked_mul(target.code_inclusion_tree.height() as usize)?;
+        let inclusion_nodes = target.code_inclusion_tree.node_count();
+        let zero_bitplane_nodes = target.zero_bitplane_tree.node_count();
+        if count > self.code_blocks[slot]
+            || inclusion_nodes.checked_add(zero_bitplane_nodes)? > self.nodes[slot]
+        {
+            return None;
+        }
+        let start = self.code_block_start[slot];
+        let blocks = code_blocks.get_mut(start..start.checked_add(count)?)?;
+        // A rectangle that meets no window: no scratch code-block is read.
+        let unread = IntRect::from_ltrb(0, 0, 0, 0);
+        // Row-major over the grid: code-block `index` sits at
+        // (`index % columns`, `index / columns`).
+        if columns != 0 {
+            for (row, y_idx) in blocks.chunks_exact_mut(columns as usize).zip(0u32..) {
+                for (block, x_idx) in row.iter_mut().zip(0u32..) {
+                    *block = CodeBlock::new(unread, x_idx, y_idx, 0..0);
+                }
+            }
+        }
+        let root = self.node_start[slot];
+        target
+            .code_inclusion_tree
+            .place(root, inclusion_nodes, tag_tree_nodes)?;
+        target.zero_bitplane_tree.place(
+            root.checked_add(inclusion_nodes)?,
+            zero_bitplane_nodes,
+            tag_tree_nodes,
+        )?;
+        target.code_blocks = start..start + count;
+        *borrower = Some(precinct);
+        Some(())
+    }
+
+    /// Have every borrowing precinct give its scratch back.
+    pub(crate) fn give_all_back(&mut self, precincts: &mut [Precinct]) {
+        for (slot, borrower) in self.borrowers.iter_mut().enumerate() {
+            if let Some(precinct) = borrower.take().and_then(|index| precincts.get_mut(index)) {
+                give_back(precinct, self.code_block_start[slot]);
+            }
+        }
+    }
+
+    /// The most code-blocks a borrowing precinct can have.
+    pub(crate) fn code_blocks(&self) -> usize {
+        self.code_blocks.iter().copied().max().unwrap_or(0)
+    }
+}
+
+/// Leave `precinct` with no code-blocks and unplaced tag trees, as built.
+fn give_back(precinct: &mut Precinct, code_block_start: usize) {
+    precinct.code_blocks = code_block_start..code_block_start;
+    precinct.code_inclusion_tree.unplace();
+    precinct.zero_bitplane_tree.unplace();
+}
+
+/// Append the scratch precincts the plan sized, when precincts are parsed in
+/// scratch.
+fn build_scratch_precincts(
+    storage: &mut DecompositionStorage<'_>,
+    plan: &DecompositionAllocationPlan,
+) -> Result<()> {
+    storage.parse_scratch = None;
+    if plan.scratch_tree_nodes == [0; SCRATCH_PRECINCTS] {
+        return Ok(());
+    }
+    let mut code_block_start = [0; SCRATCH_PRECINCTS];
+    let mut node_start = [0; SCRATCH_PRECINCTS];
+    let mut nodes = [0; SCRATCH_PRECINCTS];
+    let mut code_block_end = storage.code_blocks.len();
+    let mut node_end = storage.tag_tree_nodes.len();
+    for slot in 0..SCRATCH_PRECINCTS {
+        code_block_start[slot] = code_block_end;
+        node_start[slot] = node_end;
+        nodes[slot] = plan.scratch_tree_nodes[slot]
+            .checked_mul(2)
+            .ok_or(ValidationError::ImageTooLarge)?;
+        code_block_end = code_block_end
+            .checked_add(plan.scratch_code_blocks[slot])
+            .ok_or(ValidationError::ImageTooLarge)?;
+        node_end = node_end
+            .checked_add(nodes[slot])
+            .ok_or(ValidationError::ImageTooLarge)?;
+    }
+    if code_block_end > storage.code_blocks.capacity()
+        || node_end > storage.tag_tree_nodes.capacity()
+    {
+        return Err(DecodingError::HostAllocationFailed.into());
+    }
+    let unread = CodeBlock::new(IntRect::from_ltrb(0, 0, 0, 0), 0, 0, 0..0);
+    storage.code_blocks.resize(code_block_end, unread);
+    storage.tag_tree_nodes.resize(node_end, TagNode::default());
+    storage.parse_scratch = Some(ParseScratch {
+        code_block_start,
+        code_blocks: plan.scratch_code_blocks,
+        node_start,
+        nodes,
+        borrowers: [None; SCRATCH_PRECINCTS],
+    });
+    Ok(())
+}
+
 pub(crate) struct Segment<'a> {
     pub(crate) idx: u8,
     pub(crate) coding_pases: u8,
@@ -496,7 +739,42 @@ pub(crate) struct Segment<'a> {
     pub(crate) data: &'a [u8],
 }
 
-#[derive(Clone)]
+/// The segments one layer of a code-block contributed: a range of the
+/// tile's segment records, once the layer's packet has been read. A tile
+/// holds one per layer of every code-block, so it is kept to 8 bytes.
+#[derive(Clone, Copy)]
 pub(crate) struct Layer {
-    pub(crate) segments: Option<Range<usize>>,
+    start: u32,
+    /// The range's length, or [`Layer::UNREAD_LEN`] before the packet is
+    /// read.
+    len: u32,
+}
+
+impl Layer {
+    const UNREAD_LEN: u32 = u32::MAX;
+
+    /// A layer whose packet has not been read.
+    pub(crate) const UNREAD: Self = Self {
+        start: 0,
+        len: Self::UNREAD_LEN,
+    };
+
+    /// A layer that contributed the segments `range`, or `None` when the
+    /// range does not fit the record.
+    pub(crate) fn with_segments(range: Range<usize>) -> Option<Self> {
+        let start = u32::try_from(range.start).ok()?;
+        let len = u32::try_from(range.end.checked_sub(range.start)?)
+            .ok()
+            .filter(|len| *len != Self::UNREAD_LEN)?;
+        start.checked_add(len)?;
+        Some(Self { start, len })
+    }
+
+    /// The segments the layer contributed, once its packet has been read.
+    pub(crate) fn segments(self) -> Option<Range<usize>> {
+        (self.len != Self::UNREAD_LEN).then(|| {
+            let start = self.start as usize;
+            start..start + self.len as usize
+        })
+    }
 }

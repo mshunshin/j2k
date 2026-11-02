@@ -146,10 +146,9 @@ pub struct J2kLosslessEncodeOptions {
     pub max_decomposition_levels: Option<u8>,
     /// Optional tile width and height.
     ///
-    /// Tile origins must sit on the wavelet, code-block, and precinct grids.
-    /// Without component subsampling, power-of-two tile sizes at least as
-    /// large as the code-block size always qualify. Other grids are rejected
-    /// as unsupported.
+    /// Tile dimensions need not align with the wavelet, code-block, or precinct
+    /// grids. Tiles retain their absolute component origins during encoding;
+    /// the smallest edge tile still caps the effective decomposition depth.
     pub tile_size: Option<(u32, u32)>,
     /// Optional maximum number of complete packets to place in each tile-part.
     pub tile_part_packet_limit: Option<u16>,
@@ -355,7 +354,7 @@ pub enum J2kRateTarget {
     BitsPerPixel(f64),
     /// Target total codestream byte size.
     Bytes(u64),
-    /// Target decoded peak signal-to-noise ratio in dB.
+    /// Minimum decoded peak signal-to-noise ratio in dB, within the configured tolerance.
     PsnrDb(f64),
 }
 
@@ -418,14 +417,20 @@ pub struct J2kLossyEncodeOptions {
     /// Positive irreversible step multipliers per component, in QCD/QCC order:
     /// final LL, then HL/LH/HH from coarsest to finest detail resolution.
     /// Each row must match the actual decomposition count selected for the image.
-    /// A common rate-search scale multiplies the fixed profile shape.
+    /// An active profile weights the unrounded nominal steps. Each weighted
+    /// step must round to a representable QCD/QCC tuple. An exact all-ones
+    /// profile disables weighting, preserving no-profile bytes even when the
+    /// nominal defaults saturate. Nearby non-neutral weights can therefore be
+    /// rejected at a clipped default (for example precision 30, weight 1.01).
+    /// Rate search keeps this shape fixed and resolves both scale bounds from
+    /// every band, starting at the first admissible scale at or above one.
+    /// Fixed-scale encoding rejects out-of-range active profiles.
     pub quantization_profile: Option<Vec<Vec<f32>>>,
     /// Optional tile width and height.
     ///
-    /// Tile origins must sit on the wavelet, code-block, and precinct grids.
-    /// Without component subsampling, power-of-two tile sizes at least as
-    /// large as the code-block size always qualify. Other grids are rejected
-    /// as unsupported.
+    /// Tile dimensions need not align with the wavelet, code-block, or precinct
+    /// grids. Tiles retain their absolute component origins during encoding;
+    /// the smallest edge tile still caps the effective decomposition depth.
     pub tile_size: Option<(u32, u32)>,
     /// Optional maximum number of complete packets to place in each tile-part.
     pub tile_part_packet_limit: Option<u16>,

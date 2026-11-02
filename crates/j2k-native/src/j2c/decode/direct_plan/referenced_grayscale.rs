@@ -5,11 +5,11 @@
 use super::{
     append_classic_payload_records, append_retained_records, bail,
     build_direct_grayscale_tile_plan, grayscale_plan_rects, output_region_rect,
-    payload_record_span, referenced_output_region, strip_classic_payload_owners, tile,
-    tile_intersects_output, validate_grayscale_tile, validate_ht_payload_records, BitReader,
-    ClassicPayloadCollector, DecodeAllocationBudget, DecoderContext, DecodingError, Header,
-    J2kReferencedClassicPlan, J2kReferencedHtj2kPlan, J2kReferencedTileGeometry,
-    J2kReferencedTilePlan, Result, ValidationError, Vec,
+    payload_record_span, referenced_output_region, reject_grayscale_mct,
+    strip_classic_payload_owners, tile, tile_intersects_output, validate_grayscale_tile,
+    validate_ht_payload_records, BitReader, ClassicPayloadCollector, DecodeAllocationBudget,
+    DecoderContext, DecodingError, Header, J2kReferencedClassicPlan, J2kReferencedHtj2kPlan,
+    J2kReferencedTileGeometry, J2kReferencedTilePlan, Result, ValidationError, Vec,
 };
 
 pub(crate) fn build_referenced_htj2k_grayscale_plan<'a>(
@@ -66,9 +66,13 @@ pub(crate) fn build_referenced_htj2k_grayscale_plan<'a>(
             if classic_job_count != tile_classic_payloads.len() {
                 bail!(DecodingError::CodeBlockDecodeFailure);
             }
+            let Some((decoded_rect, destination_rect)) =
+                grayscale_plan_rects(&geometry, output_rect)?
+            else {
+                continue;
+            };
             append_retained_records(&mut retained, &mut payloads, &mut tile_payloads)?;
             let payload_records = payload_record_span(first_record, record_count)?;
-            let (decoded_rect, destination_rect) = grayscale_plan_rects(&geometry, output_rect)?;
             tile_plans.push(J2kReferencedTilePlan::new(
                 usize::try_from(tile.idx).map_err(|_| ValidationError::ImageTooLarge)?,
                 decoded_rect,
@@ -80,6 +84,7 @@ pub(crate) fn build_referenced_htj2k_grayscale_plan<'a>(
                 J2kReferencedTileGeometry::Grayscale(geometry),
             ));
         }
+        reject_grayscale_mct(&parsed_tiles, header)?;
 
         Ok(J2kReferencedHtj2kPlan::grayscale(
             tile_plans,
@@ -143,6 +148,11 @@ pub(crate) fn build_referenced_classic_grayscale_plan<'a>(
             if job_count != tile_payloads.len() {
                 bail!(DecodingError::CodeBlockDecodeFailure);
             }
+            let Some((decoded_rect, destination_rect)) =
+                grayscale_plan_rects(&geometry, output_rect)?
+            else {
+                continue;
+            };
             append_classic_payload_records(
                 &mut payloads,
                 &mut ranges,
@@ -150,7 +160,6 @@ pub(crate) fn build_referenced_classic_grayscale_plan<'a>(
                 &mut tile_ranges,
             )?;
             let payload_records = payload_record_span(first_record, job_count)?;
-            let (decoded_rect, destination_rect) = grayscale_plan_rects(&geometry, output_rect)?;
             tile_plans.push(J2kReferencedTilePlan::new(
                 usize::try_from(tile.idx).map_err(|_| ValidationError::ImageTooLarge)?,
                 decoded_rect,
@@ -162,6 +171,7 @@ pub(crate) fn build_referenced_classic_grayscale_plan<'a>(
                 J2kReferencedTileGeometry::Grayscale(geometry),
             ));
         }
+        reject_grayscale_mct(&parsed_tiles, header)?;
 
         Ok(J2kReferencedClassicPlan::grayscale(
             tile_plans,

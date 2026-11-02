@@ -11,10 +11,110 @@ use j2k::{
     DecodeRequest, Downscale, EncodedImage, J2kBlockCodingMode, J2kEncodeValidation,
     J2kLosslessEncodeOptions, J2kLosslessSamples, Rect,
 };
-use j2k_ml::{BurnBatchTensor, CudaUploadBurnDecoder};
+use j2k_ml::{BurnBatchTensor, CudaDirectBurnDecoder, CudaUploadBurnDecoder};
 use j2k_test_support::{
     cuda_runtime_and_strict_oxide_gate, htj2k_gray8_large_fixture, OpenJphBatchFixture,
 };
+
+#[test]
+fn direct_cuda_batch_is_burn_consumable_without_decoded_pixel_readback() {
+    if !cuda_runtime_and_strict_oxide_gate("j2k-ml direct CUDA-to-Burn batch") {
+        return;
+    }
+    let (width, height) = (19_u32, 13_u32);
+    let encode_distinct = |seed: u32| {
+        let pixels = (0_u32..width * height * 3)
+            .map(|value| ((value * 73 + seed * 41 + 19) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        encode_j2k_lossless(
+            J2kLosslessSamples::new(&pixels, width, height, 3, 8, false)
+                .expect("valid generated RGB8 samples"),
+            &J2kLosslessEncodeOptions::default()
+                .with_block_coding_mode(J2kBlockCodingMode::HighThroughput)
+                .with_validation(J2kEncodeValidation::External),
+        )
+        .expect("encode distinct RGB8 fixture")
+        .codestream
+    };
+    let mut decoder =
+        CudaDirectBurnDecoder::new(CudaDevice::default(), BatchDecodeOptions::default());
+    let prepared = decoder
+        .prepare(vec![
+            EncodedImage::full(Arc::from(encode_distinct(0))),
+            EncodedImage::full(Arc::from(encode_distinct(1))),
+        ])
+        .expect("prepare direct CUDA batch");
+    let expected = match CpuBatchDecoder::new(BatchDecodeOptions::default())
+        .decode_prepared(&prepared)
+        .expect("decode direct batch CPU oracle")
+        .groups()[0]
+        .samples()
+    {
+        CpuBatchSamples::U8(samples) => samples.clone(),
+        other => panic!("unexpected direct RGB8 oracle type: {other:?}"),
+    };
+
+    drop(
+        decoder
+            .decode_prepared(&prepared)
+            .expect("warm direct CUDA batch"),
+    );
+    let before = decoder
+        .codec()
+        .diagnostics()
+        .expect("direct CUDA diagnostics before measured decode")
+        .runtime
+        .expect("direct CUDA runtime initialized");
+    let output = decoder
+        .decode_prepared(&prepared)
+        .expect("decode directly into Burn CUDA storage");
+    let after = decoder
+        .codec()
+        .diagnostics()
+        .expect("direct CUDA diagnostics after measured decode")
+        .runtime
+        .expect("direct CUDA runtime remains initialized");
+
+    assert!(output.errors().is_empty());
+    assert!(output.group_errors().is_empty());
+    assert_eq!(
+        after.device_to_host_operations - before.device_to_host_operations,
+        after.status_device_to_host_operations - before.status_device_to_host_operations,
+        "the direct path may read codec status, but not decoded pixels"
+    );
+    assert_eq!(
+        after.device_to_host_bytes - before.device_to_host_bytes,
+        after.status_device_to_host_bytes - before.status_device_to_host_bytes,
+        "all codec D2H bytes must belong to status validation"
+    );
+    drop(decoder);
+
+    let BurnBatchTensor::U8(tensor) = output
+        .into_groups()
+        .into_iter()
+        .next()
+        .unwrap()
+        .into_tensor()
+    else {
+        panic!("expected direct native U8 Burn tensor")
+    };
+    assert_eq!(tensor.dims(), [2, 3, height as usize, width as usize,]);
+    let normalized = tensor
+        .clone()
+        .float()
+        .div_scalar(255.0)
+        .into_data()
+        .into_vec::<f32>()
+        .expect("downstream Burn CUDA operation");
+    let values = tensor
+        .into_data()
+        .into_vec::<u8>()
+        .expect("direct CUDA Burn data");
+    assert_eq!(values, expected);
+    for (actual, sample) in normalized.iter().zip(&values) {
+        assert!((actual - f32::from(*sample) / 255.0).abs() <= f32::EPSILON);
+    }
+}
 
 #[test]
 fn staged_cuda_batch_writes_exact_u8_pixels_and_reuses_the_session() {
@@ -35,8 +135,13 @@ fn staged_cuda_batch_writes_exact_u8_pixels_and_reuses_the_session() {
         let burn_batch = decoder
             .decode_prepared(&prepared)
             .expect("submit prepared CUDA batch");
-        assert_eq!(burn_batch.errors, [] as [j2k::IndexedBatchError; 0]);
-        let BurnBatchTensor::U8(tensor) = burn_batch.groups.into_iter().next().unwrap().tensor
+        assert!(burn_batch.errors().is_empty());
+        let BurnBatchTensor::U8(tensor) = burn_batch
+            .into_groups()
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_tensor()
         else {
             panic!("expected U8 tensor")
         };
@@ -87,11 +192,11 @@ fn staged_cuda_preserves_native_u16_and_i16_samples() {
             .decode(vec![EncodedImage::full(Arc::from(encoded))])
             .expect("decode native CUDA type");
         let tensor = burn_batch
-            .groups
+            .into_groups()
             .into_iter()
             .next()
             .unwrap()
-            .tensor
+            .into_tensor()
             .into_tensor();
         assert_eq!(tensor.dtype(), dtype);
         let data = tensor.into_data();
@@ -138,11 +243,11 @@ fn staged_cuda_supports_roi_and_reduction_with_explicit_host_staging() {
         )])
         .expect("decode CUDA ROI reduction");
     let tensor = burn_batch
-        .groups
+        .into_groups()
         .into_iter()
         .next()
         .unwrap()
-        .tensor
+        .into_tensor()
         .into_tensor();
     assert_eq!(tensor.dims(), [1, 1, 12, 16]);
 }
@@ -169,9 +274,10 @@ fn staged_cuda_rgb_preserves_subnative_codes_and_burn_layout() {
     ];
 
     for layout in [BatchLayout::Nhwc, BatchLayout::Nchw] {
-        let options = BatchDecodeOptions {
-            layout,
-            ..BatchDecodeOptions::default()
+        let options = {
+            let mut options = BatchDecodeOptions::default();
+            options.layout = layout;
+            options
         };
         let mut decoder = CudaUploadBurnDecoder::new(CudaDevice::default(), options);
         let mut cpu = CpuBatchDecoder::new(options);
@@ -194,11 +300,11 @@ fn staged_cuda_rgb_preserves_subnative_codes_and_burn_layout() {
                 .decode_prepared(&prepared)
                 .expect("decode exact RGB through staged Burn upload");
             let group = burn_batch
-                .groups
+                .into_groups()
                 .into_iter()
                 .next()
                 .expect("Burn RGB group");
-            let tensor = group.tensor.into_tensor();
+            let tensor = group.into_tensor().into_tensor();
             assert_eq!(tensor.dtype(), *expected_dtype);
             assert_eq!(
                 tensor.dims(),
@@ -266,9 +372,10 @@ fn staged_cuda_signed_rgb_matches_cpu_for_geometry_and_burn_layout() {
     ];
 
     for layout in [BatchLayout::Nhwc, BatchLayout::Nchw] {
-        let options = BatchDecodeOptions {
-            layout,
-            ..BatchDecodeOptions::default()
+        let options = {
+            let mut options = BatchDecodeOptions::default();
+            options.layout = layout;
+            options
         };
         let mut decoder = CudaUploadBurnDecoder::new(CudaDevice::default(), options);
         let mut cpu = CpuBatchDecoder::new(options);
@@ -302,11 +409,11 @@ fn staged_cuda_signed_rgb_matches_cpu_for_geometry_and_burn_layout() {
                     .decode_prepared(&prepared)
                     .unwrap_or_else(|error| panic!("{} Burn decode: {error}", fixture.name));
                 let group = burn_batch
-                    .groups
+                    .into_groups()
                     .into_iter()
                     .next()
                     .expect("Burn signed RGB group");
-                let tensor = group.tensor.into_tensor();
+                let tensor = group.into_tensor().into_tensor();
                 assert_eq!(tensor.dtype(), DType::I16);
                 assert_eq!(
                     tensor.dims(),

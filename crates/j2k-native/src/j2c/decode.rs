@@ -6,26 +6,24 @@
 
 use alloc::vec::Vec;
 
-use super::bitplane::{BitPlaneDecodeBuffers, BitPlaneDecodeContext};
 use super::build::{CodeBlock, Decomposition, Layer, Precinct, Segment, SubBand, SubBandType};
 use super::codestream::{ComponentInfo, Header, QuantizationStyle, WaveletTransform};
-use super::ht_block_decode::{self, HtBlockDecodeContext};
-use super::idwt::IDWTOutput;
-use super::roi::{tile_intersects_output_region, RoiPlan};
+use super::ht_block_decode;
+use super::roi::{roi_required_output_margin, tile_intersects_output_region};
 use super::tag_tree::TagNode;
 use super::tile::{ComponentTile, ParsedTiles, ResolutionTile, Tile};
 use super::{bitplane, build, idwt, mct, segment, tile, ComponentData};
 use crate::error::{
-    bail, ColorError, DecodeError, DecodingError, DirectPlanUnsupportedReason, Result, TileError,
+    bail, ColorError, DecodingError, DirectPlanUnsupportedReason, Result, TileError,
     ValidationError,
 };
 use crate::j2c::segment::MAX_BITPLANE_COUNT;
 use crate::profile;
 use crate::reader::BitReader;
 use crate::{
-    add_roi_shift_to_bitplanes, apply_roi_maxshift_inverse_i64,
+    add_roi_shift_to_bitplanes, apply_roi_maxshift_inverse_i64, checked_decode_sample_count,
     decode_j2k_code_block_scalar_with_workspace,
-    decode_j2k_code_block_scalar_with_workspace_midpoint, HtCodeBlockBatchJob,
+    decode_j2k_code_block_scalar_with_workspace_midpoint, ComponentRowSink, HtCodeBlockBatchJob,
     HtCodeBlockDecodeJob, HtCodeBlockDecoder, HtOwnedCodeBlockBatchJob, HtOwnedSubBandPlan,
     HtSubBandDecodeJob, J2kCodeBlockBatchJob, J2kCodeBlockDecodeJob, J2kCodeBlockDecodeWorkspace,
     J2kCodeBlockStyle, J2kDirectBandId, J2kDirectColorPlan, J2kDirectGrayscalePlan,
@@ -33,17 +31,25 @@ use crate::{
     J2kOwnedSubBandPlan, J2kRect, J2kStoreComponentJob, J2kSubBandDecodeJob, J2kSubBandType,
     J2kWaveletTransform,
 };
-use core::mem::size_of;
 use core::ops::Range;
 
 mod allocation;
+mod banded_tier1;
 mod direct_plan;
+#[cfg(feature = "parallel")]
+mod parallel_bands;
 mod peak;
+mod planes_floor;
 mod reuse;
+mod state;
 mod store;
 mod subband;
+#[cfg(all(test, feature = "parallel"))]
+pub(crate) use self::subband::MIN_BAND_WORK;
 mod subband_params;
 mod tier1;
+#[cfg(feature = "parallel")]
+mod tile_workers;
 mod workspace;
 pub(crate) use self::allocation::DecodeAllocationBudget;
 use self::direct_plan::collect_classic_code_block_data;
@@ -54,7 +60,16 @@ pub(crate) use self::direct_plan::{
     build_referenced_htj2k_grayscale_plan, build_referenced_htj2k_rgba_plan,
 };
 pub(crate) use self::peak::{record_workspace, WorkspaceBytes, WorkspacePeak};
-use self::store::{apply_sign_shift_after_mct, component_unsigned_level_shift, store};
+pub(crate) use self::planes_floor::full_decode_planes_floor;
+#[cfg(any(test, feature = "std"))]
+pub(crate) use self::reuse::is_capacity_error;
+pub(crate) use self::state::{DecompositionStorage, TileDecodeContext, TileDecompositions};
+use self::store::{
+    apply_inverse_mct_per_tile, apply_sign_shift_after_mct, component_unsigned_level_shift,
+    fused_last_level, store, store_last_level_bands,
+};
+#[cfg(feature = "parallel")]
+use self::store::{store_rows, TileRows};
 use self::subband::{
     code_block_required_by_index, count_classic_code_blocks, count_ht_code_blocks,
     decode_component_tile_bit_planes,
@@ -75,15 +90,55 @@ pub use self::workspace::{
     CpuDecodeParallelism, DecoderContext, DecoderWorkspace, DecoderWorkspaceStats,
 };
 
+#[cfg(test)]
 pub(crate) fn decode_with_capacity_retry<'a>(
     data: &'a [u8],
     header: &Header<'a>,
     retained_image_bytes: usize,
     ctx: &mut DecoderContext<'a>,
     ht_decoder: &mut Option<&mut dyn HtCodeBlockDecoder>,
+    #[cfg(feature = "std")] directory: Option<
+        &alloc::sync::Arc<super::segment::directory::PacketDirectory>,
+    >,
+) -> Result<()> {
+    decode_rows_with_capacity_retry(
+        data,
+        header,
+        retained_image_bytes,
+        ctx,
+        ht_decoder,
+        &mut None,
+        #[cfg(feature = "std")]
+        directory,
+    )
+}
+
+/// [`decode_with_capacity_retry`] that hands a region decode's samples to
+/// `row_sink` as they are finished, when every tile can stream them (see
+/// [`streams_rows`]). Otherwise the samples land in the component planes as
+/// usual, and `ctx` records which happened.
+pub(crate) fn decode_rows_with_capacity_retry<'a>(
+    data: &'a [u8],
+    header: &Header<'a>,
+    retained_image_bytes: usize,
+    ctx: &mut DecoderContext<'a>,
+    ht_decoder: &mut Option<&mut dyn HtCodeBlockDecoder>,
+    row_sink: &mut Option<&mut dyn ComponentRowSink>,
+    #[cfg(feature = "std")] directory: Option<
+        &alloc::sync::Arc<super::segment::directory::PacketDirectory>,
+    >,
 ) -> Result<()> {
     run_decode_with_capacity_retry(ctx, |ctx| {
-        decode(data, header, retained_image_bytes, ctx, ht_decoder)
+        decode(
+            data,
+            header,
+            retained_image_bytes,
+            ctx,
+            ht_decoder,
+            row_sink,
+            #[cfg(feature = "std")]
+            directory,
+        )
     })
 }
 
@@ -104,6 +159,7 @@ fn run_decode_with_capacity_retry<'a>(
         retained_idwt_bytes,
     );
 
+    ctx.tile_decode_context.streamed_samples = 0;
     let first_result = decode(ctx);
     let result = ctx.retry_without_retained_scratch_on_capacity(
         retained_scratch_bytes,
@@ -174,6 +230,7 @@ fn decode_preparsed<'a>(
         reused_baseline,
         ctx,
         &mut None,
+        &mut None,
         profile_enabled,
         DecodeProfileTimings::default(),
         profile::profile_now(profile_enabled),
@@ -186,6 +243,10 @@ fn decode<'a>(
     retained_image_bytes: usize,
     ctx: &mut DecoderContext<'a>,
     ht_decoder: &mut Option<&mut dyn HtCodeBlockDecoder>,
+    row_sink: &mut Option<&mut dyn ComponentRowSink>,
+    #[cfg(feature = "std")] directory: Option<
+        &alloc::sync::Arc<super::segment::directory::PacketDirectory>,
+    >,
 ) -> Result<()> {
     let mut reused_baseline = ctx.prepare_reused_decode_baseline(retained_image_bytes)?;
     let profile_enabled = profile::profile_stages_enabled();
@@ -213,6 +274,12 @@ fn decode<'a>(
         parsed_tiles = tile::parse(&mut reader, header, reused_baseline.parser_live);
     }
     let tiles = parsed_tiles?;
+    #[cfg(feature = "std")]
+    let tiles = {
+        let mut tiles = tiles;
+        tiles.set_packet_directory(directory.cloned());
+        tiles
+    };
     profile_timings.parse_tiles_us += profile::elapsed_us(stage_start);
 
     decode_parsed_tiles(
@@ -222,6 +289,7 @@ fn decode<'a>(
         reused_baseline,
         ctx,
         ht_decoder,
+        row_sink,
         profile_enabled,
         profile_timings,
         total_start,
@@ -239,6 +307,7 @@ fn decode_parsed_tiles<'a>(
     reused_baseline: reuse::ReusedDecodeBaseline,
     ctx: &mut DecoderContext<'a>,
     ht_decoder: &mut Option<&mut dyn HtCodeBlockDecoder>,
+    row_sink: &mut Option<&mut dyn ComponentRowSink>,
     profile_enabled: bool,
     mut profile_timings: DecodeProfileTimings,
     total_start: Option<profile::ProfileInstant>,
@@ -246,19 +315,53 @@ fn decode_parsed_tiles<'a>(
     if tiles.is_empty() {
         bail!(TileError::Invalid);
     }
+    ensure_tiles_share_sample_type(tiles)?;
+    let (structural_workspace_bytes, reused_baseline, cpu_decode_parallelism) = choose_region_idwt(
+        header,
+        tiles,
+        ctx,
+        (ht_decoder.is_some(), row_sink.is_some()),
+        structural_workspace_bytes,
+        reused_baseline,
+    )?;
+    let stream_rows = ctx.tile_decode_context.stream_rows;
+    // The row-streamed IDWT writes rows straight into the planes, so they
+    // need no padding.
+    let last_idwt_level_padding = last_idwt_level_padding(
+        header,
+        tiles,
+        ctx.tile_decode_context.output_region,
+        ht_decoder.is_some(),
+    )
+    .filter(|_| !ctx.tile_decode_context.line_region_idwt);
+    #[cfg(test)]
+    let last_idwt_level_padding =
+        last_idwt_level_padding.filter(|_| !ctx.tile_decode_context.separate_last_idwt_level);
     let retained_decode_baseline = ctx.reset(
         header,
         &tiles[0],
         structural_workspace_bytes,
         reused_baseline.channel_capacity,
+        ht_decoder.is_some(),
+        last_idwt_level_padding,
     )?;
     let retained_decode_base_without_scratch = retained_decode_baseline
         .checked_sub(reused_baseline.scratch_capacity)
         .ok_or(ValidationError::ImageTooLarge)?;
-    let cpu_decode_parallelism = ctx.cpu_decode_parallelism;
     let (tile_ctx, storage) = (&mut ctx.tile_decode_context, &mut ctx.storage);
 
-    for tile in tiles.iter() {
+    // Under Auto, the tiles may decode at once on worker contexts. On any
+    // failure the loop below decodes every tile again, in order.
+    #[cfg(feature = "parallel")]
+    let decoded_by_workers = cpu_decode_parallelism == CpuDecodeParallelism::Auto
+        && ht_decoder.is_none()
+        && !profile_enabled
+        && tile_workers::decode_tiles(header, tiles, tile_ctx, retained_decode_baseline).is_some();
+    #[cfg(not(feature = "parallel"))]
+    let decoded_by_workers = false;
+
+    tile_ctx.fused_last_level = None;
+    for tile in tiles.iter().filter(|_| !decoded_by_workers) {
         ltrace!(
             "tile {} rect [{},{} {}x{}]",
             tile.idx,
@@ -275,6 +378,10 @@ fn decode_parsed_tiles<'a>(
             }
         }
 
+        let output = match row_sink.as_deref_mut() {
+            Some(sink) if stream_rows => TileOutput::Sink(sink),
+            _ => TileOutput::Planes,
+        };
         decode_tile(
             tile,
             header,
@@ -285,17 +392,24 @@ fn decode_parsed_tiles<'a>(
             profile_enabled,
             &mut profile_timings,
             retained_decode_base_without_scratch,
+            output,
         )?;
     }
 
-    // Note that this assumes that either all tiles have MCT or none of them.
-    // In theory, only some could have it... But hopefully no such cursed
-    // images exist!
-    if tiles[0].mct {
+    ensure_every_sample_streamed(header, tile_ctx)?;
+    tile_ctx.ensure_unzeroed_planes_overwritten()?;
+
+    tile_ctx.deferred_mct = None;
+    // Streamed rows were transformed on the way to the sink.
+    if tiles.iter().any(|tile| tile.mct) && !stream_rows {
         let stage_start = profile::profile_now(profile_enabled);
-        mct::apply_inverse(tile_ctx, &tiles[0].component_infos, header, ht_decoder)?;
-        apply_sign_shift_after_mct(tile_ctx, &header.component_infos);
+        let parallel = cpu_decode_parallelism == CpuDecodeParallelism::Auto;
+        apply_inverse_mct(tile_ctx, header, tiles, ht_decoder, parallel)?;
         profile_timings.mct_us += profile::elapsed_us(stage_start);
+    }
+    // Planes holding a last level's sub-bands need the deferred MCT's pack.
+    if tile_ctx.fused_last_level.take().is_some() {
+        bail!(DecodingError::IncompletePlaneStore);
     }
 
     if profile_enabled {
@@ -308,6 +422,278 @@ fn decode_parsed_tiles<'a>(
     storage.release_all_allocations();
 
     Ok(())
+}
+
+/// The planes hold integers or floats for the whole image, as the first tile
+/// needs, so every tile must need the same.
+fn ensure_tiles_share_sample_type(tiles: &[Tile<'_>]) -> Result<()> {
+    let exact_integer_decode = tile_requires_exact_integer_decode(&tiles[0]);
+    if tiles
+        .iter()
+        .any(|tile| tile_requires_exact_integer_decode(tile) != exact_integer_decode)
+    {
+        bail!(DecodingError::UnsupportedFeature(
+            "tiles that differ in needing exact integer decode"
+        ));
+    }
+    Ok(())
+}
+
+/// A decode that streamed its rows has no planes: the sink must have
+/// received every sample of every component, transformed, once.
+fn ensure_every_sample_streamed(header: &Header<'_>, tile_ctx: &TileDecodeContext) -> Result<()> {
+    if !tile_ctx.stream_rows {
+        return Ok(());
+    }
+    let expected = tile_ctx
+        .output_region
+        .map(OutputRegion::dimensions)
+        .and_then(|(width, height)| checked_decode_sample_count(width, height).ok())
+        .and_then(|samples| samples.checked_mul(header.component_infos.len()))
+        .ok_or(ValidationError::ImageTooLarge)?;
+    if tile_ctx.streamed_samples != expected {
+        bail!(DecodingError::IncompletePlaneStore);
+    }
+    Ok(())
+}
+
+/// The inverse MCT of the decoded tiles. One transform of the whole planes
+/// serves when every tile has the first tile's MCT and wavelets. Tile-part
+/// COD and COC can set them per tile, and then each tile with an MCT
+/// transforms its own samples.
+fn apply_inverse_mct(
+    tile_ctx: &mut TileDecodeContext,
+    header: &Header<'_>,
+    tiles: &[Tile<'_>],
+    ht_decoder: &mut Option<&mut dyn HtCodeBlockDecoder>,
+    parallel: bool,
+) -> Result<()> {
+    if !mct_matches_first_tile(tiles) {
+        return apply_inverse_mct_per_tile(tile_ctx, header, tiles);
+    }
+    mct::apply_inverse(
+        tile_ctx,
+        &tiles[0].component_infos,
+        header,
+        ht_decoder,
+        parallel,
+    )?;
+    apply_sign_shift_after_mct(tile_ctx, &tiles[0].component_infos);
+    Ok(())
+}
+
+/// Whether every tile has the first tile's MCT and, with an MCT, its
+/// wavelets, which also round the components after the first three.
+fn mct_matches_first_tile(tiles: &[Tile<'_>]) -> bool {
+    let first = &tiles[0];
+    tiles.iter().all(|tile| {
+        tile.mct == first.mct
+            && (!tile.mct
+                || tile.component_infos.iter().zip(&first.component_infos).all(
+                    |(component, first)| component.wavelet_transform() == first.wavelet_transform(),
+                ))
+    })
+}
+
+/// The padded size each component plane reserves so that a region decode can
+/// write its last IDWT level straight into the plane: the region expanded by
+/// the IDWT margin on every side, within the image. `None` when it cannot or
+/// would not save memory. A hook may store IDWT output itself, exact-integer
+/// and subsampled decodes take other paths, and when several tiles meet the
+/// region no one tile owns the plane. Every plane holds its padding for the
+/// whole decode while the padding replaces one component's window at a time,
+/// so it pays off only when all planes' padding together is smaller than one
+/// padded window.
+fn last_idwt_level_padding(
+    header: &Header<'_>,
+    tiles: &ParsedTiles<'_>,
+    output_region: Option<OutputRegion>,
+    hooked: bool,
+) -> Option<(u32, u32)> {
+    if !region_decode_without_hook_or_special_samples(tiles, output_region, hooked) {
+        return None;
+    }
+    let output_region = output_region?;
+    let mut covering = tiles
+        .iter()
+        .filter(|tile| tile_intersects_output_region(tile.rect, &header.size_data, output_region));
+    let components = &covering.next()?.component_infos;
+    if covering.next().is_some() {
+        return None;
+    }
+    let margin = components
+        .iter()
+        .map(|component| roi_required_output_margin(component.wavelet_transform()))
+        .max()?;
+    let padded = |start: u32, len: u32, bound: u32| {
+        let end = start.checked_add(len)?;
+        let after = bound.checked_sub(end)?;
+        len.checked_add(margin.min(start))?
+            .checked_add(margin.min(after))
+    };
+    let width = padded(
+        output_region.x,
+        output_region.width,
+        header.size_data.image_width(),
+    )?;
+    let height = padded(
+        output_region.y,
+        output_region.height,
+        header.size_data.image_height(),
+    )?;
+    let window = u64::from(width) * u64::from(height);
+    let padding = window - u64::from(output_region.width) * u64::from(output_region.height);
+    let planes = u64::try_from(components.len()).ok()?;
+    (planes.checked_mul(padding)? < window).then_some((width, height))
+}
+
+/// Whether a decode is a region decode without a code-block decoder hook,
+/// whose components need neither exact-integer samples nor subsampling: the
+/// decodes whose region IDWT may write into `channel_data` itself.
+fn region_decode_without_hook_or_special_samples(
+    tiles: &ParsedTiles<'_>,
+    output_region: Option<OutputRegion>,
+    hooked: bool,
+) -> bool {
+    output_region.is_some()
+        && !hooked
+        && tiles.first().is_some_and(|tile| {
+            tile.component_infos.iter().all(|component| {
+                !component.requires_exact_integer_decode()
+                    && component.size_info.horizontal_resolution == 1
+                    && component.size_info.vertical_resolution == 1
+            })
+        })
+}
+
+/// Record in `ctx` whether a region decode runs the row-streamed IDWT and,
+/// if it `wants_rows`, whether it streams them (see [`streams_rows`]). A
+/// decode that streams gives up the context's retained capacity first (see
+/// `release_retained_before_streaming`), and the decode goes on with the
+/// returned structural bytes, baseline and parallelism.
+///
+/// Rows that stream only from serial bands, under `Auto` because the pool's
+/// bands can't take a tile, stream serially when the region's planes would
+/// pass the decode budget even in a fresh context: the planes decode would
+/// be refused, so this costs no decode that succeeds today its parallelism.
+fn choose_region_idwt(
+    header: &Header<'_>,
+    tiles: &ParsedTiles<'_>,
+    ctx: &mut DecoderContext<'_>,
+    (hooked, wants_rows): (bool, bool),
+    structural_workspace_bytes: usize,
+    reused_baseline: reuse::ReusedDecodeBaseline,
+) -> Result<(usize, reuse::ReusedDecodeBaseline, CpuDecodeParallelism)> {
+    let line_region_idwt = ctx.line_region_idwt
+        && ctx.tile_decode_context.line_region_idwt_permitted
+        && region_decode_without_hook_or_special_samples(
+            tiles,
+            ctx.tile_decode_context.output_region,
+            hooked,
+        );
+    ctx.tile_decode_context.line_region_idwt = line_region_idwt;
+    let streams = |tile_ctx: &TileDecodeContext, parallelism| {
+        wants_rows && line_region_idwt && streams_rows(header, tiles, tile_ctx, parallelism)
+    };
+    let mut parallelism = ctx.cpu_decode_parallelism;
+    let mut stream_rows = streams(&ctx.tile_decode_context, parallelism);
+    if !stream_rows
+        && parallelism == CpuDecodeParallelism::Auto
+        && streams(&ctx.tile_decode_context, CpuDecodeParallelism::Serial)
+        && planes_pass_budget(
+            header,
+            &ctx.tile_decode_context,
+            structural_workspace_bytes,
+            reused_baseline,
+        )
+    {
+        parallelism = CpuDecodeParallelism::Serial;
+        stream_rows = true;
+    }
+    ctx.tile_decode_context.stream_rows = stream_rows;
+    ctx.tile_decode_context.streamed_samples = 0;
+    let (structural_workspace_bytes, reused_baseline) = if stream_rows {
+        ctx.release_retained_before_streaming(structural_workspace_bytes, reused_baseline)?
+    } else {
+        (structural_workspace_bytes, reused_baseline)
+    };
+    Ok((structural_workspace_bytes, reused_baseline, parallelism))
+}
+
+/// Whether the output region's component planes would pass the decode
+/// budget beside `structural_workspace_bytes` without the context's
+/// retained capacity, as `reset` charges them; planes too large to count
+/// pass it too.
+fn planes_pass_budget(
+    header: &Header<'_>,
+    tile_ctx: &TileDecodeContext,
+    structural_workspace_bytes: usize,
+    reused_baseline: reuse::ReusedDecodeBaseline,
+) -> bool {
+    let (width, height) = tile_ctx.output_region.map_or(
+        (
+            header.size_data.image_width(),
+            header.size_data.image_height(),
+        ),
+        OutputRegion::dimensions,
+    );
+    let fresh = structural_workspace_bytes
+        .saturating_sub(reused_baseline.channel_capacity)
+        .saturating_sub(reused_baseline.scratch_capacity);
+    planes_floor::region_planes_bytes(header, width, height).map_or(true, |planes| {
+        planes.saturating_add(fresh) > tile_ctx.planes_budget()
+    })
+}
+
+/// Whether a region decode on the row-streamed IDWT can hand its samples to
+/// a row sink instead of component planes: every tile decodes its Tier-1 in
+/// bands, serially (see [`tile_bands`]) or on the pool (see [`pool_bands`]),
+/// so all components can advance together; the image and tiles have no
+/// offsets and there are one to four components (see
+/// [`image_streams_rows`]); and each tile with an inverse MCT has three
+/// components or more, the first three with one wavelet, as
+/// `apply_inverse_mct_per_tile` requires.
+/// `ensure_every_sample_streamed` checks afterwards that the rows covered
+/// the region.
+fn streams_rows(
+    header: &Header<'_>,
+    tiles: &ParsedTiles<'_>,
+    tile_ctx: &TileDecodeContext,
+    parallelism: CpuDecodeParallelism,
+) -> bool {
+    let components = header.component_infos.len();
+    image_streams_rows(header)
+        && tiles.iter().all(|tile| {
+            let infos = &tile.component_infos;
+            infos.len() == components
+                // The row-streamed IDWT already excludes hooks.
+                && (tile_bands(header, tile, tile_ctx, false, parallelism)
+                    || pool_bands(header, tile, tile_ctx, false, parallelism))
+                && infos
+                    .iter()
+                    .all(|component| !component.requires_exact_integer_decode())
+                // Each tile's rows take its own MCT, as the planes do. A tile
+                // whose MCT the planes reject decodes into them instead, so
+                // the decode reports their error.
+                && (!tile.mct
+                    || (components >= 3
+                        && infos[1..3].iter().all(|component| {
+                            component.wavelet_transform() == infos[0].wavelet_transform()
+                        })))
+        })
+}
+
+/// The conditions of [`streams_rows`] that the main header settles: the
+/// image and its tiles have no offsets, and there are one to four
+/// components. The plans that choose a streamed route before decoding
+/// check them here too (see `Image::region_decode_streams_rows`).
+pub(crate) fn image_streams_rows(header: &Header<'_>) -> bool {
+    let size = &header.size_data;
+    size.image_area_x_offset == 0
+        && size.image_area_y_offset == 0
+        && size.tile_x_offset == 0
+        && size.tile_y_offset == 0
+        && (1..=4).contains(&header.component_infos.len())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,16 +722,38 @@ impl OutputRegion {
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DecodeDebugCounters {
+    #[cfg(test)]
+    pub(crate) packet_headers: usize,
+    #[cfg(test)]
+    pub(crate) directory_skips: usize,
     pub(crate) decoded_code_blocks: usize,
     pub(crate) skipped_code_blocks: usize,
     pub(crate) idwt_output_samples: usize,
     /// Sub-band coefficients held in storage, summed over decoded tiles.
     pub(crate) stored_coefficients: usize,
+    /// Code-blocks built, and the layer records built for them, summed over
+    /// decoded tiles. Region decodes give layers only to code-blocks they read.
+    pub(crate) built_code_blocks: usize,
+    pub(crate) built_layer_records: usize,
+    /// Precinct records built, summed over decoded tiles. Region decodes
+    /// build none for precincts they never parse.
+    pub(crate) built_precincts: usize,
     /// Progression positions region precinct selection walked, summed over
     /// decoded tiles.
     pub(crate) selection_scanned_packets: usize,
     /// Empty decomposition capacity discarded before region selection.
     pub(crate) selection_released_storage_bytes: usize,
+    /// Components whose bands decoded on the worker pool ahead of the
+    /// streamed IDWT, summed over decoded tiles.
+    pub(crate) pool_band_components: usize,
+    /// Components that gave up the pool for whole windows because a band
+    /// was left running with no worker to finish it.
+    pub(crate) pool_band_fallbacks: usize,
+    /// Pool bands planned in parts, summed over decoded tiles.
+    pub(crate) pool_band_parts: usize,
+    /// The bytes the decode's budget starts from after `reset`, retained
+    /// capacity included.
+    pub(crate) decode_baseline_bytes: usize,
     /// The largest decode workspace sampled at stage boundaries, by owner.
     pub(crate) workspace_peak: WorkspacePeak,
     pub(crate) ht_phase_stats: ht_block_decode::HtBlockDecodeStats,
@@ -353,6 +761,45 @@ pub(crate) struct DecodeDebugCounters {
     pub(crate) ht_parallel_tasks: usize,
     #[cfg(all(test, feature = "parallel"))]
     pub(crate) ht_task_workspace_growths: usize,
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) classic_task_workspace_growths: usize,
+    /// The most readers a tile streaming its rows from pool bands
+    /// reconstructed them on.
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) pool_band_readers: usize,
+    /// The most band slots a ring of pool bands held that did not hold its
+    /// whole window, at the finest active level and at the others.
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) pool_band_finest_slots: usize,
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) pool_band_other_slots: usize,
+    /// The most line-buffer samples a tile streaming its rows from pool
+    /// bands held beyond the IDWT samples its ROI plan charged.
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) uncharged_line_samples: usize,
+    /// The most samples of row batches a tile streaming from pool bands held
+    /// beside its IDWT rings.
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) line_batch_samples: usize,
+    /// Bytes of the pool band plans recorded in the workspace peak, summed
+    /// over components and tiles.
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) pool_band_plan_bytes: usize,
+    /// Bytes that budget charged for its threads' scratch, and the bytes
+    /// that scratch held once the bands decoded, summed over tiles.
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) thread_scratch_charged: usize,
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) thread_scratch_held: usize,
+    /// The most block-scratch samples a thread of such a tile held.
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) thread_block_samples: usize,
+    /// Tiles whose failed bands decoded again over whole windows, and the
+    /// pool threads' scratches still held when they did, summed.
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) whole_window_reruns: usize,
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) scratches_live_in_reruns: usize,
     #[cfg(all(test, feature = "parallel"))]
     pub(crate) parallel_coefficients: ParallelCoefficientStats,
 }
@@ -400,6 +847,7 @@ fn decode_tile<'a>(
     profile_enabled: bool,
     profile_timings: &mut DecodeProfileTimings,
     retained_decode_baseline: usize,
+    output: TileOutput<'_, '_>,
 ) -> Result<()> {
     storage.reset_for_next_tile();
     let retained_decode_baseline = retained_decode_baseline
@@ -433,7 +881,11 @@ fn decode_tile<'a>(
             output_region,
             retained_decode_baseline,
         )?,
-        None => None,
+        // A decode that builds every precinct reads the packets a region
+        // decode of the whole image reads.
+        None => {
+            build::select_whole_image_precincts(tile, header, storage, retained_decode_baseline)?
+        }
     };
     // The selection stays live through packet parsing, so its bytes are part
     // of the baseline every later phase budgets against until it is dropped.
@@ -456,29 +908,43 @@ fn decode_tile<'a>(
         build::BuildWorkspace::DecodePixels {
             skipped_resolution_levels: header.skipped_resolution_levels,
             // A code-block decoder hook may rely on every component's
-            // coefficients being live together, so it keeps the tile layout.
-            coefficient_layout: if ht_decoder.is_some() {
+            // coefficients being live together, so it keeps the tile layout,
+            // as do streamed rows, which decode the components together.
+            coefficient_layout: if ht_decoder.is_some() || tile_ctx.stream_rows {
                 build::CoefficientLayout::Tile
             } else {
                 build::CoefficientLayout::Component
             },
         },
-        selection.as_ref(),
+        // Only a region decode builds just the selected precincts.
+        tile_ctx.output_region.and(selection.as_ref()),
     )?;
     if tile_ctx.output_region.is_some() {
-        if storage.roi_plan.is_none() {
-            build::release_unused_roi_workspace(storage, tile.component_infos.len())?;
-        }
-        // Region decode sizes coefficient storage to the code-blocks the ROI
-        // plan keeps, or to the whole tile when there is no plan.
-        build::allocate_deferred_coefficients(storage, header.skipped_resolution_levels)?;
+        prepare_region_storage(
+            tile,
+            header,
+            tile_ctx,
+            storage,
+            ht_decoder.is_some(),
+            cpu_decode_parallelism,
+        )?;
     }
     tile_ctx.debug_counters.stored_coefficients += storage.coefficients.len();
+    tile_ctx.debug_counters.built_code_blocks += storage.code_blocks.len();
+    tile_ctx.debug_counters.built_layer_records += storage.layers.len();
+    tile_ctx.debug_counters.built_precincts += storage.precincts.len();
     record_workspace(tile_ctx, storage, selection_bytes)?;
     profile_timings.build_us += profile::elapsed_us(stage_start);
     // Next, we parse the layers/segments for each code block.
     let stage_start = profile::profile_now(profile_enabled);
-    segment::parse_selected(tile, header, storage, selection.as_ref())?;
+    let packet_stats = segment::parse_selected(tile, header, storage, selection.as_ref())?;
+    #[cfg(not(test))]
+    let _ = packet_stats;
+    #[cfg(test)]
+    {
+        tile_ctx.debug_counters.packet_headers += packet_stats.parsed_headers;
+        tile_ctx.debug_counters.directory_skips += packet_stats.skipped_packets;
+    }
     record_workspace(tile_ctx, storage, selection_bytes)?;
     drop(selection);
     storage.structural_workspace_bytes = storage
@@ -495,18 +961,135 @@ fn decode_tile<'a>(
         cpu_decode_parallelism,
         profile_enabled,
         profile_timings,
+        output,
     )?;
     Ok(())
+}
+
+/// After `build`, choose how a region decode's IDWT and Tier-1 run and size
+/// its coefficient storage to match.
+fn prepare_region_storage(
+    tile: &Tile<'_>,
+    header: &Header<'_>,
+    tile_ctx: &TileDecodeContext,
+    storage: &mut DecompositionStorage<'_>,
+    hooked: bool,
+    cpu_decode_parallelism: CpuDecodeParallelism,
+) -> Result<()> {
+    if storage.roi_plan.is_none() {
+        build::release_unused_roi_workspace(storage, tile.component_infos.len())?;
+    }
+    storage.line_region_idwt = tile_ctx.line_region_idwt && storage.roi_plan.is_some();
+    storage.last_idwt_level_in_channels =
+        !storage.line_region_idwt && idwt::last_level_fits_channels(storage, tile_ctx, header)?;
+    // Region decode sizes coefficient storage to the code-blocks the ROI
+    // plan keeps, clipped to the windows the IDWT reads unless a hook
+    // writes whole code-blocks, or to the whole tile when there is no plan.
+    let clip_to_idwt_windows = clips_to_idwt_windows(tile_ctx, hooked);
+    storage.banded_tier1 = storage.line_region_idwt
+        && tile_bands(header, tile, tile_ctx, hooked, cpu_decode_parallelism);
+    #[cfg(feature = "parallel")]
+    {
+        storage.parallel_bands = storage.line_region_idwt
+            && !storage.banded_tier1
+            && parallel_bands::applies(header, tile, tile_ctx, hooked, cpu_decode_parallelism);
+    }
+    storage.lockstep_lines =
+        (storage.banded_tier1 || storage.parallel_bands) && tile_ctx.stream_rows;
+    #[cfg(feature = "parallel")]
+    {
+        storage.deep_band_rings = storage.parallel_bands
+            && storage.lockstep_lines
+            && parallel_bands::deep_rings(tile)
+            && parallel_bands::reads_whole_rows(header, storage);
+        storage.one_synthesis_reader = storage.parallel_bands
+            && storage.lockstep_lines
+            && parallel_bands::one_reader(tile, storage);
+        storage.shallow_band_rings = parallel_bands::shallow_rings(tile, storage);
+        storage.shared_pool_band_rings = parallel_bands::shared_rings(tile_ctx, storage);
+    }
+    build::allocate_deferred_coefficients(
+        storage,
+        header.skipped_resolution_levels,
+        clip_to_idwt_windows,
+    )?;
+    Ok(())
+}
+
+/// Whether a tile clips its stored windows to the ones the IDWT reads: a hook
+/// writes whole code-blocks instead.
+fn clips_to_idwt_windows(tile_ctx: &TileDecodeContext, hooked: bool) -> bool {
+    #[cfg(test)]
+    return !hooked && !tile_ctx.store_whole_code_blocks;
+    #[cfg(not(test))]
+    {
+        let _ = tile_ctx;
+        !hooked
+    }
+}
+
+/// Whether `tile` decodes its Tier-1 in bands on this decode's row-streamed
+/// IDWT (see [`banded_tier1::applies`]). The tile's layout and
+/// [`streams_rows`], which needs every tile to band, share this check.
+fn tile_bands(
+    header: &Header<'_>,
+    tile: &Tile<'_>,
+    tile_ctx: &TileDecodeContext,
+    hooked: bool,
+    parallelism: CpuDecodeParallelism,
+) -> bool {
+    let bands = tile_ctx.line_region_idwt
+        && banded_tier1::applies(
+            header,
+            tile,
+            parallelism,
+            clips_to_idwt_windows(tile_ctx, hooked),
+        );
+    #[cfg(test)]
+    let bands = bands && !tile_ctx.whole_window_tier1;
+    bands
+}
+
+/// Whether `tile` decodes its bands on the worker pool ahead of this
+/// decode's row-streamed IDWT (see [`parallel_bands::applies`]).
+fn pool_bands(
+    header: &Header<'_>,
+    tile: &Tile<'_>,
+    tile_ctx: &TileDecodeContext,
+    hooked: bool,
+    parallelism: CpuDecodeParallelism,
+) -> bool {
+    #[cfg(feature = "parallel")]
+    return parallel_bands::applies(header, tile, tile_ctx, hooked, parallelism);
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = (header, tile, tile_ctx, hooked, parallelism);
+        false
+    }
+}
+
+/// Where a decoded tile's samples go.
+enum TileOutput<'o, 'p> {
+    /// The decode's component planes.
+    Planes,
+    /// A tile worker's own rows of the planes.
+    #[cfg(feature = "parallel")]
+    Rows(&'o mut TileRows<'p>),
+    /// A row sink, as the streamed IDWT finishes them; see [`streams_rows`].
+    Sink(&'o mut (dyn ComponentRowSink + 'p)),
 }
 
 /// Runs Tier-1, the IDWT and store for each component of a parsed tile.
 ///
 /// With [`build::CoefficientLayout::Component`], every component decodes into
 /// the same coefficient buffer, so each finishes all three stages before the
-/// next is decoded. Otherwise Tier-1 decodes the whole tile first.
+/// next is decoded. Otherwise Tier-1 decodes the whole tile first. With
+/// [`TileOutput::Rows`], a tile worker stores into its own rows of the
+/// planes, and with [`TileOutput::Sink`], the tile's rows go to the sink.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the per-component stages share decode_tile's state, adapter, and profiling explicitly"
+    clippy::too_many_lines,
+    reason = "the per-component stages share decode_tile's state, adapter, and profiling explicitly, and the sink routes and the Tier-1, IDWT and store order stay in one place"
 )]
 fn decode_components<'a>(
     tile: &Tile<'a>,
@@ -517,7 +1100,37 @@ fn decode_components<'a>(
     cpu_decode_parallelism: CpuDecodeParallelism,
     profile_enabled: bool,
     profile_timings: &mut DecodeProfileTimings,
+    mut output: TileOutput<'_, '_>,
 ) -> Result<()> {
+    if let TileOutput::Sink(sink) = output {
+        #[cfg(feature = "parallel")]
+        if storage.parallel_bands {
+            if parallel_bands::decode_tile_rows(
+                tile,
+                header,
+                tile_ctx,
+                storage,
+                sink,
+                profile_enabled,
+                profile_timings,
+            )? {
+                return Ok(());
+            }
+            // The route declined the bands: decode them serially, which the
+            // pool's band slots also hold.
+            storage.parallel_bands = false;
+            storage.banded_tier1 = true;
+        }
+        return banded_tier1::decode_tile_rows(
+            tile,
+            header,
+            tile_ctx,
+            storage,
+            sink,
+            profile_enabled,
+            profile_timings,
+        );
+    }
     let per_component = storage.coefficient_layout == build::CoefficientLayout::Component;
     if !per_component {
         decode_tier1_stage(
@@ -535,39 +1148,59 @@ fn decode_components<'a>(
 
     // Unlike before, we interleave the apply_idwt and store stages
     // for each component tile so we can reuse allocations better.
-    for (idx, component_info) in header.component_infos.iter().enumerate() {
-        if per_component {
-            if idx > 0 {
-                // Code-blocks the decode skips leave their samples untouched,
-                // so clear the previous component's coefficients first.
-                storage.coefficients.fill(0.0);
-                storage.coefficients_i64.fill(0);
-            }
-            decode_tier1_stage(
-                tile,
-                idx..idx + 1,
-                header,
-                tile_ctx,
-                storage,
-                ht_decoder,
-                cpu_decode_parallelism,
-                profile_enabled,
-                profile_timings,
-            )?;
-        }
-        // Next, we apply the inverse discrete wavelet transform.
-        let stage_start = profile::profile_now(profile_enabled);
-        idwt::apply(
-            storage,
-            tile_ctx,
+    tile_ctx.fused_last_level = matches!(output, TileOutput::Planes)
+        .then(|| fused_last_level(tile, header, tile_ctx, storage, ht_decoder.is_some()))
+        .flatten();
+    let fused = tile_ctx.fused_last_level.is_some();
+    if !fused {
+        tile_ctx.prepare_deferred_plane()?;
+    }
+    // A tile-part COD or COC can give the tile its own coding style.
+    for (idx, component_info) in tile.component_infos.iter().enumerate() {
+        if decode_component_bands(
+            tile,
             idx,
             header,
+            tile_ctx,
+            storage,
             component_info.wavelet_transform(),
-            ht_decoder,
-            cpu_decode_parallelism == CpuDecodeParallelism::Auto,
-        )?;
-        record_workspace(tile_ctx, storage, 0)?;
-        profile_timings.idwt_us += profile::elapsed_us(stage_start);
+            profile_enabled,
+            profile_timings,
+        )? {
+            record_workspace(tile_ctx, storage, 0)?;
+        } else {
+            if per_component {
+                // Code-blocks the decode skips leave their samples untouched, so
+                // Tier-1 clears the previous component's coefficients first.
+                storage.stale_coefficients = idx > 0;
+                decode_tier1_stage(
+                    tile,
+                    idx..idx + 1,
+                    header,
+                    tile_ctx,
+                    storage,
+                    ht_decoder,
+                    cpu_decode_parallelism,
+                    profile_enabled,
+                    profile_timings,
+                )?;
+            }
+            // Next, we apply the inverse discrete wavelet transform. A last level
+            // left to the pack ends at its LL band.
+            let stage_start = profile::profile_now(profile_enabled);
+            let idwt_result = idwt::apply(
+                storage,
+                tile_ctx,
+                idx,
+                header,
+                component_info.wavelet_transform(),
+                ht_decoder,
+                cpu_decode_parallelism == CpuDecodeParallelism::Auto,
+            );
+            idwt_result?;
+            record_workspace(tile_ctx, storage, 0)?;
+            profile_timings.idwt_us += profile::elapsed_us(stage_start);
+        }
         // Finally, we store the raw samples for the tile area in the correct
         // location. Note that in case we have MCT, we are not applying it yet.
         // It will be applied in the very end once all tiles have been processed.
@@ -579,20 +1212,78 @@ fn decode_components<'a>(
         // store one IDWT output at a time, allowing for better reuse of
         // allocations.
         let stage_start = profile::profile_now(profile_enabled);
-        store(
-            tile,
-            header,
-            tile_ctx,
-            component_info,
-            idx,
-            ht_decoder,
-            cpu_decode_parallelism == CpuDecodeParallelism::Auto,
-        )?;
+        let parallel = cpu_decode_parallelism == CpuDecodeParallelism::Auto;
+        if let Some(level) = tile_ctx.fused_last_level {
+            store_last_level_bands(tile_ctx, storage, idx, &level)?;
+        } else {
+            match &mut output {
+                #[cfg(feature = "parallel")]
+                TileOutput::Rows(rows) => {
+                    store_rows(rows, tile, header, tile_ctx, component_info, idx, parallel)?;
+                }
+                _ => store(
+                    tile,
+                    header,
+                    tile_ctx,
+                    component_info,
+                    idx,
+                    ht_decoder,
+                    parallel,
+                )?,
+            }
+        }
         record_workspace(tile_ctx, storage, 0)?;
         profile_timings.store_us += profile::elapsed_us(stage_start);
     }
 
     Ok(())
+}
+
+/// Decode component `component_idx` of a tile that decodes in bands as the
+/// streamed IDWT reads them, on the pool or serially. Returns `false` when it
+/// takes the whole-window path instead.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the banded stage shares decode_tile's state and profiling explicitly"
+)]
+fn decode_component_bands<'a>(
+    tile: &Tile<'a>,
+    component_idx: usize,
+    header: &Header<'_>,
+    tile_ctx: &mut TileDecodeContext,
+    storage: &mut DecompositionStorage<'a>,
+    transform: WaveletTransform,
+    profile_enabled: bool,
+    profile_timings: &mut DecodeProfileTimings,
+) -> Result<bool> {
+    // Unless the route declines and the sub-bands hold whole windows again.
+    #[cfg(feature = "parallel")]
+    if storage.parallel_bands {
+        return parallel_bands::decode_component(
+            tile,
+            component_idx,
+            header,
+            tile_ctx,
+            storage,
+            transform,
+            profile_enabled,
+            profile_timings,
+        );
+    }
+    if !storage.banded_tier1 {
+        return Ok(false);
+    }
+    banded_tier1::decode_component(
+        tile,
+        component_idx,
+        header,
+        tile_ctx,
+        storage,
+        transform,
+        profile_enabled,
+        profile_timings,
+    )?;
+    Ok(true)
 }
 
 /// Decode the code-blocks of `components` and sample the workspace after.
@@ -817,284 +1508,6 @@ fn emit_decode_profile_row(
     );
 }
 
-/// All decompositions for a single tile.
-#[derive(Clone)]
-pub(crate) struct TileDecompositions {
-    pub(crate) first_ll_sub_band: usize,
-    pub(crate) decompositions: Range<usize>,
-}
-
-impl TileDecompositions {
-    pub(crate) fn sub_band_iter(
-        &self,
-        resolution: u8,
-        decompositions: &[Decomposition],
-    ) -> SubBandIter {
-        let indices = if resolution == 0 {
-            [
-                self.first_ll_sub_band,
-                self.first_ll_sub_band,
-                self.first_ll_sub_band,
-            ]
-        } else {
-            decompositions[self.decompositions.clone()][resolution as usize - 1].sub_bands
-        };
-
-        SubBandIter {
-            next_idx: 0,
-            indices,
-            resolution,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct SubBandIter {
-    resolution: u8,
-    next_idx: usize,
-    indices: [usize; 3],
-}
-
-impl Iterator for SubBandIter {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let value = if self.resolution == 0 {
-            if self.next_idx > 0 {
-                None
-            } else {
-                Some(self.indices[0])
-            }
-        } else if self.next_idx >= self.indices.len() {
-            None
-        } else {
-            Some(self.indices[self.next_idx])
-        };
-
-        self.next_idx += 1;
-
-        value
-    }
-}
-
-/// Owned decomposition workspace for one active tile.
-///
-/// Within an image, reset retains capacities and the next build counts them in
-/// its live baseline. Crossing to a new image drops every retained allocation.
-#[derive(Default)]
-pub(crate) struct DecompositionStorage<'a> {
-    pub(crate) segments: Vec<Segment<'a>>,
-    pub(crate) layers: Vec<Layer>,
-    pub(crate) code_blocks: Vec<CodeBlock>,
-    pub(crate) precincts: Vec<Precinct>,
-    pub(crate) tag_tree_nodes: Vec<TagNode>,
-    pub(crate) coefficients: Vec<f32>,
-    pub(crate) coefficients_i64: Vec<i64>,
-    pub(crate) sub_bands: Vec<SubBand>,
-    pub(crate) decompositions: Vec<Decomposition>,
-    pub(crate) tile_decompositions: Vec<TileDecompositions>,
-    pub(crate) roi_plan: Option<RoiPlan>,
-    pub(crate) exact_integer_decode: bool,
-    /// How the built sub-bands' coefficient ranges share `coefficients`.
-    pub(crate) coefficient_layout: build::CoefficientLayout,
-    /// Planned non-segment live bytes for the active tile and future decode scratch.
-    pub(crate) structural_workspace_bytes: usize,
-    /// Set when region decode deferred coefficient storage until the ROI
-    /// plan is known. Holds the whole-plane IDWT workspace the plan left out,
-    /// which must be charged if decode falls back to the whole tile.
-    pub(crate) deferred_idwt_workspace_elements: Option<usize>,
-    /// Allocation/cap failure raised from the option-based packet parser.
-    pub(crate) packet_workspace_error: Option<DecodeError>,
-}
-
-impl DecompositionStorage<'_> {
-    pub(crate) fn reset_for_next_tile(&mut self) {
-        self.segments.clear();
-        self.layers.clear();
-        self.code_blocks.clear();
-        self.precincts.clear();
-        self.tag_tree_nodes.clear();
-        self.coefficients.clear();
-        self.coefficients_i64.clear();
-        self.sub_bands.clear();
-        self.decompositions.clear();
-        self.tile_decompositions.clear();
-        self.roi_plan = None;
-        self.exact_integer_decode = false;
-        self.coefficient_layout = build::CoefficientLayout::Tile;
-        self.structural_workspace_bytes = 0;
-        self.deferred_idwt_workspace_elements = None;
-        self.packet_workspace_error = None;
-    }
-
-    pub(crate) fn release_all_allocations(&mut self) {
-        *self = Self::default();
-    }
-
-    pub(crate) fn retained_capacity_bytes(&self) -> Result<usize> {
-        let mut bytes = 0_usize;
-        include_capacity::<Segment<'_>>(&mut bytes, self.segments.capacity())?;
-        include_capacity::<Layer>(&mut bytes, self.layers.capacity())?;
-        include_capacity::<CodeBlock>(&mut bytes, self.code_blocks.capacity())?;
-        include_capacity::<Precinct>(&mut bytes, self.precincts.capacity())?;
-        include_capacity::<TagNode>(&mut bytes, self.tag_tree_nodes.capacity())?;
-        include_capacity::<f32>(&mut bytes, self.coefficients.capacity())?;
-        include_capacity::<i64>(&mut bytes, self.coefficients_i64.capacity())?;
-        include_capacity::<SubBand>(&mut bytes, self.sub_bands.capacity())?;
-        include_capacity::<Decomposition>(&mut bytes, self.decompositions.capacity())?;
-        include_capacity::<TileDecompositions>(&mut bytes, self.tile_decompositions.capacity())?;
-        Ok(bytes)
-    }
-}
-
-fn include_capacity<T>(bytes: &mut usize, capacity: usize) -> Result<()> {
-    let additional = capacity
-        .checked_mul(size_of::<T>())
-        .ok_or(ValidationError::ImageTooLarge)?;
-    *bytes = bytes
-        .checked_add(additional)
-        .ok_or(ValidationError::ImageTooLarge)?;
-    if *bytes > crate::DEFAULT_MAX_DECODE_BYTES {
-        return Err(ValidationError::ImageTooLarge.into());
-    }
-    Ok(())
-}
-
-/// A reusable context used during the decoding of a single tile.
-///
-/// Some of the fields are temporary in nature and reset after moving on to the
-/// next tile, some contain global state.
-#[derive(Default)]
-pub(crate) struct TileDecodeContext {
-    /// A reusable buffer for the IDWT output.
-    pub(crate) idwt_output: IDWTOutput,
-    /// A scratch buffer used during IDWT.
-    pub(crate) idwt_scratch_buffer: Vec<f32>,
-    /// Per-worker band buffers for the row-banded IDWT.
-    pub(crate) idwt_band_scratch: Vec<f32>,
-    /// A scratch buffer used during exact reversible integer IDWT.
-    pub(crate) idwt_scratch_buffer_i64: Vec<i64>,
-    /// A reusable context for decoding code blocks.
-    pub(crate) bit_plane_decode_context: BitPlaneDecodeContext,
-    /// Reusable buffers for decoding bitplanes.
-    pub(crate) bit_plane_decode_buffers: BitPlaneDecodeBuffers,
-    /// A reusable context for decoding HTJ2K code blocks.
-    pub(crate) ht_block_decode_context: HtBlockDecodeContext,
-    #[cfg(feature = "parallel")]
-    pub(in crate::j2c::decode) ht_task_workspaces: Vec<workspace::HtTaskWorkspace>,
-    #[cfg(feature = "parallel")]
-    pub(in crate::j2c::decode) parallel_coefficients: Vec<f32>,
-    /// Test-only switch that keeps HT tiles on the per-sub-band path so its
-    /// slab and bank behavior stays covered.
-    #[cfg(all(test, feature = "parallel"))]
-    pub(crate) force_per_sub_band_ht: bool,
-    /// The raw, decoded samples for each channel.
-    pub(crate) channel_data: Vec<ComponentData>,
-    /// Optional output window for region-local decode storage.
-    pub(crate) output_region: Option<OutputRegion>,
-    /// Whether irreversible samples are being decoded for an integer output.
-    pub(crate) round_irreversible_output: bool,
-    /// Debug counters for tests and ROI instrumentation.
-    pub(crate) debug_counters: DecodeDebugCounters,
-}
-
-impl TileDecodeContext {
-    fn release_all_allocations(&mut self) {
-        let output_region = self.output_region;
-        let round_irreversible_output = self.round_irreversible_output;
-        #[cfg(all(test, feature = "parallel"))]
-        let force_per_sub_band_ht = self.force_per_sub_band_ht;
-        *self = Self::default();
-        self.output_region = output_region;
-        self.round_irreversible_output = round_irreversible_output;
-        #[cfg(all(test, feature = "parallel"))]
-        {
-            self.force_per_sub_band_ht = force_per_sub_band_ht;
-        }
-    }
-
-    fn release_tile_scratch_allocations(&mut self) {
-        self.release_idwt_allocations();
-        self.release_tier1_allocations();
-    }
-
-    fn release_tier1_allocations(&mut self) {
-        self.bit_plane_decode_context = BitPlaneDecodeContext::default();
-        self.bit_plane_decode_buffers = BitPlaneDecodeBuffers::default();
-        self.ht_block_decode_context = HtBlockDecodeContext::default();
-        #[cfg(feature = "parallel")]
-        {
-            self.ht_task_workspaces = Vec::new();
-            self.parallel_coefficients = Vec::new();
-        }
-    }
-
-    pub(crate) fn serial_tier1_capacity_bytes(&self) -> Result<usize> {
-        let classic_bytes = self.bit_plane_decode_context.allocated_bytes()?;
-        let buffer_bytes = self.bit_plane_decode_buffers.allocated_bytes()?;
-        let ht_bytes = self.ht_block_decode_context.allocated_bytes()?;
-        classic_bytes
-            .checked_add(buffer_bytes)
-            .and_then(|bytes| bytes.checked_add(ht_bytes))
-            .ok_or(ValidationError::ImageTooLarge.into())
-    }
-
-    pub(crate) fn tier1_capacity_bytes(&self) -> Result<usize> {
-        let serial_bytes = self.serial_tier1_capacity_bytes()?;
-        #[cfg(feature = "parallel")]
-        {
-            serial_bytes
-                .checked_add(workspace::ht_task_workspace_bytes(
-                    &self.ht_task_workspaces,
-                )?)
-                .and_then(|bytes| {
-                    self.parallel_coefficients
-                        .capacity()
-                        .checked_mul(size_of::<f32>())
-                        .and_then(|coefficient_bytes| bytes.checked_add(coefficient_bytes))
-                })
-                .ok_or(ValidationError::ImageTooLarge.into())
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            Ok(serial_bytes)
-        }
-    }
-
-    #[cfg(all(test, feature = "parallel"))]
-    pub(crate) fn ht_parallel_workspace_count(&self) -> usize {
-        self.ht_task_workspaces.len()
-    }
-
-    #[cfg(all(test, feature = "parallel"))]
-    pub(crate) fn ht_parallel_workspace_bytes(&self) -> Result<usize> {
-        workspace::ht_task_workspace_bytes(&self.ht_task_workspaces)
-    }
-
-    pub(crate) fn idwt_capacity_bytes(&self) -> Result<usize> {
-        let mut bytes = 0_usize;
-        include_capacity::<f32>(&mut bytes, self.idwt_output.coefficients.capacity())?;
-        include_capacity::<i64>(&mut bytes, self.idwt_output.coefficients_i64.capacity())?;
-        include_capacity::<f32>(&mut bytes, self.idwt_scratch_buffer.capacity())?;
-        include_capacity::<f32>(&mut bytes, self.idwt_band_scratch.capacity())?;
-        include_capacity::<i64>(&mut bytes, self.idwt_scratch_buffer_i64.capacity())?;
-        Ok(bytes)
-    }
-
-    pub(crate) fn retained_scratch_bytes(&self) -> Result<usize> {
-        self.tier1_capacity_bytes()?
-            .checked_add(self.idwt_capacity_bytes()?)
-            .ok_or(ValidationError::ImageTooLarge.into())
-    }
-
-    fn release_idwt_allocations(&mut self) {
-        self.idwt_output = IDWTOutput::default();
-        self.idwt_scratch_buffer = Vec::new();
-        self.idwt_band_scratch = Vec::new();
-        self.idwt_scratch_buffer_i64 = Vec::new();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1178,9 +1591,9 @@ mod tests {
     #[test]
     fn collect_classic_code_block_data_preserves_zero_length_segments() {
         let mut storage = DecompositionStorage::default();
-        storage.layers.push(Layer {
-            segments: Some(0..3),
-        });
+        storage
+            .layers
+            .push(Layer::with_segments(0..3).expect("test segment range"));
         storage.segments.push(Segment {
             idx: 0,
             coding_pases: 1,
@@ -1228,9 +1641,9 @@ mod tests {
     #[test]
     fn collect_classic_code_block_data_rejects_non_contiguous_segment_indices() {
         let mut storage = DecompositionStorage::default();
-        storage.layers.push(Layer {
-            segments: Some(0..2),
-        });
+        storage
+            .layers
+            .push(Layer::with_segments(0..2).expect("test segment range"));
         storage.segments.push(Segment {
             idx: 0,
             coding_pases: 1,
@@ -1282,8 +1695,7 @@ mod tests {
             .map(|value| f32::from(u8::try_from(value).expect("test value fits u8")))
             .collect::<Vec<_>>();
         let block = super::DecodedBlock {
-            output_x: 0,
-            output_y: 0,
+            placement: super::subband::BlockPlacement::whole(0, 0, 4, 3),
             width: 4,
             height: 3,
             coefficients: &mut coefficients,
@@ -1313,8 +1725,7 @@ mod tests {
         let mut coefficient_stats = super::ParallelCoefficientStats::default();
         let mut coefficients = vec![1.0, 2.0, 3.0, 4.0];
         let block = super::DecodedBlock {
-            output_x: 3,
-            output_y: 1,
+            placement: super::subband::BlockPlacement::whole(3, 1, 2, 2),
             width: 2,
             height: 2,
             coefficients: &mut coefficients,
@@ -1345,8 +1756,7 @@ mod tests {
         let mut coefficient_stats = super::ParallelCoefficientStats::default();
         let mut coefficients = vec![1.0, 2.0];
         let block = super::DecodedBlock {
-            output_x: 4,
-            output_y: 1,
+            placement: super::subband::BlockPlacement::whole(4, 1, 2, 1),
             width: 2,
             height: 1,
             coefficients: &mut coefficients,
@@ -1366,19 +1776,23 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn auto_cpu_parallelism_enables_ht_sub_band_parallel_branch() {
+    fn auto_cpu_parallelism_enables_sub_band_parallel_branches() {
+        let branches: [fn(super::CpuDecodeParallelism, usize) -> bool; 2] = [
+            super::should_decode_ht_sub_band_in_parallel,
+            super::should_decode_classic_sub_band_in_parallel,
+        ];
         for threads in [1, 2] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .unwrap();
             pool.install(|| {
-                for blocks in [0, 3, 4, 16, usize::MAX] {
+                for (branch, blocks) in branches
+                    .iter()
+                    .flat_map(|branch| [0, 3, 4, 16, usize::MAX].map(|blocks| (branch, blocks)))
+                {
                     assert_eq!(
-                        super::should_decode_ht_sub_band_in_parallel(
-                            super::CpuDecodeParallelism::Auto,
-                            blocks
-                        ),
+                        branch(super::CpuDecodeParallelism::Auto, blocks),
                         threads > 1 && blocks >= 4
                     );
                 }
